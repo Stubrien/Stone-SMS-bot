@@ -133,26 +133,3 @@ app.get('/', (req, res) => {
 app.listen(process.env.PORT || 3000, () => {
   console.log('Bot is running');
 });
-```
-
-5. Click **"Commit changes"** and confirm
-
----
-
-## What the Email Will Now Look Like
-```
-NEW LEAD CAPTURED
-Client Phone: +61412345678
-Time: 11/03/2026, 2:34pm AEST
-
-SUMMARY
-Name: Sarah Johnson
-Mobile: 0412 345 678 (confirmed)
-Property: 12 Main Street Ballarat
-Enquiry Type: Selling
-Notes: Looking to list in the next 3 months
-
-FULL CONVERSATION TRANSCRIPT
-Client: Hi there
-Jordan: Hi there! I am Jordan from Stone Real Estate...
-...

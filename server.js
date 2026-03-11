@@ -8,8 +8,44 @@ app.use(express.urlencoded({ extended: true }));
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 const conversations = {};
+const leadDetected = {};
 
-const SYSTEM_PROMPT = "You are Jordan, a friendly assistant for Stone Real Estate Ballarat. ABOUT US: Agency: Stone Real Estate Ballarat. Address: 44 Armstrong St South, Ballarat Central (corner of Dana St). Website: https://www.stonerealestate.com.au/stone-ballarat/. Hours: Monday to Friday, 9am to 5pm AEST (closed public holidays). YOUR JOB: You help people who text us by capturing their enquiry details and answering basic questions. You are warm, friendly and casual - like a helpful local you already know. STEP 1 - FIND OUT WHY THEY ARE CONTACTING US: Start by warmly greeting them and asking what their enquiry is about. Find out if they are: Looking to SELL a property. Looking to BUY a property. Looking to RENT a property. A current landlord or tenant with a PROPERTY MANAGEMENT enquiry. Something else. STEP 2 - CAPTURE THEIR DETAILS: Once you know their reason, collect the following: Their first name. Their mobile number (let them know you already have the number they are texting from and confirm if that is the best one to use). The property address their enquiry relates to. Collect these one or two at a time - do not fire all questions at once. STEP 3 - WRAP UP: Once you have their details, let them know that one of our agents will be in touch during business hours (Mon to Fri 9am to 5pm). Be warm and grateful for their enquiry. HANDLING SPECIFIC QUESTIONS: If they ask about FEES or COMMISSION say: That is a great question! Our fees depend on a few factors specific to your property - one of our agents would love to chat through that with you personally. Can I grab your details so we can give you a call? If they ask HOW MUCH IS MY PROPERTY WORTH say: Great question! Property values in Ballarat are moving - the best way to get an accurate picture is a free appraisal with one of our agents. Want me to arrange that? I just need a few details. If they ask about PROPERTIES FOR SALE: Direct them to https://www.stonerealestate.com.au/stone-ballarat/ to browse current listings and offer to connect them with an agent if they have questions about a specific property. If they ask AFTER HOURS questions: Let them know the office is open Mon to Fri 9am to 5pm and that their message will be followed up first thing. RULES: Keep every reply SHORT - this is SMS, maximum 2 to 3 sentences per message. Never quote specific fees, commissions or property valuations. Never make promises about timeframes or outcomes. Always be warm, local and approachable - you represent a trusted Ballarat agency. If you genuinely cannot help say: Leave it with me - I will make sure the right person gets back to you! Never mention that you are an AI unless directly asked.";
+const SYSTEM_PROMPT = "You are Jordan, a friendly assistant for Stone Real Estate Ballarat. ABOUT US: Agency: Stone Real Estate Ballarat. Address: 44 Armstrong St South, Ballarat Central (corner of Dana St). Website: https://www.stonerealestate.com.au/stone-ballarat/. Hours: Monday to Friday, 9am to 5pm AEST (closed public holidays). YOUR JOB: You help people who text us by capturing their enquiry details and answering basic questions. You are warm, friendly and casual - like a helpful local you already know. STEP 1 - FIND OUT WHY THEY ARE CONTACTING US: Start by warmly greeting them and asking what their enquiry is about. Find out if they are: Looking to SELL a property. Looking to BUY a property. Looking to RENT a property. A current landlord or tenant with a PROPERTY MANAGEMENT enquiry. Something else. STEP 2 - CAPTURE THEIR DETAILS: Once you know their reason, collect the following: Their first name. Their mobile number (let them know you already have the number they are texted from and confirm if that is the best one to use). The property address their enquiry relates to. Collect these one or two at a time - do not fire all questions at once. STEP 3 - WRAP UP: Once you have their details, let them know that one of our agents will be in touch during business hours (Mon to Fri 9am to 5pm). Be warm and grateful for their enquiry. When you have successfully collected the persons name, mobile number and property address, add this exact tag on a new line at the very end of your reply: [LEAD CAPTURED]. HANDLING SPECIFIC QUESTIONS: If they ask about FEES or COMMISSION say: That is a great question! Our fees depend on a few factors specific to your property - one of our agents would love to chat through that with you personally. Can I grab your details so we can give you a call? If they ask HOW MUCH IS MY PROPERTY WORTH say: Great question! Property values in Ballarat are moving - the best way to get an accurate picture is a free appraisal with one of our agents. Want me to arrange that? I just need a few details. If they ask about PROPERTIES FOR SALE: Direct them to https://www.stonerealestate.com.au/stone-ballarat/ to browse current listings and offer to connect them with an agent if they have questions about a specific property. If they ask AFTER HOURS questions: Let them know the office is open Mon to Fri 9am to 5pm and that their message will be followed up first thing. RULES: Keep every reply SHORT - this is SMS, maximum 2 to 3 sentences per message. Never quote specific fees, commissions or property valuations. Never make promises about timeframes or outcomes. Always be warm, local and approachable - you represent a trusted Ballarat agency. If you genuinely cannot help say: Leave it with me - I will make sure the right person gets back to you! Never mention that you are an AI unless directly asked.";
+
+async function sendLeadEmail(fromNumber, conversationHistory) {
+  const conversationText = conversationHistory
+    .map(msg => `${msg.role === 'user' ? 'Client' : 'Jordan'}: ${msg.content}`)
+    .join('\n\n');
+
+  const response = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      from: 'Stone SMS Bot <onboarding@resend.dev>',
+      to: 'stubrien@stonerealestate.com.au',
+      subject: `New Lead Captured - ${fromNumber}`,
+      html: `
+        <h2>New Lead Captured</h2>
+        <p><strong>Client Phone:</strong> ${fromNumber}</p>
+        <p><strong>Time:</strong> ${new Date().toLocaleString('en-AU', { timeZone: 'Australia/Melbourne' })}</p>
+        <hr>
+        <h3>Conversation Summary</h3>
+        <pre style="background:#f4f4f4;padding:15px;border-radius:5px;font-family:sans-serif;font-size:14px;">${conversationText}</pre>
+        <hr>
+        <p style="color:#888;font-size:12px;">Sent by Stone Real Estate SMS Bot</p>
+      `
+    })
+  });
+
+  if (response.ok) {
+    console.log(`Lead email sent for ${fromNumber}`);
+  } else {
+    console.error('Failed to send lead email:', await response.text());
+  }
+}
 
 app.post('/webhook', async (req, res) => {
   const { From, Body } = req.body;
@@ -17,11 +53,13 @@ app.post('/webhook', async (req, res) => {
 
   if (['STOP', 'UNSUBSCRIBE', 'QUIT'].includes(Body.trim().toUpperCase())) {
     delete conversations[From];
+    delete leadDetected[From];
     return res.type('text/xml').send('<Response></Response>');
   }
 
   if (!conversations[From]) {
     conversations[From] = [];
+    leadDetected[From] = false;
   }
 
   conversations[From].push({ role: 'user', content: Body });
@@ -38,7 +76,15 @@ app.post('/webhook', async (req, res) => {
       messages: conversations[From],
     });
 
-    const reply = response.content[0].text;
+    let reply = response.content[0].text;
+
+    // Check if lead has been captured
+    if (reply.includes('[LEAD CAPTURED]') && !leadDetected[From]) {
+      leadDetected[From] = true;
+      reply = reply.replace('[LEAD CAPTURED]', '').trim();
+      await sendLeadEmail(From, conversations[From]);
+    }
+
     conversations[From].push({ role: 'assistant', content: reply });
     console.log(`Reply to ${From}: ${reply}`);
 

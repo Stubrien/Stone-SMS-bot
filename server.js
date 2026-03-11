@@ -25,7 +25,7 @@ async function sendLeadEmail(fromNumber, conversationHistory) {
     },
     body: JSON.stringify({
       from: 'Stone SMS Bot <onboarding@resend.dev>',
-      to: 'stubrien@stonerealestate.com.au',
+      to: 'stu@briens.com.au',
       subject: `New Lead Captured - ${fromNumber}`,
       html: `
         <h2>New Lead Captured</h2>

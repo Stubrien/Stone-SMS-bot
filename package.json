@@ -1,0 +1,14 @@
+{
+  "name": "stone-sms-bot",
+  "version": "1.0.0",
+  "description": "AI SMS Bot for Stone Real Estate Ballarat",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "twilio": "^4.19.0",
+    "@anthropic-ai/sdk": "^0.20.1"
+  }
+}

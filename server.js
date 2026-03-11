@@ -317,7 +317,3 @@ POST /send-bulk
     { "to": "+61487654321", "name": "James" }
   ]
 }
-
-app.listen(process.env.PORT || 3000, () => {
-  console.log('Bot is running');
-});

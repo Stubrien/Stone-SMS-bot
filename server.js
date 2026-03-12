@@ -261,6 +261,10 @@ app.get('/', function(req, res) {
   res.send('Stone Real Estate SMS Bot is running!');
 });
 
+app.get('/send', function(req, res) {
+  res.send('Send endpoint is ready!');
+});
+
 app.listen(process.env.PORT || 3000, function() {
   console.log('Bot is running');
 });

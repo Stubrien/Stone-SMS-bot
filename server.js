@@ -123,7 +123,8 @@ async function sendOptOutEmail(fromNumber) {
 
 app.post('/send', async function(req, res) {
   const to = req.body.to || req.body.To;
-  const name = req.body.name || req.body['First Name'] || req.body.first_name;
+  const fullName = req.body.name || req.body['First Name'] || req.body.first_name || '';
+  const name = fullName.split(' ')[0];
   const message = req.body.message || req.body.Message;
 
   if (!to || !message) {

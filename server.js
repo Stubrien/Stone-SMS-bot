@@ -122,9 +122,9 @@ async function sendOptOutEmail(fromNumber) {
 }
 
 app.post('/send', async function(req, res) {
-  const to = req.body.to;
-  const name = req.body.name;
-  const message = req.body.message;
+  const to = req.body.to || req.body.To;
+  const name = req.body.name || req.body['First Name'] || req.body.first_name;
+  const message = req.body.message || req.body.Message;
 
   if (!to || !message) {
     return res.status(400).json({ error: 'to and message are required' });
@@ -163,8 +163,8 @@ app.post('/send-bulk', async function(req, res) {
 
   for (let i = 0; i < contacts.length; i++) {
     const contact = contacts[i];
-    const to = contact.to;
-    const name = contact.name;
+    const to = contact.to || contact.To;
+    const name = contact.name || contact['First Name'] || contact.first_name;
 
     if (!to) continue;
 

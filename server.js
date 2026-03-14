@@ -1,4 +1,5 @@
 const express = require('express');
+const alexBot = require('./alex');
 const twilio = require('twilio');
 const Anthropic = require('@anthropic-ai/sdk');
 
@@ -295,6 +296,7 @@ app.post('/webhook', async function(req, res) {
     res.type('text/xml').send(twiml.toString());
   }
 });
+alexBot(app);
 
 app.get('/', function(req, res) {
   res.send('Stone Real Estate SMS Bot is running!');

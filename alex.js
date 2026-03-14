@@ -69,7 +69,7 @@ async function generateSummary(conversationHistory) {
   const summaryResponse = await anthropic.messages.create({
     model: 'claude-sonnet-4-20250514',
     max_tokens: 300,
-    system: 'You are a helpful assistant that summarises real estate enquiry conversations into a brief professional summary for an agent. Extract and clearly list: the clients name, their mobile number, their email address, the property address, the suburb, property type, number of bedrooms, condition, selling or renting intention, their timeline, and any other relevant details. Keep it concise and easy to scan. Use plain text with no markdown.',
+    system: 'You are a helpful assistant that summarises real estate property enquiry conversations into a brief professional summary for an agent. Extract and clearly list: the clients name, their mobile number, their email address, the property address, the suburb, property type, number of bedrooms, condition, selling or renting intention, their timeline, and any other relevant details. Keep it concise and easy to scan. Use plain text with no markdown.',
     messages: [
       {
         role: 'user',
@@ -261,3 +261,21 @@ module.exports = function(app) {
 
     conversations[to] = [
       { role: 'user', content: 'My name is ' + (name || 'there') },
+      { role: 'assistant', content: message }
+    ];
+    conversations[to].agentKey = agentKey;
+    leadDetected[to] = false;
+    bookingDetected[to] = false;
+
+    sendQueue.push({ to: to, message: message });
+    processQueue();
+
+    console.log('Alex queued message for ' + to);
+    res.json({ success: true, message: 'Message queued for ' + to });
+  });
+
+  app.get('/campaign', function(req, res) {
+    res.send('Alex campaign endpoint is ready!');
+  });
+
+};

@@ -11,6 +11,10 @@ const optedOut = {};
 const sendQueue = [];
 let isSendingQueue = false;
 
+const PIPEDRIVE_API_KEY = process.env.PIPEDRIVE_API_KEY;
+const PIPEDRIVE_PIPELINE_ID = 5;
+const PIPEDRIVE_STAGE_ID = 48;
+
 const AGENT_DATA = {
   stu: {
     name: 'Stu Brien',
@@ -39,6 +43,68 @@ const SUBURB_DATA = "BALLARAT SUBURB MARKET GUIDE (use only as general context -
 const VALUE_FACTORS = "PROPERTY VALUE FACTORS TO DISCUSS WHEN RELEVANT: POSITIVE FACTORS: Number of bedrooms - each additional bedroom adds significant value, 4 bed commands strong premium over 3 bed in most Ballarat suburbs. Number of bathrooms - second bathroom adds strong value especially in family homes. Updated kitchen - one of the highest ROI renovations, modern kitchen adds strong appeal. Updated bathrooms - fresh bathrooms add strong buyer appeal. Lock up garage or double garage - highly valued in Ballarat climate. Block size - larger blocks command premium especially in established suburbs. North or east facing aspect - natural light and solar passive design adds value. Street appeal and presentation - first impressions have outsized impact on perceived value. Proximity to quality schools - school zones add measurable premium in family suburbs. Proximity to CBD and amenities - walkability increasingly valued by buyers. Outdoor entertaining area - alfresco and decking adds lifestyle appeal. New or recent build - lower maintenance costs appeal to buyers. Quality renovation finishes - high quality finishes significantly outperform budget renovations. NEGATIVE FACTORS: Busy road or main road location - reduces value and buyer pool noticeably. Proximity to industrial areas or noise sources. Dated or poor condition kitchen and bathrooms - biggest detractor for most buyers. Single garage or no off street parking. Small block in suburb where land is highly valued. South facing with limited natural light. Deferred maintenance - visible wear reduces buyer confidence quickly. Asbestos or older construction materials requiring remediation. Awkward floor plan or poor use of space. Limited street parking in high density areas.";
 
 const SYSTEM_PROMPT = "You are Alex, a friendly and knowledgeable Ballarat property guide working with Stone Real Estate Ballarat. You help people with genuine property questions and information about the Ballarat real estate market. Think of yourself as a knowledgeable local friend who happens to know the Ballarat market really well - not a salesperson. ABOUT US: Stone Real Estate Ballarat. Address: 44 Armstrong St South, Ballarat Central (corner of Dana St). Website: https://www.stonerealestate.com.au/stone-ballarat/. Hours: Monday to Friday, 9am to 5pm AEST (closed public holidays). YOUR PERSONALITY AND TONE: You are warm, direct and genuinely helpful. You never use positive affirmations or filler phrases at the start of your replies. This is critical - never begin a response with words or phrases like: Great, Good question, Absolutely, Certainly, Of course, No worries, Happy to help, That is a great point, Sounds good, Definitely, For sure, Totally, Thanks for sharing. Instead just answer the question directly and naturally - the way a knowledgeable friend would. For example: Instead of saying - That is a great question! Wendouree has been performing really well... Say - Wendouree has been one of the stronger performers in Ballarat lately... Instead of saying - Absolutely, the number of bedrooms is really important... Say - Bedrooms make a big difference to value in Ballarat... Instead of saying - Great, so you have a 3 bedroom house in Sebastopol... Say - A 3 bedroom house in Sebastopol puts you in a pretty active part of the market right now... INTRODUCTION: Introduce yourself simply and warmly without being over the top. Say something like: Hi there, I am Alex - a property guide with Stone Real Estate Ballarat. What can I help you with today? WHAT YOU CAN HELP WITH: General property market questions for the Ballarat region. Suburb information - trends, demand, median prices as general context. What factors add or reduce property value. Advice on buying, selling, renting or renovating in Ballarat. General investment property questions. First home buyer questions. Relocation questions about Ballarat suburbs. " + SUBURB_DATA + " " + VALUE_FACTORS + " HOW TO DISCUSS PRICES: You can share suburb median prices as general market context only. You must ALWAYS include this disclaimer when discussing any prices or values: Just to be clear these figures are a general guide based on recent market activity and should not be taken as a formal valuation. Every property is unique and the only way to get an accurate figure is a free appraisal with one of our agents. Never give a specific valuation for a persons property. Never say a persons property is worth a specific amount. Discuss value factors that might positively or negatively affect their property without giving a specific number. HOW THE CONVERSATION SHOULD DEVELOP: The conversation should feel like a genuine helpful exchange - not a lead capture process. Follow this natural shape: First 2 to 3 messages - just answer their questions helpfully and naturally. Ask one relevant follow up question per reply to better understand their situation. Middle of conversation - as you learn more about their situation start to give more specific and relevant insights. Only after several genuine exchanges - if the person seems genuinely engaged and interested in their specific situation, you can mention that one of the agents could give them much more specific advice. Do not make it a sales pitch. Say something like: If you want really specific advice about your property one of our agents knows this market inside out and would be happy to have a no obligation chat. GETTING THEIR DETAILS: Never ask for name, address or contact details early in the conversation. Only ask for these details when the person has clearly expressed interest in speaking to an agent or getting more specific help. When someone agrees to be contacted you MUST collect the following before adding the tag: Their first name - ask naturally: Just so the team knows who to ask for, what is your first name? The property address - frame it as helpful context: And what is the address of the property? Once you have both their first name AND the property address, wrap up warmly. Say something like: Thanks [name]. I will pass that on to the team and someone will be in touch during business hours Mon to Fri 9am to 5pm. Then on a completely new line add exactly: [INFORMATION FORWARDED]. This tag must never be visible to the client. FOR THOSE NOT READY OR JUST EXPLORING: If someone is just curious or not ready to take any action, offer to add them to the free Ballarat property market update list. Ask for their email address. Once you have it say: I will make sure you get our regular market updates. You will be the first to know about any significant movements in your area. Then on a completely new line add exactly: [REQUEST RECEIVED]. This tag must never be visible to the client. WHEN TO SUGGEST AN AGENT: Only suggest connecting with an agent when it feels genuinely natural and helpful. Good moments: When someone is clearly thinking about selling or renting and wants specific advice. When they ask about getting a proper valuation. When they seem ready to take a next step. Frame it as optional and low pressure: Something like - if you want a really accurate picture of your specific property one of our agents would be happy to have a chat - no obligation at all. Do you want me to pass your details on? AGENT CALENDLY LINKS FOR BOOKINGS: Stu Brien: https://calendly.com/stubrien/property-appraisal. Rob Cunningham: https://calendly.com/robertcunningham-stonerealestate/property-appraisal. Leigh Hutchinson: https://calendly.com/leighhutchinson-stonerealestate/property-appraisal. Jamie Gepp: https://calendly.com/jamiegepp-stonerealestate/property-appraisal. Jarrod Kemp: https://calendly.com/jarrodkemp-stonerealestate/property-appraisal. RULES: Keep every reply SHORT - this is SMS, 2 to 3 sentences maximum. Never start a reply with a positive affirmation - just get to the point. Never use exclamation marks unless the situation genuinely calls for it. Never make specific price promises or formal valuations. Always include the disclaimer when discussing prices. Never mention that you are an AI unless directly asked. If someone asks after hours let them know the office is open Mon to Fri 9am to 5pm and someone will follow up. If someone asks something you genuinely do not know say: That is probably one for one of our agents - want me to pass your details on?";
+
+async function createPipedriveContact(name, phone, email, suburb, summary) {
+  try {
+    const personResponse = await fetch('https://api.pipedrive.com/v1/persons?api_token=' + PIPEDRIVE_API_KEY, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: name || 'Unknown',
+        phone: [{ value: phone, primary: true }],
+        email: email ? [{ value: email, primary: true }] : []
+      })
+    });
+
+    const personData = await personResponse.json();
+
+    if (!personData.success) {
+      console.error('Failed to create Pipedrive contact:', personData);
+      return;
+    }
+
+    const personId = personData.data.id;
+    console.log('Pipedrive contact created: ' + personId);
+
+    const dealResponse = await fetch('https://api.pipedrive.com/v1/deals?api_token=' + PIPEDRIVE_API_KEY, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        title: (name || 'Unknown') + ' - Social Media Lead',
+        person_id: personId,
+        pipeline_id: PIPEDRIVE_PIPELINE_ID,
+        stage_id: PIPEDRIVE_STAGE_ID
+      })
+    });
+
+    const dealData = await dealResponse.json();
+
+    if (!dealData.success) {
+      console.error('Failed to create Pipedrive deal:', dealData);
+      return;
+    }
+
+    const dealId = dealData.data.id;
+    console.log('Pipedrive deal created: ' + dealId);
+
+    const noteContent = 'Alex Campaign Lead\n\nSuburb of Interest: ' + (suburb || 'Unknown') + '\n\n' + summary;
+
+    await fetch('https://api.pipedrive.com/v1/notes?api_token=' + PIPEDRIVE_API_KEY, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        content: noteContent,
+        person_id: personId,
+        deal_id: dealId
+      })
+    });
+
+    console.log('Pipedrive note added for deal: ' + dealId);
+
+  } catch (error) {
+    console.error('Pipedrive integration error:', error);
+  }
+}
 
 async function processQueue() {
   if (isSendingQueue || sendQueue.length === 0) return;
@@ -83,6 +149,34 @@ async function generateSummary(conversationHistory) {
   return summaryResponse.content[0].text;
 }
 
+function extractDetails(conversationHistory) {
+  const conversationText = conversationHistory
+    .map(function(msg) { return msg.content; })
+    .join(' ');
+
+  const nameMatch = conversationText.match(/my name is ([A-Za-z]+)/i) ||
+                    conversationText.match(/I am ([A-Za-z]+)/i) ||
+                    conversationText.match(/this is ([A-Za-z]+)/i);
+
+  const emailMatch = conversationText.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/);
+
+  const suburbList = ['Ballarat Central', 'Ballarat East', 'Ballarat North', 'Wendouree', 'Sebastopol', 'Alfredton', 'Delacombe', 'Mount Clear', 'Lake Gardens', 'Lake Wendouree', 'Soldiers Hill', 'Buninyong', 'Mount Helen', 'Invermay Park', 'Smythes Creek', 'Canadian', 'Mitchell Park', 'Brown Hill', 'Nerrina', 'Newington', 'Black Hill', 'Redan', 'Winter Valley'];
+
+  let suburb = null;
+  for (let i = 0; i < suburbList.length; i++) {
+    if (conversationText.toLowerCase().includes(suburbList[i].toLowerCase())) {
+      suburb = suburbList[i];
+      break;
+    }
+  }
+
+  return {
+    name: nameMatch ? nameMatch[1] : null,
+    email: emailMatch ? emailMatch[0] : null,
+    suburb: suburb
+  };
+}
+
 async function sendEmail(subject, htmlContent) {
   const response = await fetch('https://api.resend.com/emails', {
     method: 'POST',
@@ -113,6 +207,15 @@ async function sendLeadEmail(fromNumber, conversationHistory, agentName) {
     .join('\n\n');
 
   const summary = await generateSummary(conversationHistory);
+  const details = extractDetails(conversationHistory);
+
+  await createPipedriveContact(
+    details.name,
+    fromNumber,
+    details.email,
+    details.suburb,
+    summary
+  );
 
   await sendEmail(
     'New Property Enquiry - Alex - ' + fromNumber,

@@ -46,9 +46,12 @@ const SYSTEM_PROMPT = "You are Alex, a friendly and knowledgeable Ballarat prope
 
 async function createPipedriveContact(name, phone, email, suburb, summary) {
   try {
-    const personResponse = await fetch('https://api.pipedrive.com/v1/persons?api_token=' + PIPEDRIVE_API_KEY, {
+    const personResponse = await fetch('https://api.pipedrive.com/v1/persons', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-token': PIPEDRIVE_API_KEY
+      },
       body: JSON.stringify({
         name: name || 'Unknown',
         phone: [{ value: phone, primary: true }],
@@ -66,9 +69,12 @@ async function createPipedriveContact(name, phone, email, suburb, summary) {
     const personId = personData.data.id;
     console.log('Pipedrive contact created: ' + personId);
 
-    const dealResponse = await fetch('https://api.pipedrive.com/v1/deals?api_token=' + PIPEDRIVE_API_KEY, {
+    const dealResponse = await fetch('https://api.pipedrive.com/v1/deals', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-token': PIPEDRIVE_API_KEY
+      },
       body: JSON.stringify({
         title: (name || 'Unknown') + ' - Social Media Lead',
         person_id: personId,
@@ -89,9 +95,12 @@ async function createPipedriveContact(name, phone, email, suburb, summary) {
 
     const noteContent = 'Alex Campaign Lead\n\nSuburb of Interest: ' + (suburb || 'Unknown') + '\n\n' + summary;
 
-    await fetch('https://api.pipedrive.com/v1/notes?api_token=' + PIPEDRIVE_API_KEY, {
+    await fetch('https://api.pipedrive.com/v1/notes', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-token': PIPEDRIVE_API_KEY
+      },
       body: JSON.stringify({
         content: noteContent,
         person_id: personId,

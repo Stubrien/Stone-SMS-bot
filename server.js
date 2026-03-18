@@ -305,7 +305,9 @@ app.get('/', function(req, res) {
 app.get('/send', function(req, res) {
   res.send('Send endpoint is ready!');
 });
-
+app.get('/text-alex', function(req, res) {
+  res.redirect('sms:+61483949906?body=Hi');
+});
 app.listen(process.env.PORT || 3000, function() {
   console.log('Bot is running');
 });

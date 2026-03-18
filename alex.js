@@ -337,6 +337,12 @@ module.exports = function(app) {
     const Body = req.body.Body;
     console.log('Alex incoming from ' + From + ': ' + Body);
 
+  if (Body.trim().toUpperCase() === 'RESET') {
+  delete conversations[From];
+  delete leadDetected[From];
+  console.log('Conversation reset for ' + From);
+  return res.type('text/xml').send('<Response></Response>');
+}
     if (['STOP', 'UNSUBSCRIBE', 'QUIT', 'CANCEL', 'END'].includes(Body.trim().toUpperCase())) {
       optedOut[From] = true;
       delete conversations[From];

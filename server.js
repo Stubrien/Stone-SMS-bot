@@ -236,19 +236,19 @@ app.post('/webhook', async function(req, res) {
 
   const cleanFrom = From.replace(/\s/g, '');
   const delegated = jordanPersonal.getDelegatedConversations();
-  const trustedContact = jordanPersonal.getTrustedContact(From);
-
-  if (trustedContact) {
-    console.log('Trusted contact message from ' + trustedContact.name);
-    await jordanPersonal.handleTrustedContact(From, Body, trustedContact);
-    return res.type('text/xml').send('<Response></Response>');
-  }
+const trustedContact = jordanPersonal.getTrustedContact(From);
 
 if (delegated && delegated[cleanFrom]) {
-    console.log('Delegated reply received from ' + From);
-    await jordanPersonal.handleDelegatedReply(cleanFrom, Body);
-    return res.type('text/xml').send('<Response></Response>');
-  }
+  console.log('Delegated reply received from ' + From);
+  await jordanPersonal.handleDelegatedReply(cleanFrom, Body);
+  return res.type('text/xml').send('<Response></Response>');
+}
+
+if (trustedContact) {
+  console.log('Trusted contact message from ' + trustedContact.name);
+  await jordanPersonal.handleTrustedContact(From, Body, trustedContact);
+  return res.type('text/xml').send('<Response></Response>');
+}
 
   if (['STOP', 'UNSUBSCRIBE', 'QUIT', 'CANCEL', 'END'].includes(Body.trim().toUpperCase())) {
     optedOut[From] = true;

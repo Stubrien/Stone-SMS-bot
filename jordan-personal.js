@@ -513,8 +513,3 @@ module.exports = function(app) {
   });
 
 };
-
-"What do you remember about me?"
-
-"Set a weekly reminder every Monday at 8am 
-to check my Pipedrive pipeline"

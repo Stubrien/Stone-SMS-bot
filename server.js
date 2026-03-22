@@ -234,6 +234,15 @@ app.post('/webhook', async function(req, res) {
   const Body = req.body.Body;
   console.log('Incoming from ' + From + ': ' + Body);
 
+  const cleanFrom = From.replace(/\s/g, '');
+  const delegated = jordanPersonal.getDelegatedConversations();
+
+  if (delegated && delegated[cleanFrom]) {
+    console.log('Delegated reply received from ' + From);
+    await jordanPersonal.handleDelegatedReply(cleanFrom, Body);
+    return res.type('text/xml').send('<Response></Response>');
+  }
+
   if (['STOP', 'UNSUBSCRIBE', 'QUIT', 'CANCEL', 'END'].includes(Body.trim().toUpperCase())) {
     optedOut[From] = true;
     delete conversations[From];
@@ -297,6 +306,7 @@ app.post('/webhook', async function(req, res) {
     res.type('text/xml').send(twiml.toString());
   }
 });
+
 alexBot(app);
 jordanPersonal(app);
 
@@ -307,9 +317,11 @@ app.get('/', function(req, res) {
 app.get('/send', function(req, res) {
   res.send('Send endpoint is ready!');
 });
+
 app.get('/text-alex', function(req, res) {
   res.redirect('sms:+61483949906?body=Hi');
 });
+
 app.listen(process.env.PORT || 3000, function() {
   console.log('Bot is running');
 });

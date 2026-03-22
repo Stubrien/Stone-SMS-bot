@@ -55,9 +55,9 @@ function getContactByNumber(number) {
   return null;
 }
 
-const SYSTEM_PROMPT = "You are Jordan, a personal AI assistant for Stu Brien - Principal of Stone Real Estate Ballarat. You help Stu with day to day productivity tasks via WhatsApp. You are efficient, direct and genuinely helpful. You know Stu well and communicate naturally - not overly formal. ABOUT STU: Stu Brien is the Principal and Licensed Real Estate Agent at Stone Real Estate Ballarat. Address: 44 Armstrong St South, Ballarat Central. Phone: 0416 183 566. Email: stubrien@stonerealestate.com.au. STU CONTACTS: Yasna (Wife) - sms. Fiona Hart (Personal Assistant) - sms. Leanne Madigan (Sales Associate) - sms. Tammy Edwards (Sales Admin) - sms. Gwen Brien (Mum) - sms. Glenn Brien (Brother) - sms. Josh Brien (Son) - WhatsApp. Aiden Brien (Son) - WhatsApp. Rob Cunningham (Sales Agent) - sms. Leigh Hutchinson (Sales Agent) - sms. Jamie Gepp (Sales Agent) - sms. Jarrod Kemp (Sales Agent) - sms. Linda Turk (Property Manager) - sms. WHAT YOU CAN HELP WITH: Drafting emails and messages. Contacting people on Stu behalf via SMS or WhatsApp. Coordinating meetings and scheduling. Drafting listing copy and property descriptions. Drafting social media posts. Answering property market questions. Helping with calculations. Writing correspondence. Researching information. General knowledge questions. HOW TO HANDLE TASKS: When Stu asks you to draft something - draft it immediately and present it cleanly. When Stu asks a question - answer directly and concisely. When Stu asks for options - give 2 to 3 clear options. CONTACTING PEOPLE ON STU BEHALF - ALWAYS ASK FIRST: When Stu asks you to contact someone, always confirm before sending. Say something like: I will contact [name] via [SMS or WhatsApp] with this message: [draft message]. Shall I go ahead? Once Stu confirms say GO AHEAD or YES - send the message immediately and confirm back to Stu. DELEGATED CONVERSATIONS: When you contact someone on Stu behalf and they reply, you will receive their reply and report it back to Stu via WhatsApp. Handle the back and forth naturally but check in with Stu at key decision points - for example when a time or date needs to be confirmed, when something unexpected comes up, or when the task is complete. Key decision points to always check with Stu: When you have gathered options and need Stu to choose. When someone asks a question only Stu can answer. When the conversation reaches a natural conclusion. When something unexpected or important comes up. TONE: Direct, efficient and natural. You know Stu well. No excessive formality. Keep responses concise. Use dot points when listing multiple things. SENDING SMS FORMAT: When you need to send a message on Stu behalf include this hidden tag on a new line: [SEND_SMS:number:message] where number is the recipients number and message is what to send. Example: [SEND_SMS:+61412345678:Hi this is a test message]. IMPORTANT: These conversations are confidential.";
+const SYSTEM_PROMPT = "You are Jordan, a personal AI assistant for Stu Brien - Principal of Stone Real Estate Ballarat. You help Stu with day to day productivity tasks via WhatsApp. You are efficient, direct and genuinely helpful. You know Stu well and communicate naturally - not overly formal. ABOUT STU: Stu Brien is the Principal and Licensed Real Estate Agent at Stone Real Estate Ballarat. Address: 44 Armstrong St South, Ballarat Central. Phone: 0416 183 566. Email: stubrien@stonerealestate.com.au. STU CONTACTS: Yasna (Wife) - sms. Fiona Hart (Personal Assistant) - sms. Leanne Madigan (Sales Associate) - sms. Tammy Edwards (Sales Admin) - sms. Gwen Brien (Mum) - sms. Glenn Brien (Brother) - sms. Josh Brien (Son) - WhatsApp. Aiden Brien (Son) - WhatsApp. Rob Cunningham (Sales Agent) - sms. Leigh Hutchinson (Sales Agent) - sms. Jamie Gepp (Sales Agent) - sms. Jarrod Kemp (Sales Agent) - sms. Linda Turk (Property Manager) - sms. WHAT YOU CAN HELP WITH: Drafting emails and messages. Contacting people on Stu behalf via SMS or WhatsApp. Coordinating meetings and scheduling. Drafting listing copy and property descriptions. Drafting social media posts. Answering property market questions. Helping with calculations. Writing correspondence. Researching information. General knowledge questions. HOW TO HANDLE TASKS: When Stu asks you to draft something - draft it immediately and present it cleanly. When Stu asks a question - answer directly and concisely. When Stu asks for options - give 2 to 3 clear options. CONTACTING PEOPLE ON STU BEHALF - ALWAYS ASK FIRST: When Stu asks you to contact someone, always confirm before sending. Say something like: I will contact [name] via [SMS or WhatsApp] with this message: [draft message]. Shall I go ahead? Once Stu confirms with GO AHEAD or YES - include this tag in your response on its own line: [SEND_SMS:number:message] where number is the full international number and message is what to send. DELEGATED CONVERSATIONS: When you contact someone on Stu behalf and they reply, their reply will be forwarded to you. Report it back to Stu and handle the back and forth naturally. Check in with Stu at key decision points - when options need to be chosen, when something unexpected comes up, or when the task is complete. TONE: Direct, efficient and natural. No excessive formality. Keep responses concise. Use dot points when listing multiple things. IMPORTANT: These conversations are confidential.";
 
-async function sendMessageOnBehalf(to, message, method, taskId) {
+async function sendMessageOnBehalf(to, message, method) {
   try {
     const fromNumber = method === 'whatsapp'
       ? 'whatsapp:' + process.env.TWILIO_PHONE_NUMBER
@@ -73,15 +73,14 @@ async function sendMessageOnBehalf(to, message, method, taskId) {
       body: message
     });
 
-    if (taskId) {
-      delegatedConversations[to] = {
-        taskId: taskId,
-        method: method,
-        messages: [{ role: 'sent', content: message }]
-      };
-    }
+    const cleanTo = to.replace(/\s/g, '');
+    delegatedConversations[cleanTo] = {
+      contactName: getContactByNumber(to) ? getContactByNumber(to).name : to,
+      method: method,
+      messages: [{ role: 'sent', content: message }]
+    };
 
-    console.log('Sent message to ' + to + ' via ' + method);
+    console.log('Sent delegated message to ' + to + ' via ' + method);
     return true;
   } catch (error) {
     console.error('Failed to send message to ' + to + ': ' + error.message);
@@ -102,7 +101,61 @@ async function notifyStu(message) {
   }
 }
 
+async function handleDelegatedReply(fromNumber, body) {
+  const delegation = delegatedConversations[fromNumber];
+  if (!delegation) return;
+
+  delegation.messages.push({ role: 'received', content: body });
+
+  const contact = getContactByNumber(fromNumber);
+  const contactName = contact ? contact.name : fromNumber;
+
+  const stuFrom = STU_WHATSAPP;
+
+  if (!conversations[stuFrom]) {
+    conversations[stuFrom] = [];
+  }
+
+  const contextMessage = contactName + ' replied to your message: "' + body + '"\n\nHow would you like me to respond?';
+  conversations[stuFrom].push({ role: 'user', content: contextMessage });
+
+  try {
+    const response = await anthropic.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 500,
+      system: SYSTEM_PROMPT,
+      messages: conversations[stuFrom]
+    });
+
+    let jordanReply = response.content[0].text;
+
+    const sendTagMatch = jordanReply.match(/\[SEND_SMS:([^:]+):([^\]]+)\]/);
+    if (sendTagMatch) {
+      const toNumber = sendTagMatch[1].trim();
+      const messageToSend = sendTagMatch[2].trim();
+      jordanReply = jordanReply.replace(/\[SEND_SMS:[^\]]+\]/g, '').trim();
+      const contactForSend = getContactByNumber(toNumber);
+      const method = contactForSend ? contactForSend.method : 'sms';
+      await sendMessageOnBehalf(toNumber, messageToSend, method);
+    }
+
+    conversations[stuFrom].push({ role: 'assistant', content: jordanReply });
+
+    await notifyStu(jordanReply);
+
+  } catch (error) {
+    console.error('Error handling delegated reply:', error);
+    await notifyStu(contactName + ' replied: "' + body + '"');
+  }
+}
+
 module.exports = function(app) {
+
+  module.exports.getDelegatedConversations = function() {
+    return delegatedConversations;
+  };
+
+  module.exports.handleDelegatedReply = handleDelegatedReply;
 
   app.post('/whatsapp', async function(req, res) {
     const From = req.body.From;
@@ -111,9 +164,9 @@ module.exports = function(app) {
     console.log('WhatsApp incoming from ' + From + ': ' + Body);
 
     const cleanFrom = From.replace('whatsapp:', '').replace(/\s/g, '');
-    const cleanStu = (STU_NUMBER || '').replace(/\s/g, '');
+    const cleanStu = (STU_NUMBER || '').replace(/\s/g, '').replace('+', '');
 
-    if (!cleanStu || !cleanFrom.includes(cleanStu.replace('+', ''))) {
+    if (!cleanStu || !cleanFrom.includes(cleanStu)) {
       console.log('Blocked WhatsApp message from non-authorised number: ' + From);
       return res.type('text/xml').send('<Response></Response>');
     }
@@ -130,14 +183,13 @@ module.exports = function(app) {
       return res.type('text/xml').send(twiml.toString());
     }
 
-    if ((Body.trim().toUpperCase() === 'GO AHEAD' || Body.trim().toUpperCase() === 'YES' || Body.trim().toUpperCase() === 'SEND') && pendingSMS[From]) {
+    if (['GO AHEAD', 'YES', 'SEND'].includes(Body.trim().toUpperCase()) && pendingSMS[From]) {
       try {
         const smsJob = pendingSMS[From];
         const contact = findContact(smsJob.contactName);
         const method = contact ? contact.method : 'sms';
-        const taskId = Date.now().toString();
 
-        const success = await sendMessageOnBehalf(smsJob.to, smsJob.message, method, taskId);
+        const success = await sendMessageOnBehalf(smsJob.to, smsJob.message, method);
 
         if (success) {
           delete pendingSMS[From];
@@ -149,7 +201,7 @@ module.exports = function(app) {
           return res.type('text/xml').send(twiml.toString());
         } else {
           const twiml = new twilio.twiml.MessagingResponse();
-          twiml.message('Failed to send the message - please try again.');
+          twiml.message('Failed to send - please try again.');
           return res.type('text/xml').send(twiml.toString());
         }
       } catch (error) {
@@ -205,30 +257,6 @@ module.exports = function(app) {
       twiml.message('Having a technical issue - try again in a moment.');
       res.type('text/xml').send(twiml.toString());
     }
-  });
-
-  app.post('/webhook', async function(req, res) {
-    const From = req.body.From;
-    const Body = req.body.Body;
-
-    console.log('SMS webhook incoming from ' + From + ': ' + Body);
-
-    const cleanFrom = From.replace(/\s/g, '');
-    const delegation = delegatedConversations[cleanFrom];
-
-    if (delegation) {
-      console.log('Delegated reply received from ' + From);
-      delegation.messages.push({ role: 'received', content: Body });
-
-      const contact = getContactByNumber(cleanFrom);
-      const contactName = contact ? contact.name : From;
-
-      await notifyStu(contactName + ' replied: "' + Body + '"\n\nHow would you like me to respond?');
-
-      return res.type('text/xml').send('<Response></Response>');
-    }
-
-    res.type('text/xml').send('<Response></Response>');
   });
 
   app.get('/whatsapp', function(req, res) {

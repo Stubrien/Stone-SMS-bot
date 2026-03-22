@@ -86,8 +86,28 @@ const CONTACTS = {
   'jarrod': { name: 'Jarrod Kemp', number: '+61450836257', method: 'sms', relationship: 'Sales Agent' },
   'jarrod kemp': { name: 'Jarrod Kemp', number: '+61450836257', method: 'sms', relationship: 'Sales Agent' },
   'linda': { name: 'Linda Turk', number: '+61414287337', method: 'sms', relationship: 'Senior Property Manager' },
-  'linda turk': { name: 'Linda Turk', number: '+61414287337', method: 'sms', relationship: 'Senior Property Manager' }
+  'linda turk': { name: 'Linda Turk', number: '+61414287337', method: 'sms', relationship: 'Senior Property Manager' },
+  'josh shanahan': { name: 'Josh Shanahan', number: '+61491118698', method: 'sms', relationship: 'Property Manager' }
 };
+
+function resolveContactNumber(nameOrNumber) {
+  if (!nameOrNumber) return null;
+  const str = nameOrNumber.toString().trim();
+  if (str.startsWith('+') || /^\d/.test(str)) {
+    return str.replace(/\s/g, '');
+  }
+  const lower = str.toLowerCase();
+  if (CONTACTS[lower]) return CONTACTS[lower].number;
+  try {
+    const memories = db.prepare('SELECT key, value FROM memories WHERE category = ?').all('contacts');
+    for (const mem of memories) {
+      if (mem.key.toLowerCase() === lower) {
+        return mem.value.split(' - ')[0].replace(/\s/g, '');
+      }
+    }
+  } catch (e) {}
+  return str;
+}
 
 function getContactByNumber(number) {
   const clean = number.replace('whatsapp:', '').replace(/\s/g, '');
@@ -96,6 +116,21 @@ function getContactByNumber(number) {
       return CONTACTS[key];
     }
   }
+  try {
+    const memories = db.prepare('SELECT key, value FROM memories WHERE category = ?').all('contacts');
+    for (const mem of memories) {
+      const parts = mem.value.split(' - ');
+      const memNumber = parts[0].replace(/\s/g, '');
+      if (memNumber === clean) {
+        return {
+          name: mem.key,
+          number: memNumber,
+          method: parts[1] ? parts[1].trim() : 'sms',
+          relationship: 'Contact'
+        };
+      }
+    }
+  } catch (e) {}
   return null;
 }
 
@@ -277,7 +312,12 @@ async function callClaudeWithSearch(systemPrompt, messages, maxTokens) {
 
 async function sendMessageOnBehalf(to, message, contactName) {
   try {
-    const cleanTo = to.replace(/\s/g, '');
+    const cleanTo = resolveContactNumber(to);
+    if (!cleanTo) {
+      console.error('Could not resolve number for: ' + to);
+      return false;
+    }
+    console.log('Sending to ' + cleanTo + ': ' + message);
     await twilioClient.messages.create({
       from: process.env.TWILIO_PHONE_NUMBER,
       to: cleanTo,
@@ -290,7 +330,7 @@ async function sendMessageOnBehalf(to, message, contactName) {
       messages: [{ role: 'sent', content: message, sentAt: new Date().toISOString() }]
     };
     saveFollowUp(name, cleanTo, message);
-    console.log('Message sent to ' + cleanTo);
+    console.log('Message sent successfully to ' + cleanTo);
     return true;
   } catch (error) {
     console.error('Failed to send to ' + to + ': ' + error.message);
@@ -330,14 +370,11 @@ async function handleTrustedContact(from, body, trustedContact) {
 
   if (!trustedConversations[from]) trustedConversations[from] = [];
   trustedConversations[from].push({ role: 'user', content: body });
-
-  if (trustedConversations[from].length > 10) {
-    trustedConversations[from] = trustedConversations[from].slice(-10);
-  }
+  if (trustedConversations[from].length > 10) trustedConversations[from] = trustedConversations[from].slice(-10);
 
   const pendingReminders = getPendingRemindersForTrusted();
 
-  const trustedSystemPrompt = 'You are Jordan, an AI assistant working for Stu Brien. You are currently talking to ' + trustedContact.name + ' (' + trustedContact.relationship + ') who is a trusted contact. They can set reminders for Stu and view his current reminders. CURRENT DATE AND TIME: ' + currentDateTime + ' Melbourne Australia time. WHAT ' + trustedContact.name.toUpperCase() + ' CAN DO: 1. Set a reminder for Stu - they describe what Stu needs to be reminded about and when. 2. View Stu current reminders. STU CURRENT REMINDERS: ' + pendingReminders + ' SETTING A REMINDER: When ' + trustedContact.name + ' asks you to set a reminder for Stu, confirm the details naturally and include this tag: [TRUSTED_REMINDER:message:scheduled_datetime:context] where scheduled_datetime is YYYY-MM-DD HH:MM. Example: [TRUSTED_REMINDER:Pick up milk and bread on the way home:2026-03-23 17:00:Requested by Yasna]. Tell ' + trustedContact.name + ' the reminder has been set and what time it will go off. Be warm and helpful. Keep responses brief - this is SMS. If they ask about anything outside of reminders and schedule politely explain you can only help with reminders and Stu schedule on this number.';
+  const trustedSystemPrompt = 'You are Jordan, an AI assistant working for Stu Brien. You are currently talking to ' + trustedContact.name + ' (' + trustedContact.relationship + ') who is a trusted contact. They can set reminders for Stu and view his current reminders. CURRENT DATE AND TIME: ' + currentDateTime + ' Melbourne Australia time. WHAT ' + trustedContact.name.toUpperCase() + ' CAN DO: 1. Set a reminder for Stu - they describe what and when. 2. View Stu current reminders. STU CURRENT REMINDERS: ' + pendingReminders + ' SETTING A REMINDER: When ' + trustedContact.name + ' asks you to set a reminder for Stu confirm the details and include this tag: [TRUSTED_REMINDER:message:scheduled_datetime:context] where scheduled_datetime is YYYY-MM-DD HH:MM. Tell ' + trustedContact.name + ' the reminder has been set. Be warm and brief - this is SMS. If they ask about anything else politely explain you can only help with reminders and Stu schedule on this number.';
 
   try {
     const response = await callClaudeWithSearch(trustedSystemPrompt, trustedConversations[from], 500);
@@ -348,11 +385,9 @@ async function handleTrustedContact(from, body, trustedContact) {
       const message = reminderTagMatch[1].trim();
       const scheduledFor = reminderTagMatch[2].trim();
       const context = reminderTagMatch[3].trim();
-
       saveReminder('STU', message, context, 'Stu', null, scheduledFor, 'ONCE', trustedContact.name);
       reply = reply.replace(/\[TRUSTED_REMINDER:[^\]]+\]/g, '').trim();
-
-      await notifyStu(trustedContact.name + ' has set a reminder for you:\n"' + message + '"\nScheduled for: ' + scheduledFor + '\n\nI have added it to your reminders.');
+      await notifyStu(trustedContact.name + ' has set a reminder for you:\n"' + message + '"\nScheduled for: ' + scheduledFor + '\n\nAdded to your reminders.');
     }
 
     trustedConversations[from].push({ role: 'assistant', content: reply });
@@ -360,7 +395,7 @@ async function handleTrustedContact(from, body, trustedContact) {
 
   } catch (error) {
     console.error('Error handling trusted contact:', error);
-    await replySMS(from, 'Sorry, having a technical issue. Please try again in a moment.');
+    await replySMS(from, 'Sorry, having a technical issue. Please try again.');
   }
 }
 
@@ -422,7 +457,16 @@ function processTagsFromReply(reply) {
   }
   const reminderTags = [...reply.matchAll(/\[REMINDER:([^:]+):([^:]+):([^:]+):([^:]+):([^:]+):([^:]+):([^\]]+)\]/g)];
   for (const match of reminderTags) {
-    saveReminder(match[1].trim(), match[6].trim(), match[7].trim(), match[2].trim(), match[3].trim() === 'none' ? null : match[3].trim(), match[4].trim(), match[5].trim(), 'Stu');
+    saveReminder(
+      match[1].trim(),
+      match[6].trim(),
+      match[7].trim(),
+      match[2].trim(),
+      match[3].trim() === 'none' ? null : match[3].trim(),
+      match[4].trim(),
+      match[5].trim(),
+      'Stu'
+    );
   }
   const cancelTags = [...reply.matchAll(/\[CANCEL_REMINDER:(\d+)\]/g)];
   for (const match of cancelTags) {
@@ -467,7 +511,10 @@ async function checkRemindersAndFollowUps() {
         if (reminder.recurrence === 'DAILY') nextDate.setDate(nextDate.getDate() + 1);
         else if (reminder.recurrence === 'WEEKLY') nextDate.setDate(nextDate.getDate() + 7);
         else if (reminder.recurrence === 'MONTHLY') nextDate.setMonth(nextDate.getMonth() + 1);
-        db.prepare('UPDATE reminders SET scheduled_for = ? WHERE id = ?').run(nextDate.toISOString().slice(0, 16).replace('T', ' '), reminder.id);
+        db.prepare('UPDATE reminders SET scheduled_for = ? WHERE id = ?').run(
+          nextDate.toISOString().slice(0, 16).replace('T', ' '),
+          reminder.id
+        );
       }
     }
     const threeHoursAgo = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
@@ -481,7 +528,7 @@ async function checkRemindersAndFollowUps() {
   }
 }
 
-const BASE_SYSTEM_PROMPT = "You are Jordan, a personal AI assistant for Stu Brien - Principal of Stone Real Estate Ballarat. You help Stu with day to day productivity tasks via WhatsApp. You are efficient, direct and genuinely helpful. You know Stu well and communicate naturally - not overly formal. You have access to web search and use it proactively whenever Stu asks for current information, property data, news, business details, weather, prices or anything that requires up to date information. ABOUT STU: Stu Brien is the Principal and Licensed Real Estate Agent at Stone Real Estate Ballarat. Address: 44 Armstrong St South, Ballarat Central. Phone: 0416 183 566. Email: stubrien@stonerealestate.com.au. STU CONTACTS AND THEIR NUMBERS: Yasna (Wife) +61414682861 - sms. Fiona Hart (Personal Assistant) +61412185312 - sms. Leanne Madigan (Sales Associate) +61429097002 - sms. Tammy Edwards (Sales Admin) +61418318251 - sms. Gwen Brien (Mum) +61414410117 - sms. Glenn Brien (Brother) +61418301954 - sms. Josh Brien (Son) +61434308724 - sms. Aiden Brien (Son) +61498327669 - sms. Rob Cunningham (Sales Agent) +61418543634 - sms. Leigh Hutchinson (Sales Agent) +61407861960 - sms. Jamie Gepp (Sales Agent) +61459201710 - sms. Jarrod Kemp (Sales Agent) +61450836257 - sms. Linda Turk (Property Manager) +61414287337 - sms. WHAT YOU CAN HELP WITH: Web research and information lookup. Drafting and sending messages. Contacting people on Stu behalf. Coordinating meetings and scheduling. Setting reminders. Remembering preferences. Drafting listing copy. Drafting social media posts. Property market questions. Calculations. Writing correspondence. General knowledge. WEB SEARCH USAGE: Use web search for current property sales, listings, RBA rate, weather, business hours, news, market data, restaurant recommendations, any current facts. Summarise concisely. HOW TO HANDLE TASKS: Draft immediately and present cleanly. Answer questions directly. Give 2 to 3 clear options when asked. CONTACTING PEOPLE - TWO STEP PROCESS: STEP 1 - Show draft messages in plain text and ask shall I send these. Do NOT include any [SEND:] tags yet. STEP 2 - When Stu confirms with yes, send, go ahead, ok, yep, yeah or similar - include [SEND:] tags. Format: [SEND:+PHONENUMBER:message text] one per line per recipient. ALWAYS INTRODUCE AS AI ASSISTANT: When contacting someone for the first time say: Hi [name], this is Jordan - I am Stu Brien AI assistant. MEMORY SYSTEM - SAVING: When Stu tells you something worth remembering save it using: [MEMORY:category:key:value]. Categories: preferences, contacts, instructions, tasks. Tell Stu: Got it - I will remember that. MEMORY SYSTEM - DELETING: [FORGET:category:key]. REMINDER SYSTEM: When Stu sets a reminder use: [REMINDER:type:recipient:recipient_number:scheduled_datetime:recurrence:message:context]. Type is STU or CONTACT. Recurrence is ONCE, DAILY, WEEKLY or MONTHLY. Datetime format is YYYY-MM-DD HH:MM. Confirm back with exact date and time. CANCEL REMINDER: [CANCEL_REMINDER:id]. FOLLOW UP TRACKING: When you send a message expecting a reply use: [FOLLOW_UP:contact_name:contact_number:message_summary]. DELEGATED CONVERSATIONS: When someone replies their message will be forwarded to you. Report back to Stu and ask how to respond. TONE: Direct, efficient and natural. No excessive formality. Concise. Dot points for lists. IMPORTANT: Confidential.";
+const BASE_SYSTEM_PROMPT = "You are Jordan, a personal AI assistant for Stu Brien - Principal of Stone Real Estate Ballarat. You help Stu with day to day productivity tasks via WhatsApp. You are efficient, direct and genuinely helpful. You know Stu well and communicate naturally - not overly formal. You have access to web search and use it proactively whenever Stu asks for current information, property data, news, business details, weather, prices or anything that requires up to date information. ABOUT STU: Stu Brien is the Principal and Licensed Real Estate Agent at Stone Real Estate Ballarat. Address: 44 Armstrong St South, Ballarat Central. Phone: 0416 183 566. Email: stubrien@stonerealestate.com.au. STU CONTACTS AND THEIR NUMBERS: Yasna (Wife) +61414682861 - sms. Fiona Hart (Personal Assistant) +61412185312 - sms. Leanne Madigan (Sales Associate) +61429097002 - sms. Tammy Edwards (Sales Admin) +61418318251 - sms. Gwen Brien (Mum) +61414410117 - sms. Glenn Brien (Brother) +61418301954 - sms. Josh Brien (Son) +61434308724 - sms. Aiden Brien (Son) +61498327669 - sms. Rob Cunningham (Sales Agent) +61418543634 - sms. Leigh Hutchinson (Sales Agent) +61407861960 - sms. Jamie Gepp (Sales Agent) +61459201710 - sms. Jarrod Kemp (Sales Agent) +61450836257 - sms. Linda Turk (Property Manager) +61414287337 - sms. Josh Shanahan (Property Manager) +61491118698 - sms. Additional contacts are stored in memory and will be available in your context. WHAT YOU CAN HELP WITH: Web research and information lookup. Drafting and sending messages. Contacting people on Stu behalf. Coordinating meetings and scheduling. Setting reminders. Remembering preferences and contacts. Drafting listing copy. Drafting social media posts. Property market questions. Calculations. Writing correspondence. General knowledge. WEB SEARCH BEHAVIOUR: When using web search do not narrate your search process to Stu. Do not say things like Let me search for that or Let me try a different approach or I will look that up. Just search silently and present the final result cleanly and directly. ADDING CONTACTS: When Stu asks you to add a contact save it using: [MEMORY:contacts:Full Name:+61XXXXXXXXX - sms]. Confirm back to Stu that the contact has been saved. HOW TO HANDLE TASKS: Draft immediately and present cleanly. Answer questions directly. Give 2 to 3 clear options when asked. CONTACTING PEOPLE - TWO STEP PROCESS: STEP 1 - Show draft messages in plain text and ask shall I send these. Do NOT include any [SEND:] tags yet. STEP 2 - When Stu confirms with yes, send, go ahead, ok, yep, yeah or similar - include [SEND:] tags. Format: [SEND:+PHONENUMBER:message text] one per line per recipient. ALWAYS INTRODUCE AS AI ASSISTANT: When contacting someone for the first time say: Hi [name], this is Jordan - I am Stu Brien AI assistant. MEMORY SYSTEM - SAVING: When Stu tells you something worth remembering save it using: [MEMORY:category:key:value]. Categories: preferences, contacts, instructions, tasks. Tell Stu: Got it - I will remember that. MEMORY SYSTEM - DELETING: [FORGET:category:key]. REMINDER SYSTEM: When Stu sets a reminder use: [REMINDER:type:recipient:recipient_number:scheduled_datetime:recurrence:message:context]. Type is STU or CONTACT. Recurrence is ONCE, DAILY, WEEKLY or MONTHLY. Datetime format is YYYY-MM-DD HH:MM. Confirm back with exact date and time. CANCEL REMINDER: [CANCEL_REMINDER:id]. FOLLOW UP TRACKING: When you send a message expecting a reply use: [FOLLOW_UP:contact_name:contact_number:message_summary]. DELEGATED CONVERSATIONS: When someone replies their message will be forwarded to you. Report back to Stu and ask how to respond. TONE: Direct, efficient and natural. No excessive formality. Concise. Dot points for lists. IMPORTANT: Confidential.";
 
 module.exports = function(app) {
 
@@ -490,9 +537,7 @@ module.exports = function(app) {
   };
 
   module.exports.handleDelegatedReply = handleDelegatedReply;
-
   module.exports.handleTrustedContact = handleTrustedContact;
-
   module.exports.getTrustedContact = getTrustedContact;
 
   setInterval(checkRemindersAndFollowUps, 60 * 1000);

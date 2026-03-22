@@ -1,5 +1,6 @@
 const express = require('express');
 const alexBot = require('./alex');
+const jordanPersonal = require('./jordan-personal');
 const twilio = require('twilio');
 const Anthropic = require('@anthropic-ai/sdk');
 
@@ -297,6 +298,7 @@ app.post('/webhook', async function(req, res) {
   }
 });
 alexBot(app);
+jordanPersonal(app);
 
 app.get('/', function(req, res) {
   res.send('Stone Real Estate SMS Bot is running!');

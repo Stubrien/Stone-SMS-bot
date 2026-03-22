@@ -88,8 +88,9 @@ async function sendMessageOnBehalf(to, message, method) {
 
 async function notifyStu(message) {
   try {
+    const whatsappFrom = process.env.WHATSAPP_FROM || 'whatsapp:' + process.env.TWILIO_PHONE_NUMBER;
     await twilioClient.messages.create({
-      from: 'whatsapp:' + process.env.TWILIO_PHONE_NUMBER,
+      from: whatsappFrom,
       to: STU_WHATSAPP,
       body: message
     });

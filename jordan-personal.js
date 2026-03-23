@@ -29,7 +29,7 @@ function getMelbourneOffset() {
 function melbourneToUTC(dateTimeStr) {
   const clean = dateTimeStr.trim().replace('.', ':');
   const offset = getMelbourneOffset();
-  const local = new Date(clean);
+  const local = new Date(clean.replace(' ', 'T') + ':00');
   const utc = new Date(local.getTime() - offset * 60 * 60 * 1000);
   console.log('Converting Melbourne time ' + clean + ' (offset +' + offset + ') to UTC: ' + utc.toISOString());
   return utc.toISOString();

@@ -61,6 +61,7 @@ function melbourneToUTC(dateTimeStr) {
     return new Date().toISOString();
   }
 }
+
 async function initDB() {
   try {
     await pool.query(`
@@ -530,7 +531,8 @@ async function checkRemindersAndFollowUps() {
         await pool.query(`
           UPDATE reminders SET status = 'prompted', last_follow_up = $1 WHERE id = $2
         `, [new Date().toISOString(), reminder.id]);
-        console.log('Reminder prompted to Stu: ID ' + reminder.id);
+        pendingSnooze['lastPromptedId'] = reminder.id;
+        console.log('Reminder prompted to Stu: ID ' + reminder.id + ' - stored as lastPromptedId');
       } else if (reminder.type === 'CONTACT' && reminder.recipient_number) {
         await sendMessageOnBehalf(reminder.recipient_number, reminder.message, reminder.recipient);
         await notifyStu('Sent reminder to ' + reminder.recipient + ': "' + reminder.message + '"');
@@ -555,6 +557,7 @@ async function checkRemindersAndFollowUps() {
         last_follow_up = $1
         WHERE id = $2
       `, [new Date().toISOString(), reminder.id]);
+      pendingSnooze['lastPromptedId'] = reminder.id;
     }
 
     const threeHoursAgo = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
@@ -576,16 +579,19 @@ async function checkRemindersAndFollowUps() {
 
 async function handleReminderResponse(body) {
   const bodyUpper = body.trim().toUpperCase();
+  const lastId = pendingSnooze['lastPromptedId'];
 
   if (bodyUpper === 'DONE') {
     try {
-      const result = await pool.query(`
-        UPDATE reminders SET status = 'done'
-        WHERE status = 'prompted'
-        RETURNING id, message, recurrence, scheduled_for
-      `);
+      const result = await pool.query(
+        lastId
+          ? 'UPDATE reminders SET status = $1 WHERE id = $2 RETURNING id, message, recurrence, scheduled_for'
+          : "UPDATE reminders SET status = $1 WHERE status = 'prompted' RETURNING id, message, recurrence, scheduled_for",
+        lastId ? ['done', lastId] : ['done']
+      );
       if (result.rows.length > 0) {
         const reminder = result.rows[0];
+        delete pendingSnooze['lastPromptedId'];
         if (reminder.recurrence && reminder.recurrence !== 'ONCE') {
           let nextDate = new Date(reminder.scheduled_for);
           if (reminder.recurrence === 'DAILY') nextDate.setDate(nextDate.getDate() + 1);
@@ -610,12 +616,14 @@ async function handleReminderResponse(body) {
 
   if (bodyUpper === 'CANCEL') {
     try {
-      const result = await pool.query(`
-        UPDATE reminders SET status = 'cancelled'
-        WHERE status = 'prompted'
-        RETURNING id, message
-      `);
+      const result = await pool.query(
+        lastId
+          ? 'UPDATE reminders SET status = $1 WHERE id = $2 RETURNING id, message'
+          : "UPDATE reminders SET status = $1 WHERE status = 'prompted' RETURNING id, message",
+        lastId ? ['cancelled', lastId] : ['cancelled']
+      );
       if (result.rows.length > 0) {
+        delete pendingSnooze['lastPromptedId'];
         await notifyStu('Reminder cancelled and removed.');
         console.log('Reminder cancelled: ID ' + result.rows[0].id);
         return true;
@@ -623,19 +631,22 @@ async function handleReminderResponse(body) {
     } catch (e) { console.error('Error cancelling:', e.message); }
   }
 
-  if (bodyUpper === 'SNOOZE' || bodyUpper.includes('SNOOZE')) {
-    pendingSnooze[STU_WHATSAPP] = true;
+  if (bodyUpper === 'SNOOZE' || bodyUpper.startsWith('SNOOZE')) {
+    pendingSnooze['waitingForSnoozeTime'] = true;
     await notifyStu('When would you like me to remind you again?');
     return true;
   }
 
-  if (pendingSnooze[STU_WHATSAPP]) {
+  if (pendingSnooze['waitingForSnoozeTime']) {
     try {
-      const result = await pool.query(`
-        SELECT id, message FROM reminders WHERE status = 'prompted' LIMIT 1
-      `);
+      const result = await pool.query(
+        lastId
+          ? 'SELECT id, message FROM reminders WHERE id = $1 LIMIT 1'
+          : "SELECT id, message FROM reminders WHERE status = 'prompted' LIMIT 1",
+        lastId ? [lastId] : []
+      );
       if (result.rows.length > 0) {
-        delete pendingSnooze[STU_WHATSAPP];
+        delete pendingSnooze['waitingForSnoozeTime'];
         const currentDateTime = getCurrentDateTime();
         const snoozeResponse = await anthropic.messages.create({
           model: 'claude-sonnet-4-20250514',

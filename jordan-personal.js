@@ -20,10 +20,21 @@ const STU_WHATSAPP = 'whatsapp:' + (process.env.STU_WHATSAPP_NUMBER || '');
 const WHATSAPP_FROM = process.env.WHATSAPP_FROM || 'whatsapp:' + process.env.TWILIO_PHONE_NUMBER;
 
 function getMelbourneOffset() {
-  const now = new Date();
-  const melbourne = new Date(now.toLocaleString('en-AU', { timeZone: 'Australia/Melbourne' }));
-  const utc = new Date(now.toLocaleString('en-AU', { timeZone: 'UTC' }));
-  return (melbourne - utc) / (60 * 60 * 1000);
+  try {
+    const now = new Date();
+    const melbStr = now.toLocaleString('en-US', { timeZone: 'Australia/Melbourne', hour: 'numeric', hour12: false });
+    const utcStr = now.toLocaleString('en-US', { timeZone: 'UTC', hour: 'numeric', hour12: false });
+    const melbHour = parseInt(melbStr);
+    const utcHour = parseInt(utcStr);
+    let diff = melbHour - utcHour;
+    if (diff < -12) diff += 24;
+    if (diff > 12) diff -= 24;
+    console.log('Melbourne offset calculated: +' + diff);
+    return diff;
+  } catch (e) {
+    console.error('getMelbourneOffset error: ' + e.message);
+    return 11;
+  }
 }
 
 function melbourneToUTC(dateTimeStr) {
@@ -612,7 +623,7 @@ async function handleReminderResponse(body) {
     } catch (e) { console.error('Error cancelling:', e.message); }
   }
 
-  if (bodyUpper === 'SNOOZE') {
+  if (bodyUpper === 'SNOOZE' || bodyUpper.includes('SNOOZE')) {
     pendingSnooze[STU_WHATSAPP] = true;
     await notifyStu('When would you like me to remind you again?');
     return true;

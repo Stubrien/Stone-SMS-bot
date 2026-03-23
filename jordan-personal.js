@@ -27,14 +27,29 @@ function getMelbourneOffset() {
 }
 
 function melbourneToUTC(dateTimeStr) {
-  const clean = dateTimeStr.trim().replace('.', ':');
-  const offset = getMelbourneOffset();
-  const local = new Date(clean.replace(' ', 'T') + ':00');
-  const utc = new Date(local.getTime() - offset * 60 * 60 * 1000);
-  console.log('Converting Melbourne time ' + clean + ' (offset +' + offset + ') to UTC: ' + utc.toISOString());
-  return utc.toISOString();
+  try {
+    const clean = dateTimeStr.trim().replace('.', ':');
+    console.log('Converting Melbourne time: ' + clean);
+    const parts = clean.match(/(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2})/);
+    if (!parts) {
+      console.error('Could not parse datetime: ' + clean);
+      return new Date().toISOString();
+    }
+    const year = parseInt(parts[1]);
+    const month = parseInt(parts[2]) - 1;
+    const day = parseInt(parts[3]);
+    const hour = parseInt(parts[4]);
+    const minute = parseInt(parts[5]);
+    const offset = getMelbourneOffset();
+    console.log('Melbourne offset: ' + offset);
+    const utc = new Date(Date.UTC(year, month, day, hour - offset, minute));
+    console.log('UTC result: ' + utc.toISOString());
+    return utc.toISOString();
+  } catch (e) {
+    console.error('melbourneToUTC error: ' + e.message);
+    return new Date().toISOString();
+  }
 }
-
 async function initDB() {
   try {
     await pool.query(`

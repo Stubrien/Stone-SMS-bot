@@ -1,54 +1,66 @@
 const Anthropic = require('@anthropic-ai/sdk');
 const twilio = require('twilio');
-const Database = require('better-sqlite3');
-const path = require('path');
+const { Pool } = require('pg');
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 
+const pool = new Pool({
+  connectionString: process.env.SUPABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
+
 const conversations = {};
 const trustedConversations = {};
 const delegatedConversations = {};
+const pendingSnooze = {};
 
 const STU_NUMBER = process.env.STU_WHATSAPP_NUMBER;
 const STU_WHATSAPP = 'whatsapp:' + (process.env.STU_WHATSAPP_NUMBER || '');
 const WHATSAPP_FROM = process.env.WHATSAPP_FROM || 'whatsapp:' + process.env.TWILIO_PHONE_NUMBER;
 
-const db = new Database(path.join('/tmp', 'jordan.db'));
-
-db.exec(`
-  CREATE TABLE IF NOT EXISTS memories (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    category TEXT NOT NULL,
-    key TEXT NOT NULL,
-    value TEXT NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(category, key)
-  );
-  CREATE TABLE IF NOT EXISTS reminders (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    type TEXT NOT NULL,
-    message TEXT NOT NULL,
-    context TEXT,
-    recipient TEXT,
-    recipient_number TEXT,
-    scheduled_for DATETIME NOT NULL,
-    recurrence TEXT,
-    sent INTEGER DEFAULT 0,
-    set_by TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-  CREATE TABLE IF NOT EXISTS follow_ups (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    contact_name TEXT NOT NULL,
-    contact_number TEXT NOT NULL,
-    message_sent TEXT NOT NULL,
-    sent_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    prompted INTEGER DEFAULT 0,
-    resolved INTEGER DEFAULT 0
-  );
-`);
+async function initDB() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS memories (
+        id SERIAL PRIMARY KEY,
+        category TEXT NOT NULL,
+        key TEXT NOT NULL,
+        value TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(category, key)
+      );
+      CREATE TABLE IF NOT EXISTS reminders (
+        id SERIAL PRIMARY KEY,
+        type TEXT NOT NULL,
+        message TEXT NOT NULL,
+        context TEXT,
+        recipient TEXT,
+        recipient_number TEXT,
+        scheduled_for TIMESTAMP NOT NULL,
+        recurrence TEXT,
+        status TEXT DEFAULT 'pending',
+        follow_up_count INTEGER DEFAULT 0,
+        last_follow_up TIMESTAMP,
+        set_by TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE TABLE IF NOT EXISTS follow_ups (
+        id SERIAL PRIMARY KEY,
+        contact_name TEXT NOT NULL,
+        contact_number TEXT NOT NULL,
+        message_sent TEXT NOT NULL,
+        sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        prompted INTEGER DEFAULT 0,
+        resolved INTEGER DEFAULT 0
+      );
+    `);
+    console.log('Supabase database initialised successfully');
+  } catch (error) {
+    console.error('Database init error:', error.message);
+  }
+}
 
 const TRUSTED_CONTACTS = {
   '+61414682861': { name: 'Yasna', relationship: 'Wife' },
@@ -93,41 +105,24 @@ const CONTACTS = {
 function resolveContactNumber(nameOrNumber) {
   if (!nameOrNumber) return null;
   const str = nameOrNumber.toString().trim();
-  if (str.startsWith('+') || /^\d/.test(str)) {
-    return str.replace(/\s/g, '');
-  }
+  if (str.startsWith('+') || /^\d/.test(str)) return str.replace(/\s/g, '');
   const lower = str.toLowerCase();
   if (CONTACTS[lower]) return CONTACTS[lower].number;
-  try {
-    const memories = db.prepare('SELECT key, value FROM memories WHERE category = ?').all('contacts');
-    for (const mem of memories) {
-      if (mem.key.toLowerCase() === lower) {
-        return mem.value.split(' - ')[0].replace(/\s/g, '');
-      }
-    }
-  } catch (e) {}
   return str;
 }
 
-function getContactByNumber(number) {
+async function getContactByNumber(number) {
   const clean = number.replace('whatsapp:', '').replace(/\s/g, '');
   for (const key in CONTACTS) {
-    if (CONTACTS[key].number.replace(/\s/g, '') === clean) {
-      return CONTACTS[key];
-    }
+    if (CONTACTS[key].number.replace(/\s/g, '') === clean) return CONTACTS[key];
   }
   try {
-    const memories = db.prepare('SELECT key, value FROM memories WHERE category = ?').all('contacts');
-    for (const mem of memories) {
-      const parts = mem.value.split(' - ');
+    const result = await pool.query('SELECT key, value FROM memories WHERE category = $1', ['contacts']);
+    for (const row of result.rows) {
+      const parts = row.value.split(' - ');
       const memNumber = parts[0].replace(/\s/g, '');
       if (memNumber === clean) {
-        return {
-          name: mem.key,
-          number: memNumber,
-          method: parts[1] ? parts[1].trim() : 'sms',
-          relationship: 'Contact'
-        };
+        return { name: row.key, number: memNumber, method: parts[1] ? parts[1].trim() : 'sms', relationship: 'Contact' };
       }
     }
   } catch (e) {}
@@ -142,33 +137,26 @@ function getTrustedContact(number) {
 function getCurrentDateTime() {
   return new Date().toLocaleString('en-AU', {
     timeZone: 'Australia/Melbourne',
-    weekday: 'long',
-    year: 'numeric',
-    month: 'long',
-    day: 'numeric',
-    hour: '2-digit',
-    minute: '2-digit'
+    weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
+    hour: '2-digit', minute: '2-digit'
   });
 }
 
 function isActiveHours() {
   const hour = parseInt(new Date().toLocaleString('en-AU', {
-    timeZone: 'Australia/Melbourne',
-    hour: '2-digit',
-    hour12: false
+    timeZone: 'Australia/Melbourne', hour: '2-digit', hour12: false
   }));
   return hour >= 7 && hour < 21;
 }
 
-function saveMemory(category, key, value) {
+async function saveMemory(category, key, value) {
   try {
-    db.prepare(`
+    await pool.query(`
       INSERT INTO memories (category, key, value, updated_at)
-      VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-      ON CONFLICT(category, key) DO UPDATE SET
-      value = excluded.value,
-      updated_at = CURRENT_TIMESTAMP
-    `).run(category, key, value);
+      VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
+      ON CONFLICT (category, key) DO UPDATE SET
+      value = EXCLUDED.value, updated_at = CURRENT_TIMESTAMP
+    `, [category, key, value]);
     console.log('Memory saved: [' + category + '] ' + key + ' = ' + value);
     return true;
   } catch (error) {
@@ -177,30 +165,33 @@ function saveMemory(category, key, value) {
   }
 }
 
-function loadAllMemories() {
+async function loadAllMemories() {
   try {
-    return db.prepare('SELECT category, key, value FROM memories ORDER BY category, key').all();
+    const result = await pool.query('SELECT category, key, value FROM memories ORDER BY category, key');
+    return result.rows;
   } catch (error) {
+    console.error('Failed to load memories:', error.message);
     return [];
   }
 }
 
-function deleteMemory(category, key) {
+async function deleteMemory(category, key) {
   try {
-    db.prepare('DELETE FROM memories WHERE category = ? AND key = ?').run(category, key);
+    await pool.query('DELETE FROM memories WHERE category = $1 AND key = $2', [category, key]);
     return true;
   } catch (error) {
     return false;
   }
 }
 
-function saveReminder(type, message, context, recipient, recipientNumber, scheduledFor, recurrence, setBy) {
+async function saveReminder(type, message, context, recipient, recipientNumber, scheduledFor, recurrence, setBy) {
   try {
-    db.prepare(`
-      INSERT INTO reminders (type, message, context, recipient, recipient_number, scheduled_for, recurrence, set_by)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(type, message, context || null, recipient || 'Stu', recipientNumber || null, scheduledFor, recurrence || null, setBy || 'Stu');
-    console.log('Reminder saved for ' + scheduledFor + ' set by ' + (setBy || 'Stu'));
+    const result = await pool.query(`
+      INSERT INTO reminders (type, message, context, recipient, recipient_number, scheduled_for, recurrence, set_by, status)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending')
+      RETURNING id
+    `, [type, message, context || null, recipient || 'Stu', recipientNumber || null, scheduledFor, recurrence || 'ONCE', setBy || 'Stu']);
+    console.log('Reminder saved ID:' + result.rows[0].id + ' for ' + scheduledFor + ' set by ' + (setBy || 'Stu'));
     return true;
   } catch (error) {
     console.error('Failed to save reminder:', error.message);
@@ -208,17 +199,17 @@ function saveReminder(type, message, context, recipient, recipientNumber, schedu
   }
 }
 
-function saveFollowUp(contactName, contactNumber, messageSent) {
+async function saveFollowUp(contactName, contactNumber, messageSent) {
   try {
-    db.prepare('INSERT INTO follow_ups (contact_name, contact_number, message_sent) VALUES (?, ?, ?)').run(contactName, contactNumber, messageSent);
+    await pool.query('INSERT INTO follow_ups (contact_name, contact_number, message_sent) VALUES ($1, $2, $3)', [contactName, contactNumber, messageSent]);
     return true;
   } catch (error) {
     return false;
   }
 }
 
-function buildMemoryContext() {
-  const memories = loadAllMemories();
+async function buildMemoryContext() {
+  const memories = await loadAllMemories();
   if (memories.length === 0) return '';
   const grouped = {};
   for (const mem of memories) {
@@ -228,19 +219,21 @@ function buildMemoryContext() {
   let context = '\n\nSTU PREFERENCES AND MEMORY:\n';
   for (const category in grouped) {
     context += category.toUpperCase() + ':\n';
-    for (const item of grouped[category]) {
-      context += '- ' + item + '\n';
-    }
+    for (const item of grouped[category]) context += '- ' + item + '\n';
   }
   return context;
 }
 
-function getPendingRemindersContext() {
+async function getPendingRemindersContext() {
   try {
-    const reminders = db.prepare('SELECT * FROM reminders WHERE sent = 0 ORDER BY scheduled_for ASC LIMIT 10').all();
-    if (reminders.length === 0) return '';
+    const result = await pool.query(`
+      SELECT * FROM reminders 
+      WHERE status IN ('pending', 'prompted') 
+      ORDER BY scheduled_for ASC LIMIT 10
+    `);
+    if (result.rows.length === 0) return '';
     let context = '\n\nPENDING REMINDERS:\n';
-    for (const r of reminders) {
+    for (const r of result.rows) {
       context += '- [ID:' + r.id + '] ' + r.scheduled_for + ' - ' + (r.recipient !== 'Stu' ? 'To ' + r.recipient + ': ' : '') + r.message + (r.set_by && r.set_by !== 'Stu' ? ' (set by ' + r.set_by + ')' : '') + '\n';
     }
     return context;
@@ -249,14 +242,16 @@ function getPendingRemindersContext() {
   }
 }
 
-function getPendingRemindersForTrusted() {
+async function getPendingRemindersForTrusted() {
   try {
-    const reminders = db.prepare('SELECT * FROM reminders WHERE sent = 0 ORDER BY scheduled_for ASC LIMIT 5').all();
-    if (reminders.length === 0) return 'Stu has no pending reminders.';
+    const result = await pool.query(`
+      SELECT * FROM reminders 
+      WHERE status IN ('pending', 'prompted') 
+      ORDER BY scheduled_for ASC LIMIT 5
+    `);
+    if (result.rows.length === 0) return 'Stu has no pending reminders.';
     let text = 'Stu current reminders:\n';
-    for (const r of reminders) {
-      text += '- ' + r.scheduled_for + ': ' + r.message + '\n';
-    }
+    for (const r of result.rows) text += '- ' + r.scheduled_for + ': ' + r.message + '\n';
     return text;
   } catch (e) {
     return 'Could not retrieve reminders.';
@@ -284,14 +279,7 @@ async function callClaudeWithSearch(systemPrompt, messages, maxTokens) {
       const toolResultMessages = [
         ...messages,
         { role: 'assistant', content: response.content },
-        {
-          role: 'user',
-          content: [{
-            type: 'tool_result',
-            tool_use_id: toolUseBlock.id,
-            content: 'Search completed for: ' + toolUseBlock.input.query
-          }]
-        }
+        { role: 'user', content: [{ type: 'tool_result', tool_use_id: toolUseBlock.id, content: 'Search completed for: ' + toolUseBlock.input.query }] }
       ];
       const followUp = await anthropic.messages.create({
         model: 'claude-sonnet-4-20250514',
@@ -306,30 +294,19 @@ async function callClaudeWithSearch(systemPrompt, messages, maxTokens) {
       }
     }
   }
-
   return fullText;
 }
 
 async function sendMessageOnBehalf(to, message, contactName) {
   try {
     const cleanTo = resolveContactNumber(to);
-    if (!cleanTo) {
-      console.error('Could not resolve number for: ' + to);
-      return false;
-    }
+    if (!cleanTo) { console.error('Could not resolve number for: ' + to); return false; }
     console.log('Sending to ' + cleanTo + ': ' + message);
-    await twilioClient.messages.create({
-      from: process.env.TWILIO_PHONE_NUMBER,
-      to: cleanTo,
-      body: message
-    });
-    const contact = getContactByNumber(cleanTo);
+    await twilioClient.messages.create({ from: process.env.TWILIO_PHONE_NUMBER, to: cleanTo, body: message });
+    const contact = await getContactByNumber(cleanTo);
     const name = contactName || (contact ? contact.name : cleanTo);
-    delegatedConversations[cleanTo] = {
-      contactName: name,
-      messages: [{ role: 'sent', content: message, sentAt: new Date().toISOString() }]
-    };
-    saveFollowUp(name, cleanTo, message);
+    delegatedConversations[cleanTo] = { contactName: name, messages: [{ role: 'sent', content: message, sentAt: new Date().toISOString() }] };
+    await saveFollowUp(name, cleanTo, message);
     console.log('Message sent successfully to ' + cleanTo);
     return true;
   } catch (error) {
@@ -340,11 +317,7 @@ async function sendMessageOnBehalf(to, message, contactName) {
 
 async function notifyStu(message) {
   try {
-    await twilioClient.messages.create({
-      from: WHATSAPP_FROM,
-      to: STU_WHATSAPP,
-      body: message
-    });
+    await twilioClient.messages.create({ from: WHATSAPP_FROM, to: STU_WHATSAPP, body: message });
     console.log('Stu notified: ' + message.substring(0, 60));
   } catch (error) {
     console.error('Failed to notify Stu: ' + error.message);
@@ -353,11 +326,7 @@ async function notifyStu(message) {
 
 async function replySMS(to, message) {
   try {
-    await twilioClient.messages.create({
-      from: process.env.TWILIO_PHONE_NUMBER,
-      to: to,
-      body: message
-    });
+    await twilioClient.messages.create({ from: process.env.TWILIO_PHONE_NUMBER, to: to, body: message });
     console.log('Replied to ' + to);
   } catch (error) {
     console.error('Failed to reply to ' + to + ': ' + error.message);
@@ -372,9 +341,9 @@ async function handleTrustedContact(from, body, trustedContact) {
   trustedConversations[from].push({ role: 'user', content: body });
   if (trustedConversations[from].length > 10) trustedConversations[from] = trustedConversations[from].slice(-10);
 
-  const pendingReminders = getPendingRemindersForTrusted();
+  const pendingReminders = await getPendingRemindersForTrusted();
 
-  const trustedSystemPrompt = 'You are Jordan, an AI assistant working for Stu Brien. You are currently talking to ' + trustedContact.name + ' (' + trustedContact.relationship + ') who is a trusted contact. They can set reminders for Stu and view his current reminders. CURRENT DATE AND TIME: ' + currentDateTime + ' Melbourne Australia time. WHAT ' + trustedContact.name.toUpperCase() + ' CAN DO: 1. Set a reminder for Stu - they describe what and when. 2. View Stu current reminders. STU CURRENT REMINDERS: ' + pendingReminders + ' SETTING A REMINDER: When ' + trustedContact.name + ' asks you to set a reminder for Stu confirm the details and include this tag: [TRUSTED_REMINDER:message:scheduled_datetime:context] where scheduled_datetime is YYYY-MM-DD HH:MM. Tell ' + trustedContact.name + ' the reminder has been set. Be warm and brief - this is SMS. If they ask about anything else politely explain you can only help with reminders and Stu schedule on this number.';
+  const trustedSystemPrompt = 'You are Jordan, an AI assistant working for Stu Brien. You are currently talking to ' + trustedContact.name + ' (' + trustedContact.relationship + ') who is a trusted contact. They can set reminders for Stu and view his current reminders. CURRENT DATE AND TIME: ' + currentDateTime + ' Melbourne Australia time. WHAT ' + trustedContact.name.toUpperCase() + ' CAN DO: 1. Set a reminder for Stu. 2. View Stu current reminders. STU CURRENT REMINDERS: ' + pendingReminders + ' SETTING A REMINDER: When ' + trustedContact.name + ' asks you to set a reminder for Stu confirm the details and include this tag: [TRUSTED_REMINDER:message:scheduled_datetime:context] where scheduled_datetime is YYYY-MM-DD HH:MM. Tell ' + trustedContact.name + ' the reminder has been set. Be warm and brief - this is SMS. If they ask about anything else politely explain you can only help with reminders and Stu schedule on this number.';
 
   try {
     const response = await callClaudeWithSearch(trustedSystemPrompt, trustedConversations[from], 500);
@@ -385,14 +354,13 @@ async function handleTrustedContact(from, body, trustedContact) {
       const message = reminderTagMatch[1].trim();
       const scheduledFor = reminderTagMatch[2].trim();
       const context = reminderTagMatch[3].trim();
-      saveReminder('STU', message, context, 'Stu', null, scheduledFor, 'ONCE', trustedContact.name);
+      await saveReminder('STU', message, context, 'Stu', null, scheduledFor, 'ONCE', trustedContact.name);
       reply = reply.replace(/\[TRUSTED_REMINDER:[^\]]+\]/g, '').trim();
       await notifyStu(trustedContact.name + ' has set a reminder for you:\n"' + message + '"\nScheduled for: ' + scheduledFor + '\n\nAdded to your reminders.');
     }
 
     trustedConversations[from].push({ role: 'assistant', content: reply });
     await replySMS(from, reply);
-
   } catch (error) {
     console.error('Error handling trusted contact:', error);
     await replySMS(from, 'Sorry, having a technical issue. Please try again.');
@@ -406,76 +374,58 @@ async function handleDelegatedReply(fromNumber, body) {
   console.log('Delegated reply from ' + fromNumber + ': ' + body);
   delegation.messages.push({ role: 'received', content: body });
 
-  try {
-    db.prepare('UPDATE follow_ups SET resolved = 1 WHERE contact_number = ? AND resolved = 0').run(fromNumber);
-  } catch (e) {}
+  try { await pool.query('UPDATE follow_ups SET resolved = 1 WHERE contact_number = $1 AND resolved = 0', [fromNumber]); } catch (e) {}
 
-  const contact = getContactByNumber(fromNumber);
+  const contact = await getContactByNumber(fromNumber);
   const contactName = contact ? contact.name : fromNumber;
   const stuFrom = STU_WHATSAPP;
 
   if (!conversations[stuFrom]) conversations[stuFrom] = [];
-
   const contextMessage = contactName + ' replied: "' + body + '"';
   conversations[stuFrom].push({ role: 'user', content: contextMessage });
 
   try {
     const currentDateTime = getCurrentDateTime();
-    const memoryContext = buildMemoryContext();
+    const memoryContext = await buildMemoryContext();
     const systemPrompt = BASE_SYSTEM_PROMPT + memoryContext + '\n\nCURRENT DATE AND TIME: ' + currentDateTime + ' Melbourne time.';
-
     const reply = await callClaudeWithSearch(systemPrompt, conversations[stuFrom]);
 
     const allSendTags = [...reply.matchAll(/\[SEND:(\+[\d]+):([^\]]+)\]/g)];
     let cleanReply = reply;
     if (allSendTags.length > 0) {
       cleanReply = reply.replace(/\[SEND:(\+[\d]+):([^\]]+)\]/g, '').trim();
-      for (const match of allSendTags) {
-        await sendMessageOnBehalf(match[1].trim(), match[2].trim());
-      }
+      for (const match of allSendTags) await sendMessageOnBehalf(match[1].trim(), match[2].trim());
     }
 
-    processTagsFromReply(reply);
+    await processTagsFromReply(reply);
     cleanReply = stripAllTags(cleanReply);
     conversations[stuFrom].push({ role: 'assistant', content: cleanReply });
     await notifyStu(cleanReply);
-
   } catch (error) {
     console.error('Error handling delegated reply:', error);
     await notifyStu(contactName + ' replied: "' + body + '"');
   }
 }
 
-function processTagsFromReply(reply) {
+async function processTagsFromReply(reply) {
   const memoryTags = [...reply.matchAll(/\[MEMORY:([^:]+):([^:]+):([^\]]+)\]/g)];
-  for (const match of memoryTags) {
-    saveMemory(match[1].trim(), match[2].trim(), match[3].trim());
-  }
+  for (const match of memoryTags) await saveMemory(match[1].trim(), match[2].trim(), match[3].trim());
+
   const forgetTags = [...reply.matchAll(/\[FORGET:([^:]+):([^\]]+)\]/g)];
-  for (const match of forgetTags) {
-    deleteMemory(match[1].trim(), match[2].trim());
-  }
+  for (const match of forgetTags) await deleteMemory(match[1].trim(), match[2].trim());
+
   const reminderTags = [...reply.matchAll(/\[REMINDER:([^:]+):([^:]+):([^:]+):([^:]+):([^:]+):([^:]+):([^\]]+)\]/g)];
   for (const match of reminderTags) {
-    saveReminder(
-      match[1].trim(),
-      match[6].trim(),
-      match[7].trim(),
-      match[2].trim(),
-      match[3].trim() === 'none' ? null : match[3].trim(),
-      match[4].trim(),
-      match[5].trim(),
-      'Stu'
-    );
+    await saveReminder(match[1].trim(), match[6].trim(), match[7].trim(), match[2].trim(), match[3].trim() === 'none' ? null : match[3].trim(), match[4].trim(), match[5].trim(), 'Stu');
   }
+
   const cancelTags = [...reply.matchAll(/\[CANCEL_REMINDER:(\d+)\]/g)];
   for (const match of cancelTags) {
-    try { db.prepare('UPDATE reminders SET sent = 1 WHERE id = ?').run(parseInt(match[1])); } catch (e) {}
+    try { await pool.query('UPDATE reminders SET status = $1 WHERE id = $2', ['cancelled', parseInt(match[1])]); } catch (e) {}
   }
+
   const followUpTags = [...reply.matchAll(/\[FOLLOW_UP:([^:]+):([^:]+):([^\]]+)\]/g)];
-  for (const match of followUpTags) {
-    saveFollowUp(match[1].trim(), match[2].trim(), match[3].trim());
-  }
+  for (const match of followUpTags) await saveFollowUp(match[1].trim(), match[2].trim(), match[3].trim());
 }
 
 function stripAllTags(reply) {
@@ -492,56 +442,169 @@ function stripAllTags(reply) {
 
 async function checkRemindersAndFollowUps() {
   if (!isActiveHours()) return;
-  const now = new Date().toISOString().slice(0, 16).replace('T', ' ');
+
   try {
-    const dueReminders = db.prepare('SELECT * FROM reminders WHERE sent = 0 AND scheduled_for <= ?').all(now);
-    for (const reminder of dueReminders) {
-      console.log('Processing reminder: ' + reminder.message);
+    const now = new Date().toISOString();
+
+    const dueResult = await pool.query(`
+      SELECT * FROM reminders 
+      WHERE status = 'pending' AND scheduled_for <= $1
+    `, [now]);
+
+    for (const reminder of dueResult.rows) {
+      console.log('Reminder due: [ID:' + reminder.id + '] ' + reminder.message);
+
       if (reminder.type === 'STU') {
         const setByText = reminder.set_by && reminder.set_by !== 'Stu' ? '\n(Set by ' + reminder.set_by + ')' : '';
-        await notifyStu('Reminder: ' + reminder.message + (reminder.context ? '\n' + reminder.context : '') + setByText);
+        await notifyStu(
+          'Reminder: ' + reminder.message +
+          (reminder.context && reminder.context !== 'none' ? '\n' + reminder.context : '') +
+          setByText +
+          '\n\nReply DONE, SNOOZE or CANCEL'
+        );
+        await pool.query(`
+          UPDATE reminders SET status = 'prompted', last_follow_up = $1 WHERE id = $2
+        `, [new Date().toISOString(), reminder.id]);
+        console.log('Reminder prompted to Stu: ID ' + reminder.id);
       } else if (reminder.type === 'CONTACT' && reminder.recipient_number) {
         await sendMessageOnBehalf(reminder.recipient_number, reminder.message, reminder.recipient);
         await notifyStu('Sent reminder to ' + reminder.recipient + ': "' + reminder.message + '"');
-      }
-      if (!reminder.recurrence || reminder.recurrence === 'ONCE') {
-        db.prepare('UPDATE reminders SET sent = 1 WHERE id = ?').run(reminder.id);
-      } else {
-        let nextDate = new Date(reminder.scheduled_for);
-        if (reminder.recurrence === 'DAILY') nextDate.setDate(nextDate.getDate() + 1);
-        else if (reminder.recurrence === 'WEEKLY') nextDate.setDate(nextDate.getDate() + 7);
-        else if (reminder.recurrence === 'MONTHLY') nextDate.setMonth(nextDate.getMonth() + 1);
-        db.prepare('UPDATE reminders SET scheduled_for = ? WHERE id = ?').run(
-          nextDate.toISOString().slice(0, 16).replace('T', ' '),
-          reminder.id
-        );
+        await pool.query('UPDATE reminders SET status = $1 WHERE id = $2', ['done', reminder.id]);
       }
     }
-    const threeHoursAgo = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
-    const overdueFollowUps = db.prepare('SELECT * FROM follow_ups WHERE resolved = 0 AND prompted = 0 AND sent_at <= ?').all(threeHoursAgo);
-    for (const followUp of overdueFollowUps) {
+
+    const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+    const followUpResult = await pool.query(`
+      SELECT * FROM reminders 
+      WHERE status = 'prompted' 
+      AND (last_follow_up <= $1 OR last_follow_up IS NULL)
+      AND type = 'STU'
+    `, [twoHoursAgo]);
+
+    for (const reminder of followUpResult.rows) {
+      console.log('Following up on reminder ID:' + reminder.id);
+      await notifyStu(
+        'Just checking in - did you complete this?\n"' + reminder.message + '"\n\nReply DONE, SNOOZE or CANCEL'
+      );
+      await pool.query(`
+        UPDATE reminders SET 
+        follow_up_count = follow_up_count + 1,
+        last_follow_up = $1
+        WHERE id = $2
+      `, [new Date().toISOString(), reminder.id]);
+    }
+
+    const msgFollowUpResult = await pool.query(`
+      SELECT * FROM follow_ups 
+      WHERE resolved = 0 AND prompted = 0 
+      AND sent_at <= $1
+    `, [new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString()]);
+
+    for (const followUp of msgFollowUpResult.rows) {
       await notifyStu(followUp.contact_name + ' has not replied to your message from 3 hours ago.\n"' + followUp.message_sent.substring(0, 80) + '"\nWant me to follow up?');
-      db.prepare('UPDATE follow_ups SET prompted = 1 WHERE id = ?').run(followUp.id);
+      await pool.query('UPDATE follow_ups SET prompted = 1 WHERE id = $1', [followUp.id]);
     }
+
   } catch (error) {
     console.error('Reminder check error:', error.message);
   }
 }
 
-const BASE_SYSTEM_PROMPT = "You are Jordan, a personal AI assistant for Stu Brien - Principal of Stone Real Estate Ballarat. You help Stu with day to day productivity tasks via WhatsApp. You are efficient, direct and genuinely helpful. You know Stu well and communicate naturally - not overly formal. You have access to web search and use it proactively whenever Stu asks for current information, property data, news, business details, weather, prices or anything that requires up to date information. ABOUT STU: Stu Brien is the Principal and Licensed Real Estate Agent at Stone Real Estate Ballarat. Address: 44 Armstrong St South, Ballarat Central. Phone: 0416 183 566. Email: stubrien@stonerealestate.com.au. STU CONTACTS AND THEIR NUMBERS: Yasna (Wife) +61414682861 - sms. Fiona Hart (Personal Assistant) +61412185312 - sms. Leanne Madigan (Sales Associate) +61429097002 - sms. Tammy Edwards (Sales Admin) +61418318251 - sms. Gwen Brien (Mum) +61414410117 - sms. Glenn Brien (Brother) +61418301954 - sms. Josh Brien (Son) +61434308724 - sms. Aiden Brien (Son) +61498327669 - sms. Rob Cunningham (Sales Agent) +61418543634 - sms. Leigh Hutchinson (Sales Agent) +61407861960 - sms. Jamie Gepp (Sales Agent) +61459201710 - sms. Jarrod Kemp (Sales Agent) +61450836257 - sms. Linda Turk (Property Manager) +61414287337 - sms. Josh Shanahan (Property Manager) +61491118698 - sms. Additional contacts are stored in memory and will be available in your context. WHAT YOU CAN HELP WITH: Web research and information lookup. Drafting and sending messages. Contacting people on Stu behalf. Coordinating meetings and scheduling. Setting reminders. Remembering preferences and contacts. Drafting listing copy. Drafting social media posts. Property market questions. Calculations. Writing correspondence. General knowledge. WEB SEARCH BEHAVIOUR: When using web search do not narrate your search process to Stu. Do not say things like Let me search for that or Let me try a different approach or I will look that up. Just search silently and present the final result cleanly and directly. ADDING CONTACTS: When Stu asks you to add a contact save it using: [MEMORY:contacts:Full Name:+61XXXXXXXXX - sms]. Confirm back to Stu that the contact has been saved. HOW TO HANDLE TASKS: Draft immediately and present cleanly. Answer questions directly. Give 2 to 3 clear options when asked. CONTACTING PEOPLE - TWO STEP PROCESS: STEP 1 - Show draft messages in plain text and ask shall I send these. Do NOT include any [SEND:] tags yet. STEP 2 - When Stu confirms with yes, send, go ahead, ok, yep, yeah or similar - include [SEND:] tags. Format: [SEND:+PHONENUMBER:message text] one per line per recipient. ALWAYS INTRODUCE AS AI ASSISTANT: When contacting someone for the first time say: Hi [name], this is Jordan - I am Stu Brien AI assistant. MEMORY SYSTEM - SAVING: When Stu tells you something worth remembering save it using: [MEMORY:category:key:value]. Categories: preferences, contacts, instructions, tasks. Tell Stu: Got it - I will remember that. MEMORY SYSTEM - DELETING: [FORGET:category:key]. REMINDER SYSTEM: When Stu sets a reminder use: [REMINDER:type:recipient:recipient_number:scheduled_datetime:recurrence:message:context]. Type is STU or CONTACT. Recurrence is ONCE, DAILY, WEEKLY or MONTHLY. Datetime format is YYYY-MM-DD HH:MM. Confirm back with exact date and time. CANCEL REMINDER: [CANCEL_REMINDER:id]. FOLLOW UP TRACKING: When you send a message expecting a reply use: [FOLLOW_UP:contact_name:contact_number:message_summary]. DELEGATED CONVERSATIONS: When someone replies their message will be forwarded to you. Report back to Stu and ask how to respond. TONE: Direct, efficient and natural. No excessive formality. Concise. Dot points for lists. IMPORTANT: Confidential.";
+async function handleReminderResponse(body, reminderContext) {
+  const bodyUpper = body.trim().toUpperCase();
+
+  if (bodyUpper === 'DONE') {
+    try {
+      const result = await pool.query(`
+        UPDATE reminders SET status = 'done' 
+        WHERE status = 'prompted' 
+        RETURNING id, message, recurrence, scheduled_for
+      `);
+      if (result.rows.length > 0) {
+        const reminder = result.rows[0];
+        if (reminder.recurrence && reminder.recurrence !== 'ONCE') {
+          let nextDate = new Date(reminder.scheduled_for);
+          if (reminder.recurrence === 'DAILY') nextDate.setDate(nextDate.getDate() + 1);
+          else if (reminder.recurrence === 'WEEKLY') nextDate.setDate(nextDate.getDate() + 7);
+          else if (reminder.recurrence === 'MONTHLY') nextDate.setMonth(nextDate.getMonth() + 1);
+          await pool.query(`
+            INSERT INTO reminders (type, message, context, recipient, scheduled_for, recurrence, set_by, status)
+            SELECT type, message, context, recipient, $1, recurrence, set_by, 'pending'
+            FROM reminders WHERE id = $2
+          `, [nextDate.toISOString(), reminder.id]);
+          await notifyStu('Done - marked as complete. Next reminder scheduled for ' + nextDate.toLocaleDateString('en-AU', { timeZone: 'Australia/Melbourne' }) + '.');
+        } else {
+          await notifyStu('Done - marked as complete and removed.');
+        }
+        console.log('Reminder marked done: ID ' + reminder.id);
+        return true;
+      }
+    } catch (e) { console.error('Error marking done:', e.message); }
+  }
+
+  if (bodyUpper === 'CANCEL') {
+    try {
+      const result = await pool.query(`
+        UPDATE reminders SET status = 'cancelled' 
+        WHERE status = 'prompted' 
+        RETURNING id, message
+      `);
+      if (result.rows.length > 0) {
+        await notifyStu('Reminder cancelled and removed.');
+        console.log('Reminder cancelled: ID ' + result.rows[0].id);
+        return true;
+      }
+    } catch (e) { console.error('Error cancelling:', e.message); }
+  }
+
+  if (bodyUpper === 'SNOOZE') {
+    pendingSnooze[STU_WHATSAPP] = true;
+    await notifyStu('When would you like me to remind you again?');
+    return true;
+  }
+
+  if (pendingSnooze[STU_WHATSAPP]) {
+    try {
+      const result = await pool.query(`
+        SELECT id, message FROM reminders WHERE status = 'prompted' LIMIT 1
+      `);
+      if (result.rows.length > 0) {
+        delete pendingSnooze[STU_WHATSAPP];
+        const currentDateTime = getCurrentDateTime();
+        const snoozePrompt = 'The user wants to snooze a reminder. Current time is ' + currentDateTime + '. They said: "' + body + '". Convert this to a specific datetime in YYYY-MM-DD HH:MM format. Reply with ONLY the datetime, nothing else.';
+        const snoozeResponse = await anthropic.messages.create({
+          model: 'claude-sonnet-4-20250514',
+          max_tokens: 50,
+          messages: [{ role: 'user', content: snoozePrompt }]
+        });
+        const newDateTime = snoozeResponse.content[0].text.trim();
+        await pool.query(`
+          UPDATE reminders SET scheduled_for = $1, status = 'pending', follow_up_count = 0, last_follow_up = NULL
+          WHERE id = $2
+        `, [newDateTime, result.rows[0].id]);
+        await notifyStu('Rescheduled for ' + newDateTime + '.');
+        console.log('Reminder snoozed to ' + newDateTime);
+        return true;
+      }
+    } catch (e) { console.error('Error snoozing:', e.message); }
+  }
+
+  return false;
+}
+
+const BASE_SYSTEM_PROMPT = "You are Jordan, a personal AI assistant for Stu Brien - Principal of Stone Real Estate Ballarat. You help Stu with day to day productivity tasks via WhatsApp. You are efficient, direct and genuinely helpful. You know Stu well and communicate naturally - not overly formal. You have access to web search and use it proactively whenever Stu asks for current information, property data, news, business details, weather, prices or anything that requires up to date information. ABOUT STU: Stu Brien is the Principal and Licensed Real Estate Agent at Stone Real Estate Ballarat. Address: 44 Armstrong St South, Ballarat Central. Phone: 0416 183 566. Email: stubrien@stonerealestate.com.au. STU CONTACTS AND THEIR NUMBERS: Yasna (Wife) +61414682861 - sms. Fiona Hart (Personal Assistant) +61412185312 - sms. Leanne Madigan (Sales Associate) +61429097002 - sms. Tammy Edwards (Sales Admin) +61418318251 - sms. Gwen Brien (Mum) +61414410117 - sms. Glenn Brien (Brother) +61418301954 - sms. Josh Brien (Son) +61434308724 - sms. Aiden Brien (Son) +61498327669 - sms. Rob Cunningham (Sales Agent) +61418543634 - sms. Leigh Hutchinson (Sales Agent) +61407861960 - sms. Jamie Gepp (Sales Agent) +61459201710 - sms. Jarrod Kemp (Sales Agent) +61450836257 - sms. Linda Turk (Property Manager) +61414287337 - sms. Josh Shanahan (Property Manager) +61491118698 - sms. Additional contacts are stored in memory and available in your context. WHAT YOU CAN HELP WITH: Web research and information lookup. Drafting and sending messages. Contacting people on Stu behalf. Coordinating meetings and scheduling. Setting reminders. Remembering preferences and contacts. Drafting listing copy. Drafting social media posts. Property market questions. Calculations. Writing correspondence. General knowledge. WEB SEARCH BEHAVIOUR: When using web search do not narrate your search process to Stu. Just search silently and present the final result cleanly and directly. ADDING CONTACTS: When Stu asks you to add a contact save it using: [MEMORY:contacts:Full Name:+61XXXXXXXXX - sms]. Confirm back to Stu that the contact has been saved. HOW TO HANDLE TASKS: Draft immediately and present cleanly. Answer questions directly. Give 2 to 3 clear options when asked. CONTACTING PEOPLE - TWO STEP PROCESS: STEP 1 - Show draft messages in plain text and ask shall I send these. Do NOT include any [SEND:] tags yet. STEP 2 - When Stu confirms with yes, send, go ahead, ok, yep, yeah or similar - include [SEND:] tags. Format: [SEND:+PHONENUMBER:message text] one per line per recipient. ALWAYS INTRODUCE AS AI ASSISTANT: When contacting someone for the first time say: Hi [name], this is Jordan - I am Stu Brien AI assistant. MEMORY SYSTEM - SAVING: When Stu tells you something worth remembering save it using: [MEMORY:category:key:value]. Categories: preferences, contacts, instructions, tasks. Tell Stu: Got it - I will remember that. MEMORY SYSTEM - DELETING: [FORGET:category:key]. REMINDER SYSTEM: When Stu sets a reminder use: [REMINDER:type:recipient:recipient_number:scheduled_datetime:recurrence:message:context]. Type is STU or CONTACT. Recurrence is ONCE, DAILY, WEEKLY or MONTHLY. Datetime format is YYYY-MM-DD HH:MM. Confirm back with exact date and time. When reminders fire Stu will reply DONE, SNOOZE or CANCEL - handle these naturally. CANCEL REMINDER BY ID: [CANCEL_REMINDER:id]. FOLLOW UP TRACKING: When you send a message expecting a reply use: [FOLLOW_UP:contact_name:contact_number:message_summary]. DELEGATED CONVERSATIONS: When someone replies their message will be forwarded to you. Report back to Stu and ask how to respond. TONE: Direct, efficient and natural. No excessive formality. Concise. Dot points for lists. IMPORTANT: Confidential.";
 
 module.exports = function(app) {
 
-  module.exports.getDelegatedConversations = function() {
-    return delegatedConversations;
-  };
-
+  module.exports.getDelegatedConversations = function() { return delegatedConversations; };
   module.exports.handleDelegatedReply = handleDelegatedReply;
   module.exports.handleTrustedContact = handleTrustedContact;
   module.exports.getTrustedContact = getTrustedContact;
 
-  setInterval(checkRemindersAndFollowUps, 60 * 1000);
-  console.log('Jordan reminder checker started');
+  initDB().then(() => {
+    setInterval(checkRemindersAndFollowUps, 60 * 1000);
+    console.log('Jordan reminder checker started - using Supabase');
+  });
 
   app.post('/whatsapp', async function(req, res) {
     const From = req.body.From;
@@ -567,13 +630,18 @@ module.exports = function(app) {
       return res.type('text/xml').send(twiml.toString());
     }
 
+    const reminderHandled = await handleReminderResponse(Body, null);
+    if (reminderHandled) {
+      return res.type('text/xml').send('<Response></Response>');
+    }
+
     conversations[From].push({ role: 'user', content: Body });
     if (conversations[From].length > 30) conversations[From] = conversations[From].slice(-30);
 
     try {
       const currentDateTime = getCurrentDateTime();
-      const memoryContext = buildMemoryContext();
-      const remindersContext = getPendingRemindersContext();
+      const memoryContext = await buildMemoryContext();
+      const remindersContext = await getPendingRemindersContext();
       const systemPrompt = BASE_SYSTEM_PROMPT + memoryContext + remindersContext + '\n\nCURRENT DATE AND TIME: It is currently ' + currentDateTime + ' Melbourne Australia time. Use this to accurately calculate all future dates and times.';
 
       const reply = await callClaudeWithSearch(systemPrompt, conversations[From]);
@@ -588,7 +656,7 @@ module.exports = function(app) {
         for (const match of allSendTags) {
           const toNumber = match[1].trim();
           const messageToSend = match[2].trim();
-          const contact = getContactByNumber(toNumber);
+          const contact = await getContactByNumber(toNumber);
           const contactName = contact ? contact.name : toNumber;
           const success = await sendMessageOnBehalf(toNumber, messageToSend, contactName);
           results.push({ name: contactName, success: success });
@@ -599,7 +667,7 @@ module.exports = function(app) {
         if (failNames.length > 0) cleanReply = cleanReply + '\nFailed to send to ' + failNames.join(' and ') + '.';
       }
 
-      processTagsFromReply(reply);
+      await processTagsFromReply(reply);
       cleanReply = stripAllTags(cleanReply);
 
       conversations[From].push({ role: 'assistant', content: cleanReply });

@@ -677,7 +677,70 @@ module.exports = function(app) {
   module.exports.handleDelegatedReply = handleDelegatedReply;
   module.exports.handleTrustedContact = handleTrustedContact;
   module.exports.getTrustedContact = getTrustedContact;
+module.exports.handlePersonalSMS = async function(from, body, res) {
+  const twiml = new twilio.twiml.MessagingResponse();
 
+  const bodyUpper = body.trim().toUpperCase();
+
+  if (!conversations[from]) conversations[from] = [];
+
+  if (bodyUpper === 'CLEAR') {
+    conversations[from] = [];
+    twiml.message('Conversation cleared.');
+    return res.type('text/xml').send(twiml.toString());
+  }
+
+  const reminderHandled = await handleReminderResponse(body);
+  if (reminderHandled) {
+    return res.type('text/xml').send('<Response></Response>');
+  }
+
+  conversations[from].push({ role: 'user', content: body });
+  if (conversations[from].length > 30) conversations[from] = conversations[from].slice(-30);
+
+  try {
+    const currentDateTime = getCurrentDateTime();
+    const memoryContext = await buildMemoryContext();
+    const remindersContext = await getPendingRemindersContext();
+    const systemPrompt = BASE_SYSTEM_PROMPT + memoryContext + remindersContext + '\n\nCURRENT DATE AND TIME: It is currently ' + currentDateTime + ' Melbourne Australia time. Use this to accurately calculate all future dates and times. NOTE: Stu is contacting you via SMS not WhatsApp. Reply concisely as this is SMS.';
+
+    const reply = await callClaudeWithSearch(systemPrompt, conversations[from]);
+    console.log('Jordan personal SMS reply to ' + from + ': ' + reply);
+
+    const allSendTags = [...reply.matchAll(/\[SEND:(\+[\d]+):([^\]]+)\]/g)];
+    let cleanReply = reply;
+
+    if (allSendTags.length > 0) {
+      cleanReply = reply.replace(/\[SEND:(\+[\d]+):([^\]]+)\]/g, '').trim();
+      const results = [];
+      for (const match of allSendTags) {
+        const toNumber = match[1].trim();
+        const messageToSend = match[2].trim();
+        const contact = await getContactByNumber(toNumber);
+        const contactName = contact ? contact.name : toNumber;
+        const success = await sendMessageOnBehalf(toNumber, messageToSend, contactName);
+        results.push({ name: contactName, success: success });
+      }
+      const successNames = results.filter(r => r.success).map(r => r.name);
+      const failNames = results.filter(r => !r.success).map(r => r.name);
+      if (successNames.length > 0) cleanReply = cleanReply + '\n\nSent to ' + successNames.join(' and ') + '. I will let you know when they reply.';
+      if (failNames.length > 0) cleanReply = cleanReply + '\nFailed to send to ' + failNames.join(' and ') + '.';
+    }
+
+    await processTagsFromReply(reply);
+    cleanReply = stripAllTags(cleanReply);
+
+    conversations[from].push({ role: 'assistant', content: cleanReply });
+
+    twiml.message(cleanReply);
+    res.type('text/xml').send(twiml.toString());
+
+  } catch (error) {
+    console.error('Jordan personal SMS error:', error);
+    twiml.message('Having a technical issue - try again in a moment.');
+    res.type('text/xml').send(twiml.toString());
+  }
+};
   initDB().then(() => {
     setInterval(checkRemindersAndFollowUps, 60 * 1000);
     console.log('Jordan reminder checker started - using Supabase');

@@ -235,8 +235,16 @@ app.post('/webhook', async function(req, res) {
   console.log('Incoming from ' + From + ': ' + Body);
 
   const cleanFrom = From.replace(/\s/g, '');
+  const STU_SMS = (process.env.STU_WHATSAPP_NUMBER || '').replace(/\s/g, '');
+
+  if (STU_SMS && cleanFrom.includes(STU_SMS.replace('+', ''))) {
+    console.log('Stu personal SMS received - routing to Jordan personal assistant');
+    await jordanPersonal.handlePersonalSMS(From, Body, res);
+    return;
+  }
+
   const delegated = jordanPersonal.getDelegatedConversations();
-const trustedContact = jordanPersonal.getTrustedContact(From);
+  const trustedContact = jordanPersonal.getTrustedContact(From);
 
 if (delegated && delegated[cleanFrom]) {
   console.log('Delegated reply received from ' + From);

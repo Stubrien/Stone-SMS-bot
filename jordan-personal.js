@@ -370,8 +370,9 @@ async function sendMessageOnBehalf(to, message, contactName) {
 
 async function notifyStu(message) {
   try {
-    console.log('Notifying Stu - from: ' + WHATSAPP_FROM + ' to: ' + STU_WHATSAPP);
-    await twilioClient.messages.create({ from: WHATSAPP_FROM, to: STU_WHATSAPP, body: message });
+    const stuNumber = (process.env.STU_WHATSAPP_NUMBER || '').replace('whatsapp:', '');
+    console.log('Notifying Stu via SMS - from: ' + process.env.TWILIO_PHONE_NUMBER + ' to: ' + stuNumber);
+    await twilioClient.messages.create({ from: process.env.TWILIO_PHONE_NUMBER, to: stuNumber, body: message });
     console.log('Stu notified successfully: ' + message.substring(0, 60));
   } catch (error) {
     console.error('Failed to notify Stu: ' + error.message);

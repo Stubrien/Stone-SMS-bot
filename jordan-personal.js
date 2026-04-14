@@ -313,7 +313,7 @@ async function getPendingRemindersForTrusted() {
 
 async function callClaudeWithSearch(systemPrompt, messages, maxTokens) {
   const response = await anthropic.messages.create({
-    model: 'claude-sonnet-4-20250514',
+    model: 'claude-sonnet-4-6',
     max_tokens: maxTokens || 1000,
     system: systemPrompt,
     tools: [{ type: 'web_search_20250305', name: 'web_search' }],
@@ -335,7 +335,7 @@ async function callClaudeWithSearch(systemPrompt, messages, maxTokens) {
         { role: 'user', content: [{ type: 'tool_result', tool_use_id: toolUseBlock.id, content: 'Search completed for: ' + toolUseBlock.input.query }] }
       ];
       const followUp = await anthropic.messages.create({
-        model: 'claude-sonnet-4-20250514',
+        model: 'claude-sonnet-4-6',
         max_tokens: maxTokens || 1000,
         system: systemPrompt,
         tools: [{ type: 'web_search_20250305', name: 'web_search' }],
@@ -650,7 +650,7 @@ async function handleReminderResponse(body) {
         delete pendingSnooze['waitingForSnoozeTime'];
         const currentDateTime = getCurrentDateTime();
         const snoozeResponse = await anthropic.messages.create({
-          model: 'claude-sonnet-4-20250514',
+          model: 'claude-sonnet-4-6',
           max_tokens: 50,
           messages: [{ role: 'user', content: 'Current time is ' + currentDateTime + ' Melbourne time. Convert this snooze request to a datetime in YYYY-MM-DD HH:MM format in Melbourne time. Reply with ONLY the datetime, nothing else. Request: "' + body + '"' }]
         });

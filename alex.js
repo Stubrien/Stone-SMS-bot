@@ -157,7 +157,7 @@ async function generateSummary(conversationHistory) {
     .join('\n\n');
 
   const summaryResponse = await anthropic.messages.create({
-    model: 'claude-sonnet-4-20250514',
+    model: 'claude-sonnet-4-6',
     max_tokens: 300,
     system: 'You are a helpful assistant that summarises real estate enquiry conversations into a brief professional summary for a real estate agent. Extract and clearly list: the enquiry type (vendor, buyer, tenant or landlord), the clients name, their mobile number, their email address if provided, the full property address if provided, the suburb of interest, property type, their plans and requirements, their readiness level (early stage, considering or ready), their timeline, whether they have dealt with Stone or Doepel Lilley and Taylor before, and any other relevant details. Keep it concise and easy to scan. Use plain text with no markdown.',
     messages: [
@@ -401,7 +401,7 @@ module.exports = function(app) {
 
     try {
       const response = await anthropic.messages.create({
-        model: 'claude-sonnet-4-20250514',
+        model: 'claude-sonnet-4-6',
         max_tokens: 300,
         system: SYSTEM_PROMPT,
         messages: conversations[From]

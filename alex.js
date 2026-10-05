@@ -1,5 +1,6 @@
 const Anthropic = require('@anthropic-ai/sdk');
 const twilio = require('twilio');
+const alexLeads = require('./alex-leads');
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
@@ -318,7 +319,18 @@ async function handleOutcome(tag, fromNumber, conversationHistory, agentName) {
     emailColour = '#f0e8ff';
   }
 
-  await createPipedriveRecord(name, fromNumber, email, address, suburb, summary, stageId);
+  if (alexLeads.enabled()) {
+    // Airtable replaces Pipedrive. Vendor outcomes become a lead in the Sales Leads Admin Inbox (no agent yet);
+    // buyer / tenant / landlord enquiries still go by email only.
+    const VENDOR_TAGS = ['APPRAISAL_REQUESTED', 'CONTACT_REQUEST', 'MARKET_REPORT', 'EARLY_INTEREST'];
+    if (VENDOR_TAGS.includes(tag)) {
+      try {
+        await alexLeads.createEnquiryLead({ name, phone: fromNumber, email, address, suburb, summary, outcome: emailHeading });
+      } catch (e) { console.error('Alex: Airtable lead create failed - ' + e.message); }
+    }
+  } else if (PIPEDRIVE_API_KEY) {
+    await createPipedriveRecord(name, fromNumber, email, address, suburb, summary, stageId);
+  }
 
   await sendEmail(
     emailSubject,
@@ -359,10 +371,27 @@ async function sendOptOutEmail(fromNumber) {
 
 module.exports = function(app) {
 
+  alexLeads.start();
+
   app.post('/campaign', async function(req, res) {
     const From = req.body.From;
     const Body = req.body.Body;
     console.log('Alex incoming from ' + From + ': ' + Body);
+
+    // Airtable Sales Leads pilot: approver commands (YES A7 / EDIT A7 ... / NO A7 / KEEP A7 / LIST)
+    // and replies from vendors on pilot agents' leads are handled by alex-leads.js
+    if (alexLeads.enabled()) {
+      try {
+        if (alexLeads.isApprover(From) && await alexLeads.handleApproverSMS(Body)) {
+          return res.type('text/xml').send('<Response></Response>');
+        }
+        if (!alexLeads.isApprover(From) && await alexLeads.handleVendorSMS(From, Body)) {
+          return res.type('text/xml').send('<Response></Response>');
+        }
+      } catch (e) {
+        console.error('Alex leads handler error: ' + e.message);
+      }
+    }
 
     if (Body.trim().toUpperCase() === 'RESET') {
       delete conversations[From];

@@ -163,7 +163,7 @@ function historyText(history) {
   }).join('\n');
 }
 
-const VOICE = "You write SMS messages as Alex, who works in the office of a Stone Real Estate Ballarat sales agent. " +
+const VOICE = "You write SMS messages as Alex from Stone Ballarat, writing on behalf of one of our sales agents. " +
   "Tone: warm, local, plain Australian English, like a real person in a real estate office - never salesy. " +
   "Rules: 1-3 short sentences. One question at most. No exclamation marks unless clearly warranted. Never start with filler (Great, Absolutely, Hope you're well is fine only if natural). " +
   "Never give a price opinion, valuation or commission. Never mention you are an AI unless asked directly. " +
@@ -339,6 +339,18 @@ async function eligibleLeads() {
   });
 }
 
+// Fixed opening so every text starts the same way:
+// first text  -> "Hey Sonya, this is Alex from Stone Ballarat on behalf of Stu Brien."
+// later texts -> "Hey Sonya,"
+function smsOpening(ctx, firstContact) {
+  const n = ctx.card.firstName;
+  const usable = n && !/^(\d|lot\b)/i.test(n) && !/\d/.test(ctx.card.contactName.split(',')[0].split(' ')[0]);
+  const hey = usable ? `Hey ${n},` : 'Hey there,';
+  if (!firstContact) return hey;
+  const agent = ctx.agent ? ctx.agent.name : 'our sales team';
+  return `${hey} this is Alex from Stone Ballarat on behalf of ${agent}.`;
+}
+
 async function draftOutbound(lead) {
   const ctx = await leadContext(lead);
   const stage = ctx.card.stage;
@@ -347,13 +359,21 @@ async function draftOutbound(lead) {
     ? 'Write a friendly nurture check-in. Reference something genuine from the card or notes if there is something (their plans, timing, the property), and ask one light question that tells us whether their timing has changed. Do not push for an appraisal unless the notes say they are close to ready.'
     : `Write a message offering to book a free market appraisal${ctx.card.appraisalType ? ' (' + ctx.card.appraisalType + ')' : ''} with the agent, asking what days or times generally suit them. Do not offer specific times.`;
   const firstContact = !ctx.history.some(h => h.author === 'Alex');
+  const opening = smsOpening(ctx, firstContact);
   const user =
     `AGENT: ${ctx.agent ? ctx.agent.name : 'the agent'}\n` +
     `LEAD CARD: ${JSON.stringify(ctx.card)}\n\nNOTES & HISTORY (oldest first):\n${historyText(ctx.history)}\n\n` +
-    `TASK: ${goal}${firstContact ? ' This is the first time Alex is texting this person, so introduce yourself briefly (Alex from ' + (ctx.agent ? ctx.agent.firstName : 'the agent') + "'s office at Stone Real Estate Ballarat) and end with: Reply STOP to opt out." : ''}\n\n` +
+    `TASK: ${goal}\n\nThe message will automatically start with: "${opening}" - write ONLY what comes after that. ` +
+    'Do not greet them again, do not introduce Alex again and do not sign off.\n\n' +
     'Return JSON only: {"sms": "...", "reasoning": "one short sentence for the agent on what you picked up from the card"}';
   const out = await claudeJSON(VOICE, user, 500);
-  return { ctx, purpose, draft: String(out.sms || '').trim(), reasoning: String(out.reasoning || '').trim() };
+  let body = String(out.sms || '').trim()
+    .replace(/^(hey|hi|hello)\b[^,.!]*[,.!]\s*/i, '')            // drop a repeated greeting
+    .replace(/^(this is|it's|it is|i'm)\s+alex\b[^.!?]*[.!?]\s*/i, ''); // drop a repeated intro
+  body = body.charAt(0).toUpperCase() + body.slice(1);
+  let draft = opening + ' ' + body;
+  if (firstContact && !/reply stop/i.test(draft)) draft += ' Reply STOP to opt out.';
+  return { ctx, purpose, draft, reasoning: String(out.reasoning || '').trim() };
 }
 
 let lastDigestDate = null;
@@ -432,7 +452,7 @@ async function handleVendorSMS(from, body) {
   if (/^(STOP|UNSUBSCRIBE|QUIT|CANCEL|END|STOPALL)$/i.test(text)) {
     await updateRecord(T.leads, lead.id, { [L.doNotContact]: true });
     await logActivity(lead.id, { summary: 'Vendor opted out by SMS – Do Not Contact ticked', type: 'General', kind: 'History' });
-    await sendSMS(from, "No problem, you won't receive any more messages from us. – Stone Real Estate Ballarat");
+    await sendSMS(from, "No problem, you won't receive any more messages from us. – Stone Ballarat");
     await sendSMS(approverMobile(), `${f[L.name]} replied STOP – Do Not Contact is now ticked.`);
     return true;
   }

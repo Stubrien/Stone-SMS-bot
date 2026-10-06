@@ -810,6 +810,12 @@ async function handleVendorSMS(from, body) {
   }
   if (Object.keys(leadUpd).length) {
     await updateRecord(T.leads, lead.id, leadUpd);
+    // A Nurture Reason change makes the Airtable "card changed" automation reset the follow-up date to the
+    // new track. If the vendor also named a date, put their date back once the automation has run.
+    if (leadUpd[L.nurtureReason] && leadUpd[L.followUp]) {
+      const keep = leadUpd[L.followUp];
+      setTimeout(() => updateRecord(T.leads, lead.id, { [L.followUp]: keep }).catch(e => console.error('Alex leads: re-set follow-up failed', e.message)), 45000);
+    }
     if (out.key_fact) await logActivity(lead.id, { summary: 'Key Facts updated by Alex', detail: out.key_fact, type: 'Key Facts updated', kind: 'History' });
     if (prevFollowUp) await logActivity(lead.id, { summary: `Follow-up date changed to ${dmy(out.new_follow_up_date)} by Alex`, detail: text, type: 'Follow-up date changed', kind: 'History' });
   }

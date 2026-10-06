@@ -163,11 +163,16 @@ function historyText(history) {
   }).join('\n');
 }
 
+// Soft opt-out added to the end of the first text Alex sends anyone.
+// Any reply asking to be left alone is treated as an opt-out (see handleVendorSMS).
+const OPT_OUT_LINE = "If now's not the right time or your situation has changed, no worries at all, just reply and let me know and I'll leave it there.";
+const OPT_OUT_ACK = "No worries at all, I'll leave it there. Thanks for letting me know. – Alex, Stone Ballarat";
+
 const VOICE = "You write SMS messages as Alex from Stone Ballarat, writing on behalf of one of our sales agents. " +
   "Tone: warm, local, plain Australian English, like a real person in a real estate office - never salesy. " +
   "Rules: 1-3 short sentences. One question at most. No exclamation marks unless clearly warranted. Never start with filler (Great, Absolutely, Hope you're well is fine only if natural). " +
   "Never give a price opinion, valuation or commission. Never mention you are an AI unless asked directly. " +
-  "Never repeat or hint at anything marked INTERNAL, or anything in Background Notes the vendor would not have told us themselves. " +
+  "Never write 'Reply STOP' or any opt-out wording - that is added automatically when needed. Never repeat or hint at anything marked INTERNAL, or anything in Background Notes the vendor would not have told us themselves. " +
   "Refer to the agent by first name (e.g. 'Stu asked me to check in'). Do not invent facts that are not on the card.";
 
 async function claudeJSON(system, user, maxTokens) {
@@ -372,7 +377,7 @@ async function draftOutbound(lead) {
     .replace(/^(this is|it's|it is|i'm)\s+alex\b[^.!?]*[.!?]\s*/i, ''); // drop a repeated intro
   body = body.charAt(0).toUpperCase() + body.slice(1);
   let draft = opening + ' ' + body;
-  if (firstContact && !/reply stop/i.test(draft)) draft += ' Reply STOP to opt out.';
+  if (firstContact && !draft.includes(OPT_OUT_LINE)) draft += ' ' + OPT_OUT_LINE;
   return { ctx, purpose, draft, reasoning: String(out.reasoning || '').trim() };
 }
 
@@ -452,7 +457,7 @@ async function handleVendorSMS(from, body) {
   if (/^(STOP|UNSUBSCRIBE|QUIT|CANCEL|END|STOPALL)$/i.test(text)) {
     await updateRecord(T.leads, lead.id, { [L.doNotContact]: true });
     await logActivity(lead.id, { summary: 'Vendor opted out by SMS – Do Not Contact ticked', type: 'General', kind: 'History' });
-    await sendSMS(from, "No problem, you won't receive any more messages from us. – Stone Ballarat");
+    await sendSMS(from, OPT_OUT_ACK);
     await sendSMS(approverMobile(), `${f[L.name]} replied STOP – Do Not Contact is now ticked.`);
     return true;
   }
@@ -469,8 +474,17 @@ async function handleVendorSMS(from, body) {
     ' "key_fact": "a short new fact worth adding to Key Facts, or empty",\n' +
     ' "new_follow_up_date": "YYYY-MM-DD if their timing changed (e.g. call me in March) else empty",\n' +
     ' "wants_appraisal": true/false, "appraisal_type": "Face to face|Desktop|", "preferred_times": "what they said about days/times, or empty",\n' +
-    ' "urgent_for_agent": true/false (true if they want to talk to the agent now, are ready to list, or are upset)}';
+    ' "urgent_for_agent": true/false (true if they want to talk to the agent now, are ready to list, or are upset),\n' +
+    ' "wants_no_contact": true/false - true ONLY if they clearly ask us to stop texting / leave them alone / take them off the list, or say they are no longer selling and do not want to hear from us. "Not yet" or "try me in March" is NOT an opt-out - move the follow-up date instead. If unsure, false and set urgent_for_agent}';
   const out = await claudeJSON(VOICE + ' You also extract facts for the agent accurately and conservatively.', user, 700);
+
+  if (out.wants_no_contact === true) {
+    await updateRecord(T.leads, lead.id, { [L.doNotContact]: true });
+    await logActivity(lead.id, { summary: 'Vendor asked to be left alone – Do Not Contact ticked by Alex', detail: text, type: 'General', kind: 'History' });
+    await sendSMS(from, OPT_OUT_ACK);
+    await sendSMS(approverMobile(), `${f[L.name]} asked to be left alone: "${text.slice(0, 200)}"\nDo Not Contact is now ticked and Alex replied: "${OPT_OUT_ACK}"\nIf Alex misread this, untick Do Not Contact on the card.`);
+    return true;
+  }
 
   const extra = [];
   const leadUpd = {};

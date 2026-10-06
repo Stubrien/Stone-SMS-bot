@@ -201,18 +201,18 @@ async function sendSMS(to, body) {
 function approverMobile() { return normalisePhone(process.env.APPROVER_MOBILE); }
 function isApprover(from) { return !!approverMobile() && samePhone(from, approverMobile()); }
 
-async function queueDraft({ lead, ctx, purpose, draft, reasoning, extraLines }) {
+async function queueDraft({ lead, ctx, purpose, draft, reasoning, extraLines, content, trackLabel }) {
   const code = await nextCode();
   await createRecord(T.messages, {
     [M.code]: code, [M.lead]: [lead.id], [M.direction]: 'To vendor', [M.purpose]: purpose, [M.status]: 'Awaiting approval',
-    [M.draft]: draft, [M.reasoning]: reasoning || '', [M.number]: normalisePhone(lead.fields[L.phone])
+    [M.draft]: draft, [M.reasoning]: reasoning || '', [M.number]: normalisePhone(lead.fields[L.phone]), [M_CONTENT]: content || ''
   });
   const c = ctx.card;
-  const head = `${code} · ${c.contactName}${c.address && c.address !== c.contactName ? ', ' + c.address : ''} (${c.stage}${c.followUpInterval ? ', ' + c.followUpInterval : ''})`;
+  const head = `${code} · ${c.contactName}${c.address && c.address !== c.contactName ? ', ' + c.address : ''} (${c.stage}${trackLabel ? '' : c.followUpInterval ? ', ' + c.followUpInterval : ''})`;
   const shownReason = String(reasoning || '').replace(/\s*PREV_FOLLOW_UP=\S+/, '').trim();
   const why = shownReason ? `\nWhy: ${shownReason}` : '';
   const extra = extraLines && extraLines.length ? '\n' + extraLines.map(x => x.replace('<code>', code)).join('\n') : '';
-  const text = `${head}${why}${extra}\n\nDraft: "${draft}"\n\nReply YES ${code} · EDIT ${code} your wording · NO ${code}`;
+  const text = `${head}${why}${extra}\n\nDraft: "${draft}"\n\nReply YES ${code} · CHANGE ${code} what to change · EDIT ${code} full wording · NO ${code}`;
   await sendSMS(approverMobile(), text);
   console.log('Alex leads: draft ' + code + ' sent for approval');
   return code;
@@ -235,8 +235,17 @@ async function sendApproved(msgRec) {
     const leadUpd = { [L.alexLastContact]: new Date().toISOString() };
     // A nurture check-in counts as contact: roll the follow-up forward by the interval
     if (sel(f[M.purpose]) === 'Nurture check-in') {
-      const days = parseInt(sel(lead.fields[L.interval]), 10);
-      if (days) leadUpd[L.followUp] = addDays(melbNow().date, days);
+      const st = nurtureState(lead.fields, await leadMessages(lead.fields));
+      leadUpd[L.followUp] = addDays(melbNow().date, st.days);
+      const content = String(f[M_CONTENT] || '');
+      if (content.startsWith('sale:')) {
+        try {
+          const saleId = content.slice(5);
+          const sale = await getRecord(MS_TABLE, saleId);
+          const quoted = (sale.fields[MS.quotedTo] || []).concat(leadId);
+          await updateRecord(MS_TABLE, saleId, { [MS.quotedTo]: Array.from(new Set(quoted)) });
+        } catch (e) { console.error('Alex leads: Quoted To link failed', e.message); }
+      }
     }
     await updateRecord(T.leads, leadId, leadUpd);
     await logActivity(leadId, { summary: 'Alex texted the vendor (' + sel(f[M.purpose]).toLowerCase() + ')', detail: text, type: 'SMS' });
@@ -252,13 +261,18 @@ async function waitingDrafts() {
 }
 
 // Returns true when the SMS was an approver command (so the normal Alex chat flow is skipped)
+// An EDIT reply that starts like an instruction is treated as a request to change the draft, not as the new text.
+function looksLikeInstruction(t) {
+  return /^(please\s+)?(remove|delete|drop|take\s+out|cut|add|include|mention|make|change|shorten|lengthen|soften|swap|replace|rewrite|reword|don'?t|do\s+not|no\s+need|less|more|without|leave\s+out|use|say)\b/i.test(t);
+}
+
 async function handleApproverSMS(body) {
   const text = (body || '').trim();
-  const m = text.match(/^(YES|Y|OK|SEND|EDIT|NO|N|KEEP|LIST)\b\s*(A\d+)?\s*([\s\S]*)$/i);
+  const m = text.match(/^(YES|Y|OK|SEND|EDIT|CHANGE|NO|N|KEEP|LIST)\b\s*(A\d+)?\s*([\s\S]*)$/i);
   if (!m) return false;
   const cmd = m[1].toUpperCase();
   let code = (m[2] || '').toUpperCase();
-  const rest = (m[3] || '').trim();
+  const rest = (m[3] || '').trim().replace(/^[.,:;\-–—\s]+/, '');
   const waiting = await waitingDrafts();
 
   if (cmd === 'LIST') {
@@ -295,7 +309,21 @@ async function handleApproverSMS(body) {
     await sendSMS(approverMobile(), `${code} binned – nothing sent.`);
     return true;
   }
-  if (cmd === 'EDIT' && !rest) { await sendSMS(approverMobile(), `Send the new wording after the code, e.g. EDIT ${code} Hi Sonya…`); return true; }
+  if ((cmd === 'EDIT' || cmd === 'CHANGE') && !rest) { await sendSMS(approverMobile(), `Send the new wording after the code (EDIT ${code} Hey Sonya…) or an instruction (CHANGE ${code} make it shorter).`); return true; }
+
+  // CHANGE, or an EDIT that reads like an instruction ("remove the opt out line"), is never sent as-is:
+  // Alex rewrites the draft and sends it back for approval.
+  if (cmd === 'CHANGE' || (cmd === 'EDIT' && looksLikeInstruction(rest))) {
+    const current = rec.fields[M.finalText] || rec.fields[M.draft];
+    const out = await claudeJSON(VOICE, `CURRENT DRAFT SMS: "${current}"\n\nTHE AGENT WANTS THIS CHANGE: "${rest}"\n\n` +
+      'Rewrite the SMS applying exactly that change and nothing else. Keep the greeting and introduction unless asked to change them. ' +
+      'Return JSON only: {"sms": "..."}', 400);
+    const revised = String(out.sms || '').trim();
+    if (!revised) { await sendSMS(approverMobile(), `Couldn't apply that to ${code} – try EDIT ${code} followed by the full wording.`); return true; }
+    await updateRecord(T.messages, rec.id, { [M.draft]: revised, [M.approverReply]: text });
+    await sendSMS(approverMobile(), `${code} revised:\n\nDraft: "${revised}"\n\nReply YES ${code} · CHANGE ${code} what to change · EDIT ${code} full wording · NO ${code}`);
+    return true;
+  }
 
   const fields = { [M.status]: cmd === 'EDIT' ? 'Edited & approved' : 'Approved', [M.approverReply]: text, [M.approvedBy]: by, [M.approvedAt]: new Date().toISOString() };
   if (cmd === 'EDIT') fields[M.finalText] = rest;
@@ -312,6 +340,267 @@ async function handleApproverSMS(body) {
   } catch (e) {
     await sendSMS(approverMobile(), `${code} failed to send: ${e.message.slice(0, 120)}`);
   }
+  return true;
+}
+
+// ---------------------------------------------------------------- nurture cadence
+// Each Nurture lead is on a track set by its Nurture Reason. The track decides how often Alex texts
+// and what each text is about, rotating so nothing repeats and asks only come every few messages.
+//   sale    – one recent nearby sale from the Market Sales table (never the same sale twice to a lead)
+//   suburb  – a short wrap of recent sales in their suburb
+//   tip     – a selling-prep tip from TIPS (never the same tip twice)
+//   ask     – a light question about timing, or an offer of a free updated appraisal
+
+const MS_TABLE = 'tblPfQKGokVJfPuN3';
+const MS = {
+  address: 'fld6Ya3TVCiy6EvM5', street: 'fldzC1MdamEiK1qQY', suburb: 'fldm2P7xaGkfOqtAk', type: 'fldexdbLviVOb4i1w',
+  beds: 'flds3mgStHeDoTjJy', baths: 'fld5QO7IVIGLPESWY', cars: 'fldVQG0B5Pr7HLKl7', land: 'fldaVoYVw9WLCONL0',
+  price: 'fldo7tVsAVAqamo4l', date: 'fldQ2NjHox6dH56az', dom: 'fldp15VbuAGxoFiCF', usable: 'fldcvXXIAYMNPBn9b',
+  stone: 'fldzUlscPR8lmxPeg', quotedTo: 'fldWJEXHFpU1lxqHN'
+};
+const M_CONTENT = 'fldsb2ITupyCZ67y2';      // Alex Messages → Nurture Content
+const L_MESSAGES = 'fldZjakyGET3iL1An';     // Leads → Alex Messages (inverse link)
+const SALE_MAX_AGE_DAYS = 92;
+const UNANSWERED_LIMIT = 3;
+
+const TRACKS = {
+  1: { label: 'Track 1 · weekly', days: 7, slowDays: 14, seq: ['sale', 'tip', 'suburb', 'tip'], ask: null },
+  2: { label: 'Track 2 · fortnightly', days: 14, seq: ['sale', 'tip', 'ask'], ask: 'soft' },
+  3: { label: 'Track 3 · monthly', days: 30, seq: ['sale', 'tip', 'ask'], ask: 'full' },
+  4: { label: 'Track 4 · monthly', days: 30, seq: ['sale', 'tip', 'suburb', 'ask'], ask: 'full' },
+  // Cold / no contact: every 2 months, market news first, an in-person price update offer every 4th text, never paused for silence
+  5: { label: 'Track 5 · cold, every 2 months', days: 60, seq: ['market', 'sale', 'tip', 'ask'], ask: 'price', neverPause: true }
+};
+function trackFor(fields) {
+  const r = sel(fields[L.nurtureReason]);
+  if (/1.2 months/i.test(r)) return 1;
+  if (/3 months|stalled/i.test(r)) return 2;
+  if (/no contact|cold|quiet/i.test(r)) return 5;
+  if (/12 months/i.test(r)) return 4;
+  return 3; // ~6 months, or not set
+}
+
+const TIPS = [
+  ['declutter', 'Start decluttering early, one room or cupboard at a time - buyers open everything, and it makes moving easier too.'],
+  ['small-repairs', 'Knock off the small fixes now - dripping taps, sticky doors, blown globes. Buyers add them up in their heads.'],
+  ['street-appeal', 'First impressions start at the street: mow, trim, clean the front door and letterbox.'],
+  ['paint', 'A fresh coat of neutral paint in the main living areas is one of the best-value prep jobs.'],
+  ['paperwork', 'Pull the paperwork together early - rates notices, permits for any work done, warranties. It speeds up the vendor statement.'],
+  ['section-32', 'In Victoria you need a vendor statement (Section 32) before going to market - worth lining up a conveyancer early.'],
+  ['heating-energy', 'Ballarat buyers always ask about heating and insulation - keep a note of any upgrades (solar, split systems, insulation) and a recent bill.'],
+  ['reno-check', 'Before spending on bigger renovations, have a quick chat with the agent about which jobs buyers actually pay for.'],
+  ['light', 'Light and bright sells: clean windows, open blinds and swap any dim globes before photos and inspections.'],
+  ['garden', 'A cheap garden refresh goes a long way - fresh mulch, a prune and a couple of pots by the front door.'],
+  ['kitchen-bathroom', 'Kitchens and bathrooms sell homes - regrouting, new tapware or handles is a cheap facelift.'],
+  ['next-move', 'Worth thinking early about the next move - buying first or selling first changes the timing, and the agent can talk it through.'],
+  ['building-inspection', 'Some sellers get a pre-sale building inspection so there are no surprises once buyers start looking.'],
+  ['inspection-ready', 'For inspections: fresh air, a quick tidy and keeping pets and their gear out of sight makes a real difference.']
+];
+
+// Neighbouring suburbs (used when there is no recent sale in their own suburb)
+const NEIGHBOURS = {
+  'Alfredton': ['Lake Gardens', 'Wendouree', 'Delacombe', 'Cardigan', 'Lucas', 'Lake Wendouree'],
+  'Lucas': ['Alfredton', 'Delacombe', 'Cardigan'],
+  'Delacombe': ['Sebastopol', 'Bonshaw', 'Alfredton', 'Lucas', 'Smythes Creek', 'Redan', 'Winter Valley'],
+  'Bonshaw': ['Delacombe', 'Sebastopol', 'Smythes Creek', 'Winter Valley'],
+  'Sebastopol': ['Redan', 'Delacombe', 'Bonshaw', 'Mount Pleasant', 'Mount Clear'],
+  'Redan': ['Sebastopol', 'Ballarat Central', 'Lake Wendouree', 'Delacombe', 'Mount Pleasant'],
+  'Winter Valley': ['Delacombe', 'Bonshaw', 'Smythes Creek', 'Cardigan'],
+  'Smythes Creek': ['Bonshaw', 'Delacombe', 'Winter Valley'],
+  'Cardigan': ['Lucas', 'Alfredton', 'Winter Valley', 'Cardigan Village'],
+  'Wendouree': ['Lake Wendouree', 'Alfredton', 'Invermay Park', 'Miners Rest', 'Mitchell Park', 'Lake Gardens', 'Ballarat North', 'Soldiers Hill'],
+  'Lake Wendouree': ['Wendouree', 'Ballarat Central', 'Soldiers Hill', 'Alfredton', 'Redan', 'Lake Gardens'],
+  'Lake Gardens': ['Alfredton', 'Wendouree', 'Lake Wendouree'],
+  'Ballarat Central': ['Lake Wendouree', 'Soldiers Hill', 'Bakery Hill', 'Golden Point', 'Redan', 'Black Hill', 'Ballarat North'],
+  'Soldiers Hill': ['Ballarat North', 'Ballarat Central', 'Black Hill', 'Lake Wendouree', 'Wendouree'],
+  'Ballarat North': ['Soldiers Hill', 'Invermay Park', 'Black Hill', 'Wendouree', 'Invermay', 'Nerrina'],
+  'Invermay Park': ['Ballarat North', 'Wendouree', 'Invermay', 'Miners Rest'],
+  'Black Hill': ['Ballarat North', 'Soldiers Hill', 'Ballarat Central', 'Brown Hill', 'Ballarat East', 'Nerrina'],
+  'Brown Hill': ['Ballarat East', 'Black Hill', 'Nerrina', 'Warrenheip'],
+  'Nerrina': ['Brown Hill', 'Black Hill', 'Ballarat North', 'Invermay'],
+  'Ballarat East': ['Bakery Hill', 'Brown Hill', 'Black Hill', 'Golden Point', 'Canadian', 'Eureka', 'Warrenheip'],
+  'Bakery Hill': ['Ballarat Central', 'Ballarat East', 'Golden Point'],
+  'Golden Point': ['Ballarat Central', 'Bakery Hill', 'Ballarat East', 'Canadian', 'Mount Pleasant', 'Redan'],
+  'Canadian': ['Golden Point', 'Ballarat East', 'Mount Pleasant', 'Mount Clear', 'Mount Helen', 'Eureka'],
+  'Mount Pleasant': ['Golden Point', 'Canadian', 'Mount Clear', 'Sebastopol', 'Redan'],
+  'Mount Clear': ['Mount Pleasant', 'Canadian', 'Mount Helen', 'Sebastopol', 'Buninyong'],
+  'Mount Helen': ['Mount Clear', 'Canadian', 'Buninyong', 'Scotsburn'],
+  'Buninyong': ['Mount Helen', 'Mount Clear', 'Scotsburn', 'Durham Lead', 'Navigators'],
+  'Scotsburn': ['Buninyong', 'Mount Helen'],
+  'Miners Rest': ['Invermay Park', 'Wendouree', 'Mitchell Park', 'Cardigan Village', 'Ascot'],
+  'Ascot': ['Miners Rest', 'Invermay', 'Coghills Creek'],
+  'Warrenheip': ['Brown Hill', 'Ballarat East', 'Dunnstown'],
+  'Eureka': ['Ballarat East', 'Canadian'],
+  'Invermay': ['Nerrina', 'Ballarat North', 'Invermay Park']
+};
+(function makeSymmetric() {
+  for (const [a, list] of Object.entries(NEIGHBOURS)) for (const b of list) {
+    NEIGHBOURS[b] = NEIGHBOURS[b] || [];
+    if (!NEIGHBOURS[b].includes(a)) NEIGHBOURS[b].push(a);
+  }
+})();
+const SUBURB_ALIASES = [[/\bmt\.?\s/gi, 'Mount '], [/\bnth\b/gi, 'North'], [/\bsth\b/gi, 'South'], [/\bsebas\b/gi, 'Sebastopol'], [/\bsoilders\b/gi, 'Soldiers']];
+
+const STREET_SUFFIX = { rd: 'road', st: 'street', ct: 'court', crt: 'court', dr: 'drive', ave: 'avenue', av: 'avenue', pl: 'place', cres: 'crescent', cr: 'crescent', tce: 'terrace', pde: 'parade', hwy: 'highway', ln: 'lane', bvd: 'boulevard', blvd: 'boulevard', cl: 'close', gr: 'grove', wy: 'way' };
+function streetKey(s) {
+  const words = String(s || '').toLowerCase().replace(/[^a-z0-9/ ]/g, ' ').split(/\s+/).filter(Boolean);
+  while (words.length && (/\d/.test(words[0]) || ['lot', 'unit', 'u'].includes(words[0]))) words.shift();
+  return words.map(w => STREET_SUFFIX[w] || w).join(' ');
+}
+function numberKey(s) { const m = String(s || '').match(/^\s*(?:lot\s*)?([\d/a-z-]+)/i); return m ? m[1].toLowerCase() : ''; }
+
+function suburbOf(address, knownSuburbs) {
+  let a = ' ' + String(address || '') + ' ';
+  for (const [re, rep] of SUBURB_ALIASES) a = a.replace(re, rep);
+  const lower = a.toLowerCase();
+  const hit = knownSuburbs.filter(s => lower.includes(' ' + s.toLowerCase())).sort((x, y) => y.length - x.length)[0];
+  if (!hit) return { suburb: '', street: '' };
+  const before = a.slice(0, lower.lastIndexOf(' ' + hit.toLowerCase())).replace(/,\s*$/, '').trim();
+  return { suburb: hit, street: before };
+}
+
+let salesCache = { at: 0, rows: [] };
+async function recentSales() {
+  if (Date.now() - salesCache.at < 30 * 60000) return salesCache.rows;
+  const cutoff = addDays(melbNow().date, -SALE_MAX_AGE_DAYS);
+  const rows = await listAll(MS_TABLE, { filterByFormula: `AND({${MS.usable}}, IS_AFTER({${MS.date}}, '${cutoff}'))` });
+  salesCache = { at: Date.now(), rows };
+  return rows;
+}
+function fmtPrice(n) { return '$' + Math.round(n).toLocaleString('en-AU'); }
+function monthName(iso) { return new Date(iso + 'T00:00:00Z').toLocaleString('en-AU', { month: 'long', timeZone: 'UTC' }); }
+
+async function pickSale(leadId, address, alreadyUsed) {
+  const sales = await recentSales();
+  const known = Array.from(new Set(sales.map(s => s.fields[MS.suburb]).filter(Boolean).concat(Object.keys(NEIGHBOURS))));
+  const { suburb, street } = suburbOf(address, known);
+  if (!suburb) return null;
+  const myStreet = streetKey(street), myNum = numberKey(street);
+  const wantUnit = /\//.test(street) || /unit/i.test(street);
+  const near = new Set(NEIGHBOURS[suburb] || []);
+  const scored = [];
+  for (const s of sales) {
+    const f = s.fields;
+    if ((f[MS.quotedTo] || []).includes(leadId) || alreadyUsed.has('sale:' + s.id)) continue;
+    const sStreet = streetKey(f[MS.street]);
+    if (sStreet === myStreet && numberKey(f[MS.street]) === myNum && f[MS.suburb] === suburb) continue; // their own home
+    let tier;
+    if (f[MS.suburb] === suburb && myStreet && sStreet === myStreet) tier = 0;
+    else if (f[MS.suburb] === suburb) tier = 1;
+    else if (near.has(f[MS.suburb])) tier = 2;
+    else continue;
+    const isUnit = /^unit/i.test(f[MS.type] || '');
+    scored.push({ s, tier, typeMiss: isUnit === wantUnit ? 0 : 1, stone: f[MS.stone] ? 0 : 1, date: f[MS.date] || '' });
+  }
+  scored.sort((a, b) => a.tier - b.tier || a.typeMiss - b.typeMiss || a.stone - b.stone || (a.date < b.date ? 1 : -1));
+  if (!scored.length) return null;
+  const { s, tier } = scored[0];
+  const f = s.fields;
+  const bits = [f[MS.beds] ? f[MS.beds] + ' bed' : '', /^unit/i.test(f[MS.type] || '') ? 'unit' : 'house'].filter(Boolean).join(' ');
+  return {
+    key: 'sale:' + s.id, saleId: s.id, suburb, tier,
+    fact: `${f[MS.address]} – ${bits}, sold ${fmtPrice(f[MS.price])} in ${monthName(f[MS.date])}` +
+      (f[MS.dom] ? `, ${f[MS.dom]} days on market` : '') + (f[MS.stone] ? ' (sold by Stone Ballarat - you may say our team sold it)' : ''),
+    where: tier === 0 ? 'in their street' : tier === 1 ? 'in their suburb' : 'in a neighbouring suburb (' + f[MS.suburb] + ')'
+  };
+}
+
+async function suburbWrap(address, alreadyUsed) {
+  const sales = await recentSales();
+  const known = Array.from(new Set(sales.map(s => s.fields[MS.suburb]).filter(Boolean)));
+  const { suburb } = suburbOf(address, known);
+  if (!suburb) return null;
+  const key = 'suburb:' + suburb + ':' + melbNow().date.slice(0, 7);
+  if (alreadyUsed.has(key)) return null;
+  const houses = sales.filter(s => s.fields[MS.suburb] === suburb && !/^unit/i.test(s.fields[MS.type] || '') && s.fields[MS.price]);
+  if (houses.length < 2) return null;
+  const prices = houses.map(s => s.fields[MS.price]).sort((a, b) => a - b);
+  return { key, fact: `${houses.length} houses sold in ${suburb} over the last 3 months, from ${fmtPrice(prices[0])} to ${fmtPrice(prices[prices.length - 1])}` };
+}
+
+// Ballarat-wide wrap from Market Sales (once a month at most per lead)
+async function ballaratWrap(alreadyUsed) {
+  const key = 'market:' + melbNow().date.slice(0, 7);
+  if (alreadyUsed.has(key)) return null;
+  const sales = await recentSales();
+  const houses = sales.filter(s => !/^unit/i.test(s.fields[MS.type] || '') && s.fields[MS.price]).map(s => s.fields[MS.price]).sort((a, b) => a - b);
+  if (houses.length < 10) return null;
+  const mid = houses.length % 2 ? houses[(houses.length - 1) / 2] : (houses[houses.length / 2 - 1] + houses[houses.length / 2]) / 2;
+  const top = {};
+  for (const s of sales) top[s.fields[MS.suburb]] = (top[s.fields[MS.suburb]] || 0) + 1;
+  const busiest = Object.entries(top).sort((a, b) => b[1] - a[1]).slice(0, 3).map(x => x[0]).join(', ');
+  return { key, fact: `across Ballarat, ${houses.length} houses with a disclosed price sold over the last 3 months at a middle price of about ${fmtPrice(Math.round(mid / 5000) * 5000)}; the busiest suburbs were ${busiest}` };
+}
+
+// The lead's past Alex messages (newest last)
+async function leadMessages(leadFields) {
+  const ids = (leadFields[L_MESSAGES] || []).slice(-40);
+  if (!ids.length) return [];
+  const recs = await listAll(T.messages, { filterByFormula: 'OR(' + ids.map(id => `RECORD_ID()='${id}'`).join(',') + ')' });
+  return recs.sort((a, b) => String(a.fields[M.created] || a.createdTime) < String(b.fields[M.created] || b.createdTime) ? -1 : 1);
+}
+function unansweredCount(msgs) {
+  let n = 0;
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const dir = sel(msgs[i].fields[M.direction]);
+    if (dir === 'From vendor') break;
+    if (dir === 'To vendor' && sel(msgs[i].fields[M.status]) === 'Sent') n++;
+  }
+  return n;
+}
+function nurtureState(leadFields, msgs) {
+  const track = trackFor(leadFields);
+  const sentNurture = msgs.filter(m => sel(m.fields[M.purpose]) === 'Nurture check-in' && sel(m.fields[M.status]) === 'Sent');
+  const used = new Set(msgs.map(m => m.fields[M_CONTENT]).filter(Boolean));
+  const unanswered = unansweredCount(msgs);
+  const t = TRACKS[track];
+  const days = track === 1 && unanswered >= UNANSWERED_LIMIT ? t.slowDays : t.days;
+  const askCount = sentNurture.filter(m => String(m.fields[M_CONTENT] || '').startsWith('ask:')).length;
+  return { track, t, n: sentNurture.length, askCount, used, unanswered, days, recentTexts: sentNurture.slice(-4).map(m => m.fields[M.finalText] || m.fields[M.draft]) };
+}
+
+// Decide what this nurture text is about. Falls back sale → suburb → tip so there is always something useful.
+async function planNurture(lead, st) {
+  const address = lead.fields[L.address] || '';
+  let type = st.t.seq[st.n % st.t.seq.length];
+  if (type === 'ask') {
+    const kind = st.t.ask === 'soft' ? 'timing' : st.t.ask === 'price' ? 'price-update' : (st.askCount % 2 === 0 ? 'timing' : 'appraisal');
+    if (kind === 'price-update') return {
+      key: 'ask:price-update', label: 'price update offer',
+      brief: 'Lightly suggest that if they are ever curious what their place might be worth in today\'s market, the agent is happy to pop out for a quick, no-obligation look and give them an up-to-date price guide - an accurate figure needs a visit. Never offer a price over the phone, by text or online. One sentence for the offer, zero pressure, easy to ignore.'
+    };
+    return {
+      key: 'ask:' + kind, label: kind === 'timing' ? 'timing check' : 'appraisal offer',
+      brief: kind === 'timing'
+        ? 'Ask one light, no-pressure question about whether their timing or plans have changed. Make it easy to reply in a few words.'
+        : 'Offer a free, no-obligation updated market appraisal - the agent pops out to the property whenever it suits them (never offer a price over the phone, by text or online). One sentence, zero pressure, easy to ignore.'
+    };
+  }
+  if (type === 'market') {
+    const wrap = await ballaratWrap(st.used);
+    if (wrap) return { key: wrap.key, label: 'Ballarat market update', brief: `Share this as a short Ballarat market update, in plain words: ${wrap.fact}. You may add one general, factual observation, but never forecast prices, never say what their home is worth and do not ask them for anything.` };
+    type = 'sale';
+  }
+  if (type === 'sale') {
+    const sale = await pickSale(lead.id, address, st.used);
+    if (sale) return { key: sale.key, saleId: sale.saleId, label: 'recent sale ' + sale.where, brief: `Share this recent sale ${sale.where} as a helpful local update: ${sale.fact}. Do not say what their own home is worth and do not ask them for anything. Never name the selling agency unless it was Stone Ballarat.` };
+    type = 'suburb';
+  }
+  if (type === 'suburb') {
+    const wrap = await suburbWrap(address, st.used);
+    if (wrap) return { key: wrap.key, label: 'suburb sales wrap', brief: `Share this as a quick local market update: ${wrap.fact}. Do not say what their own home is worth and do not ask them for anything.` };
+  }
+  const tip = TIPS.find(([k]) => !st.used.has('tip:' + k)) || TIPS[st.n % TIPS.length];
+  return { key: 'tip:' + tip[0], label: 'tip – ' + tip[0].replace(/-/g, ' '), brief: `Share this selling-prep tip in your own words, tied to their situation if the notes allow: ${tip[1]} Do not ask them for anything.` };
+}
+
+// Leads that have gone quiet: Track 1 slows to fortnightly; other tracks pause and the agent gets a task.
+async function pauseIfQuiet(lead, st) {
+  if (st.track === 1 || st.t.neverPause || st.unanswered < UNANSWERED_LIMIT) return false;
+  const today = melbNow().date;
+  await updateRecord(T.leads, lead.id, { [L.pauseAlex]: true, [L.nextAction]: 'Call – Alex paused after ' + st.unanswered + ' unanswered texts', [L.nextActionDate]: today });
+  await logActivity(lead.id, { summary: `Alex paused – ${st.unanswered} texts without a reply`, detail: 'Untick Pause Alex on the card to restart texts.', type: 'General', kind: 'History' });
+  await sendSMS(approverMobile(), `${lead.fields[L.name]} hasn't replied to ${st.unanswered} texts, so Alex has paused and set a call task for the agent. Untick Pause Alex on the card to restart.`);
   return true;
 }
 
@@ -360,9 +649,16 @@ async function draftOutbound(lead) {
   const ctx = await leadContext(lead);
   const stage = ctx.card.stage;
   const purpose = stage === 'Nurture' ? 'Nurture check-in' : 'Appraisal booking';
-  const goal = purpose === 'Nurture check-in'
-    ? 'Write a friendly nurture check-in. Reference something genuine from the card or notes if there is something (their plans, timing, the property), and ask one light question that tells us whether their timing has changed. Do not push for an appraisal unless the notes say they are close to ready.'
-    : `Write a message offering to book a free market appraisal${ctx.card.appraisalType ? ' (' + ctx.card.appraisalType + ')' : ''} with the agent, asking what days or times generally suit them. Do not offer specific times.`;
+  let goal, plan = null, st = null;
+  if (purpose === 'Nurture check-in') {
+    st = nurtureState(lead.fields, await leadMessages(lead.fields));
+    if (await pauseIfQuiet(lead, st)) return null;
+    plan = await planNurture(lead, st);
+    goal = 'Write a nurture text. ' + plan.brief + ' Keep it warm and useful - this person is not ready yet, so the aim is simply to be helpful and let them know we are here if they have questions.' +
+      (st.recentTexts.length ? '\nRECENT TEXTS ALEX ALREADY SENT THEM (do not repeat their wording, openers or ideas):\n' + st.recentTexts.map(t => '- ' + t).join('\n') : '');
+  } else {
+    goal = `Write a message offering to book a free market appraisal${ctx.card.appraisalType ? ' (' + ctx.card.appraisalType + ')' : ''} with the agent, asking what days or times generally suit them. Do not offer specific times.`;
+  }
   const firstContact = !ctx.history.some(h => h.author === 'Alex');
   const opening = smsOpening(ctx, firstContact);
   const user =
@@ -378,7 +674,8 @@ async function draftOutbound(lead) {
   body = body.charAt(0).toUpperCase() + body.slice(1);
   let draft = opening + ' ' + body;
   if (firstContact && !draft.includes(OPT_OUT_LINE)) draft += ' ' + OPT_OUT_LINE;
-  return { ctx, purpose, draft, reasoning: String(out.reasoning || '').trim() };
+  const reasoning = (plan ? `${st.t.label}, text ${st.n + 1}: ${plan.label}. ` : '') + String(out.reasoning || '').trim();
+  return { ctx, purpose, draft, reasoning, content: plan ? plan.key : '', trackLabel: st ? st.t.label : '' };
 }
 
 let lastDigestDate = null;
@@ -414,7 +711,7 @@ async function sweep() {
     for (const lead of due) {
       try {
         const d = await draftOutbound(lead);
-        if (d.draft) await queueDraft({ lead, ctx: d.ctx, purpose: d.purpose, draft: d.draft, reasoning: d.reasoning });
+        if (d && d.draft) await queueDraft({ lead, ctx: d.ctx, purpose: d.purpose, draft: d.draft, reasoning: d.reasoning, content: d.content, trackLabel: d.trackLabel });
       } catch (e) { console.error('Alex leads: draft failed for ' + lead.id, e.message); }
     }
   } catch (e) {
@@ -475,6 +772,7 @@ async function handleVendorSMS(from, body) {
     ' "new_follow_up_date": "YYYY-MM-DD if their timing changed (e.g. call me in March) else empty",\n' +
     ' "wants_appraisal": true/false, "appraisal_type": "Face to face|Desktop|", "preferred_times": "what they said about days/times, or empty",\n' +
     ' "urgent_for_agent": true/false (true if they want to talk to the agent now, are ready to list, or are upset),\n' +
+    ' "new_timeframe": if they told us a new selling timeframe, EXACTLY one of "Selling in 1–2 months" | "Not quite ready (~3 months)" | "Too early (~6 months)" | "Curious (12 months+)", else empty,\n' +
     ' "wants_no_contact": true/false - true ONLY if they clearly ask us to stop texting / leave them alone / take them off the list, or say they are no longer selling and do not want to hear from us. "Not yet" or "try me in March" is NOT an opt-out - move the follow-up date instead. If unsure, false and set urgent_for_agent}';
   const out = await claudeJSON(VOICE + ' You also extract facts for the agent accurately and conservatively.', user, 700);
 
@@ -492,6 +790,11 @@ async function handleVendorSMS(from, body) {
     const stamp = dmy(today) + '/' + today.slice(2, 4);
     leadUpd[L.keyFacts] = ((f[L.keyFacts] || '').trim() + `\n• ${out.key_fact} (${stamp}, via Alex)`).trim();
     extra.push('Key fact added: ' + out.key_fact);
+  }
+  const TIMEFRAMES = ['Selling in 1–2 months', 'Not quite ready (~3 months)', 'Too early (~6 months)', 'Curious (12 months+)'];
+  if (out.new_timeframe && TIMEFRAMES.includes(out.new_timeframe) && out.new_timeframe !== sel(f[L.nurtureReason])) {
+    leadUpd[L.nurtureReason] = out.new_timeframe;
+    extra.push(`Timeframe now "${out.new_timeframe}" – Alex's nurture rhythm adjusts to match`);
   }
   let prevFollowUp = null;
   if (out.new_follow_up_date && /^\d{4}-\d{2}-\d{2}$/.test(out.new_follow_up_date) && out.new_follow_up_date !== f[L.followUp]) {

@@ -772,6 +772,7 @@ async function handleVendorSMS(from, body) {
     ' "new_follow_up_date": "YYYY-MM-DD if their timing changed (e.g. call me in March) else empty",\n' +
     ' "wants_appraisal": true/false, "appraisal_type": "Face to face|Desktop|", "preferred_times": "what they said about days/times, or empty",\n' +
     ' "urgent_for_agent": true/false (true if they want to talk to the agent now, are ready to list, or are upset),\n' +
+    ' "wants_agent_contact": true/false - true ONLY if they ask for the agent to call/contact them, ask to talk to someone, or say they are ready to sell/list now,\n' +
     ' "new_timeframe": if they told us a new selling timeframe, EXACTLY one of "Selling in 1–2 months" | "Not quite ready (~3 months)" | "Too early (~6 months)" | "Curious (12 months+)", else empty,\n' +
     ' "wants_no_contact": true/false - true ONLY if they clearly ask us to stop texting / leave them alone / take them off the list, or say they are no longer selling and do not want to hear from us. "Not yet" or "try me in March" is NOT an opt-out - move the follow-up date instead. If unsure, false and set urgent_for_agent}';
   const out = await claudeJSON(VOICE + ' You also extract facts for the agent accurately and conservatively.', user, 700);
@@ -781,6 +782,12 @@ async function handleVendorSMS(from, body) {
     await logActivity(lead.id, { summary: 'Vendor asked to be left alone – Do Not Contact ticked by Alex', detail: text, type: 'General', kind: 'History' });
     await sendSMS(from, OPT_OUT_ACK);
     await sendSMS(approverMobile(), `${f[L.name]} asked to be left alone: "${text.slice(0, 200)}"\nDo Not Contact is now ticked and Alex replied: "${OPT_OUT_ACK}"\nIf Alex misread this, untick Do Not Contact on the card.`);
+    return true;
+  }
+
+  // Appraisal request or "can someone call me": hand the card straight to its agent.
+  if (out.wants_appraisal === true || out.wants_agent_contact === true) {
+    await handoffToAgent({ lead, ctx, out, text, from });
     return true;
   }
 
@@ -833,6 +840,81 @@ async function handleVendorSMS(from, body) {
     await sendSMS(approverMobile(), `${f[L.name]} replied: "${text.slice(0, 300)}"\n${extra.join('\n')}`);
   }
   return true;
+}
+
+// ---------------------------------------------------------------- handoff to the agent
+// The vendor asked for an appraisal or to talk to someone. Alex:
+//  1. moves the card to Qualifying with "Call <name> – asked for an appraisal" due today (shows in the agent's My Day),
+//  2. stops nurture texts (card is no longer in Nurture; any nurture drafts waiting for approval are binned),
+//  3. replies to the vendor straight away naming the agent ("I'll ask Jamie to give you a call"),
+//  4. texts the card's agent only (falls back to the approver if the agent has no mobile in Team).
+async function handoffToAgent({ lead, ctx, out, text, from }) {
+  const f = lead.fields;
+  const name = f[L.name] || 'Vendor';
+  const first = firstName(f[L.name]);
+  const agentFirst = ctx.agent ? ctx.agent.firstName : '';
+  const appraisal = out.wants_appraisal === true;
+  const today = melbNow().date;
+  const stage = sel(f[L.stage]);
+  const reason = appraisal ? 'asked for an appraisal' : 'asked for a call';
+  const times = String(out.preferred_times || '').trim();
+
+  const upd = {
+    [L.nextAction]: `Call ${first || name} – ${reason}` + (times ? ` (${times})` : ''),
+    [L.nextActionDate]: today
+  };
+  if (['Nurture', 'New', ''].includes(stage)) upd[L.stage] = 'Qualifying';
+  if (appraisal && out.appraisal_type) upd[L.apptType] = out.appraisal_type;
+  if (out.key_fact) {
+    const stamp = dmy(today) + '/' + today.slice(2, 4);
+    upd[L.keyFacts] = ((f[L.keyFacts] || '').trim() + `\n• ${out.key_fact} (${stamp}, via Alex)`).trim();
+  }
+  await updateRecord(T.leads, lead.id, upd);
+
+  // Bin any nurture drafts still waiting for approval on this card
+  try {
+    const pending = await listAll(T.messages, { filterByFormula: `AND({${M.status}}='Awaiting approval',{${M.direction}}='To vendor',FIND('${lead.id}',ARRAYJOIN({${M.lead}})))` });
+    for (const p of pending) await updateRecord(T.messages, p.id, { [M.status]: 'Rejected', [M.error]: 'Superseded – vendor asked for the agent' });
+  } catch (e) { console.error('Alex leads: could not clear pending drafts', e.message); }
+
+  // Immediate, fixed-wording acknowledgement to the vendor
+  const hi = first ? `Thanks ${first}` : 'Thanks';
+  const who = agentFirst || 'one of our agents';
+  const ack = appraisal
+    ? `${hi}, I'll ask ${who} to give you a call to find a time for the appraisal. – Alex, Stone Ballarat`
+    : `${hi}, I'll ask ${who} to give you a call. – Alex, Stone Ballarat`;
+  let ackSent = false;
+  try {
+    const sid = await sendSMS(from, ack);
+    ackSent = true;
+    await createRecord(T.messages, {
+      [M.lead]: [lead.id], [M.direction]: 'To vendor', [M.status]: 'Sent', [M.purpose]: appraisal ? 'Appraisal booking' : 'Reply to vendor',
+      [M.finalText]: ack, [M.number]: normalisePhone(from), [M.sentAt]: new Date().toISOString(), [M.sid]: sid,
+      [M.reasoning]: 'Automatic handoff reply – vendor ' + reason
+    });
+    await updateRecord(T.leads, lead.id, { [L.alexLastContact]: new Date().toISOString() });
+  } catch (e) { console.error('Alex leads: handoff reply failed', e.message); }
+
+  // Text the card's agent (only)
+  const agentMobile = ctx.agent && ctx.agent.mobile ? normalisePhone(ctx.agent.mobile) : '';
+  const to = agentMobile || approverMobile();
+  const addr = f[L.address] && f[L.address] !== f[L.name] ? `, ${f[L.address]}` : '';
+  const lines = [
+    `${agentMobile ? (agentFirst ? 'Hi ' + agentFirst + ' – ' : '') : '(No mobile for this card\'s agent in Team – sent to you instead) '}${name}${addr} ${reason}.`,
+    `They said: "${text.slice(0, 300)}"`,
+    times ? `Times they mentioned: ${times}` : '',
+    `Phone: ${f[L.phone] || from}`,
+    `The card is now in ${upd[L.stage] || stage} with "Call ${first || name}" due today in your My Day.`,
+    ackSent ? `Alex has told them you'll call and has stopped nurture texts.` : `Alex could NOT send them a reply – please call them.`
+  ].filter(Boolean);
+  try { await sendSMS(to, lines.join('\n')); } catch (e) { console.error('Alex leads: agent alert failed', e.message); }
+
+  await logActivity(lead.id, {
+    summary: `Handed to ${ctx.agent ? ctx.agent.name : 'the agent'} – vendor ${reason}`,
+    detail: `Vendor said: "${text}"` + (ackSent ? `\nAlex replied: "${ack}"` : ''),
+    type: 'General', kind: 'History'
+  });
+  console.log('Alex leads: handoff for ' + lead.id + ' to ' + (agentMobile ? 'agent' : 'approver'));
 }
 
 // ---------------------------------------------------------------- new enquiries (replaces Pipedrive)

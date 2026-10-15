@@ -65,6 +65,8 @@ function normalisePhone(raw) {
   if (d.length === 9 && d.startsWith('4')) return '+61' + d;
   return d;
 }
+// An Australian mobile Alex can text: +614 followed by 8 digits
+function isTextableMobile(raw) { return /^\+614\d{8}$/.test(normalisePhone(raw) || ''); }
 function samePhone(a, b) { const x = normalisePhone(a), y = normalisePhone(b); return !!x && x === y; }
 
 function melbNow() {
@@ -222,9 +224,15 @@ async function sendApproved(msgRec) {
   const f = msgRec.fields;
   const leadId = (f[M.lead] || [])[0];
   const text = f[M.finalText] || f[M.draft];
-  const to = f[M.number];
-  if (!leadId || !to || !text) throw new Error('Message ' + f[M.code] + ' is missing lead, number or text');
-  const lead = await getRecord(T.leads, leadId);
+  // Use the card's current Phone (it may have been fixed after the draft was written); fall back to the number saved on the draft
+  const leadNow = leadId ? await getRecord(T.leads, leadId) : null;
+  const to = leadNow && isTextableMobile(leadNow.fields[L.phone]) ? normalisePhone(leadNow.fields[L.phone]) : f[M.number];
+  if (!leadId || !text || !isTextableMobile(to)) {
+    const why = !leadId ? 'no lead linked' : !text ? 'no text' : 'no valid mobile on the card';
+    await updateRecord(T.messages, msgRec.id, { [M.status]: 'Failed', [M.error]: 'Not sent – ' + why });
+    return 'NOT sent – ' + why + (why.includes('mobile') ? ' (fix the Phone field on the card)' : '');
+  }
+  const lead = leadNow;
   if (lead.fields[L.doNotContact]) {
     await updateRecord(T.messages, msgRec.id, { [M.status]: 'Rejected', [M.error]: 'Do Not Contact ticked before sending' });
     return 'blocked (Do Not Contact)';
@@ -266,13 +274,55 @@ function looksLikeInstruction(t) {
   return /^(please\s+)?(remove|delete|drop|take\s+out|cut|add|include|mention|make|change|shorten|lengthen|soften|swap|replace|rewrite|reword|don'?t|do\s+not|no\s+need|less|more|without|leave\s+out|use|say)\b/i.test(t);
 }
 
+// Understands the ways people actually reply on a phone:
+//   "YES A21", "Yes a21", "Yes, A21", "yes A21.", "A21 yes", "Yep A21", "OK A21", "Send A21", "Approve A21", "👍 A21"
+//   "NO A21", "nope A21", "A21 no", "EDIT A21 <wording>", "CHANGE A21 <instruction>", "KEEP A21", "LIST"
+const CMD_WORDS = {
+  YES: /^(yes|y|yep|yeah|yup|ya|ok|okay|k|send|send it|approve|approved|go|go ahead|sure|good|perfect|👍|✅)$/i,
+  NO: /^(no|n|nope|nah|bin|bin it|reject|don'?t send|dont send|skip|❌)$/i,
+  EDIT: /^edit$/i, CHANGE: /^change$/i, KEEP: /^keep$/i, LIST: /^list$/i
+};
+function cmdOf(word) { for (const [k, re] of Object.entries(CMD_WORDS)) if (re.test(word)) return k; return null; }
+function parseApproverCommand(text) {
+  const t = String(text || '').trim().replace(/[\u2018\u2019]/g, "'");
+  if (!t) return null;
+  const codeRe = /\bA\s?(\d{1,2})\b/i;
+  const cm = t.match(codeRe);
+  const code = cm ? 'A' + parseInt(cm[1], 10) : '';
+  // Split around the code: words before it and text after it
+  const before = cm ? t.slice(0, cm.index) : t;
+  const after = cm ? t.slice(cm.index + cm[0].length) : '';
+  const clean = s => s.replace(/^[\s.,:;!\-–—]+|[\s.,:;!\-–—]+$/g, '');
+  const b = clean(before);
+  // Command first ("YES A21 …", "Yes, A21", "Go ahead A21")
+  let cmd = b ? cmdOf(b) : null;
+  const lead = s => s.replace(/^[\s.,:;!\-–—]+/, '').trim(); // keep the wording's own ending punctuation
+  let rest = lead(after);
+  if (!cmd && !b && code) {
+    // Code first ("A21 yes", "A21 edit Hey Sonya…")
+    const w = rest.match(/^(\S+(?:\s+(?:it|ahead))?)\s*([\s\S]*)$/);
+    if (w && cmdOf(clean(w[1]))) { cmd = cmdOf(clean(w[1])); rest = lead(w[2] || ''); }
+  }
+  if (!cmd && !code) {
+    // No code at all: the whole message must be a command word (e.g. "Yes", "LIST"), or EDIT/CHANGE + text
+    const w = t.match(/^(\S+)\s*([\s\S]*)$/);
+    const c = w && cmdOf(clean(w[1]));
+    if (!c) return null;
+    const tail = clean(w[2] || '');
+    if (['YES', 'NO', 'KEEP', 'LIST'].includes(c) && tail && !/^(please|pls|thanks|thank you|thx|cheers|mate|ta)$/i.test(tail)) return null; // a sentence, not a command
+    return { cmd: c, code: '', rest: ['EDIT', 'CHANGE'].includes(c) ? lead(w[2] || '') : '' };
+  }
+  if (!cmd) return null;
+  return { cmd, code, rest };
+}
+
 async function handleApproverSMS(body) {
   const text = (body || '').trim();
-  const m = text.match(/^(YES|Y|OK|SEND|EDIT|CHANGE|NO|N|KEEP|LIST)\b\s*(A\d+)?\s*([\s\S]*)$/i);
-  if (!m) return false;
-  const cmd = m[1].toUpperCase();
-  let code = (m[2] || '').toUpperCase();
-  const rest = (m[3] || '').trim().replace(/^[.,:;\-–—\s]+/, '');
+  const parsed = parseApproverCommand(text);
+  if (!parsed) return false;
+  const { cmd } = parsed;
+  let code = parsed.code;
+  const rest = parsed.rest;
   const waiting = await waitingDrafts();
 
   if (cmd === 'LIST') {
@@ -369,10 +419,18 @@ const TRACKS = {
   3: { label: 'Track 3 · monthly', days: 30, seq: ['sale', 'tip', 'ask'], ask: 'full' },
   4: { label: 'Track 4 · monthly', days: 30, seq: ['sale', 'tip', 'suburb', 'ask'], ask: 'full' },
   // Cold / no contact: every 2 months, market news first, an in-person price update offer every 4th text, never paused for silence
-  5: { label: 'Track 5 · cold, every 2 months', days: 60, seq: ['market', 'sale', 'tip', 'ask'], ask: 'price', neverPause: true }
+  5: { label: 'Track 5 · cold, every 2 months', days: 60, seq: ['market', 'sale', 'tip', 'ask'], ask: 'price', neverPause: true },
+  // Annual check-in: recently moved in / settled, or just a yearly touch. One friendly text a year: local market + an easy price-update offer.
+  6: { label: 'Track 6 · annual check-in', days: 365, seq: ['annual'], ask: null, neverPause: true,
+       goal: 'This person has recently bought/moved in or settled, or simply gets one friendly text a year from us so we stay front of mind. They are not selling. Keep it light and neighbourly - no selling tips and no pressure.' },
+  // Rental providers / landlords whose property Stone manages: quarterly, investor angle, never property-management matters.
+  7: { label: 'Track 7 · rental provider, quarterly', days: 90, seq: ['sale', 'market', 'ask'], ask: 'investor', neverPause: true,
+       goal: 'This person is a rental provider (landlord) - the property on the card is their investment property, leased through Stone Ballarat\'s property management team. Talk about it as their investment property, never as their home. The aim is to stay front of mind as their local sales contact for a price update or appraisal, market advice, or help if they ever want to sell or buy another investment property. Never mention rent, tenants, the lease, repairs or anything the property management team handles, and never give financial or tax advice.' }
 };
 function trackFor(fields) {
   const r = sel(fields[L.nurtureReason]);
+  if (/annual/i.test(r)) return 6;
+  if (/rental provider|landlord/i.test(r)) return 7;
   if (/1.2 months/i.test(r)) return 1;
   if (/3 months|stalled/i.test(r)) return 2;
   if (/no contact|cold|quiet/i.test(r)) return 5;
@@ -501,7 +559,9 @@ async function pickSale(leadId, address, alreadyUsed) {
     key: 'sale:' + s.id, saleId: s.id, suburb, tier,
     fact: `${f[MS.address]} – ${bits}, sold ${fmtPrice(f[MS.price])} in ${monthName(f[MS.date])}` +
       (f[MS.dom] ? `, ${f[MS.dom]} days on market` : '') + (f[MS.stone] ? ' (sold by Stone Ballarat - you may say our team sold it)' : ''),
-    where: tier === 0 ? 'in their street' : tier === 1 ? 'in their suburb' : 'in a neighbouring suburb (' + f[MS.suburb] + ')'
+    where: tier === 0 ? 'in their street' : tier === 1 ? 'in their suburb' : 'in a neighbouring suburb (' + f[MS.suburb] + ')',
+    plain: `Thought you might find this handy - ${f[MS.stone] ? 'our team sold ' : ''}${f[MS.address]}${f[MS.stone] ? ', a ' + bits + ',' : ' (' + bits + ')'} ${f[MS.stone] ? 'for' : 'sold for'} ${fmtPrice(f[MS.price])} in ${monthName(f[MS.date])}` +
+      (f[MS.dom] ? `, ${f[MS.dom]} day${f[MS.dom] == 1 ? '' : 's'} on market` : '') + '. Just keeping you in the loop with what\'s moving locally.'
   };
 }
 
@@ -563,6 +623,23 @@ function nurtureState(leadFields, msgs) {
 async function planNurture(lead, st) {
   const address = lead.fields[L.address] || '';
   let type = st.t.seq[st.n % st.t.seq.length];
+  if (type === 'annual') {
+    const wrap = (await suburbWrap(address, st.used)) || (await ballaratWrap(st.used));
+    return {
+      key: 'annual:' + melbNow().date.slice(0, 4), label: 'annual check-in',
+      brief: 'Write their once-a-year check-in. Hope they are enjoying the place/the area' + (wrap ? `, share this quick local market snapshot in plain words: ${wrap.fact},` : ',') +
+        ' and mention in one easy sentence that if they are ever curious what their place is worth, the agent is happy to pop out for a no-obligation price update (an accurate figure needs a visit - never give a price by text). No questions they have to answer, zero pressure.'
+    };
+  }
+  if (type === 'ask' && st.t.ask === 'investor') {
+    const kind = st.askCount % 2 === 0 ? 'investor-value' : 'investor-plans';
+    return {
+      key: 'ask:' + kind, label: kind === 'investor-value' ? 'investment price update offer' : 'investment plans check-in',
+      brief: kind === 'investor-value'
+        ? 'Offer, in one easy sentence, a free no-obligation price update on their investment property - handy for reviewing their portfolio, finance or insurance. The agent pops out to look; never give a price by text. Zero pressure.'
+        : 'Ask one light question about whether their investment plans have changed - e.g. thinking of adding another property, or ever weighing up selling - and say the agent is always happy to talk the market through. Easy to reply in a few words, zero pressure.'
+    };
+  }
   if (type === 'ask') {
     const kind = st.t.ask === 'soft' ? 'timing' : st.t.ask === 'price' ? 'price-update' : (st.askCount % 2 === 0 ? 'timing' : 'appraisal');
     if (kind === 'price-update') return {
@@ -583,12 +660,18 @@ async function planNurture(lead, st) {
   }
   if (type === 'sale') {
     const sale = await pickSale(lead.id, address, st.used);
-    if (sale) return { key: sale.key, saleId: sale.saleId, label: 'recent sale ' + sale.where, brief: `Share this recent sale ${sale.where} as a helpful local update: ${sale.fact}. Do not say what their own home is worth and do not ask them for anything. Never name the selling agency unless it was Stone Ballarat.` };
+    if (sale) return { key: sale.key, saleId: sale.saleId, label: 'recent sale ' + sale.where, fallback: sale.plain, brief: `Share this recent sale ${sale.where} as a helpful local update: ${sale.fact}. Use the address EXACTLY as written here - never change, shorten or invent an address. Do not say what their own home is worth and do not ask them for anything. Never name the selling agency unless it was Stone Ballarat.` };
     type = 'suburb';
   }
   if (type === 'suburb') {
     const wrap = await suburbWrap(address, st.used);
     if (wrap) return { key: wrap.key, label: 'suburb sales wrap', brief: `Share this as a quick local market update: ${wrap.fact}. Do not say what their own home is worth and do not ask them for anything.` };
+  }
+  if (st.track >= 6) {
+    // no selling-prep tips for annual / rental-provider tracks - fall back to a Ballarat market update or a simple hello
+    const wrap = await ballaratWrap(st.used);
+    if (wrap) return { key: wrap.key, label: 'Ballarat market update', brief: `Share this as a short Ballarat market update, in plain words: ${wrap.fact}. Never forecast prices, never say what their property is worth and do not ask them for anything.` };
+    return { key: 'hello:' + melbNow().date.slice(0, 7), label: 'friendly check-in', brief: 'Send a short, friendly check-in letting them know the agent is around if they ever want a price update or a chat about the market. Do not ask them for anything.' };
   }
   const tip = TIPS.find(([k]) => !st.used.has('tip:' + k)) || TIPS[st.n % TIPS.length];
   return { key: 'tip:' + tip[0], label: 'tip – ' + tip[0].replace(/-/g, ' '), brief: `Share this selling-prep tip in your own words, tied to their situation if the notes allow: ${tip[1]} Do not ask them for anything.` };
@@ -624,6 +707,7 @@ async function eligibleLeads() {
   return leads.filter(l => {
     const f = l.fields;
     if (!(f[L.agent] || []).some(id => agents.has(id))) return false;
+    if (!isTextableMobile(f[L.phone])) return false; // e.g. an email or landline typed into Phone
     if (waitingLeadIds.has(l.id)) return false;
     if (f[L.alexLastContact] && new Date(f[L.alexLastContact]).getTime() > cutoff) return false;
     const stage = sel(f[L.stage]);
@@ -636,6 +720,20 @@ async function eligibleLeads() {
 // Fixed opening so every text starts the same way:
 // first text  -> "Hey Sonya, this is Alex from Stone Ballarat on behalf of Stu Brien."
 // later texts -> "Hey Sonya,"
+// Street addresses like "14 Somewhere Street" or "160 Cuthberts Rd"
+const ADDRESS_RE = /\b\d+[A-Za-z]?(?:\/\d+[A-Za-z]?)?\s+(?:[A-Z][\w'-]*\s+){1,3}(?:Street|St|Road|Rd|Drive|Dr|Court|Ct|Crt|Avenue|Ave|Lane|Ln|Place|Pl|Crescent|Cres|Way|Close|Cl|Boulevard|Blvd|Bvd|Terrace|Tce|Highway|Hwy|Parade|Pde|Grove|Gr|Circuit|Cct|Rise|Track)\b/g;
+function addrKey(a) {
+  const m = String(a).match(/(\d+[A-Za-z]?)(?:\/(\d+[A-Za-z]?))?\s+([A-Za-z'-]+)/);
+  return m ? (m[1] + (m[2] ? '/' + m[2] : '') + ' ' + m[3]).toLowerCase() : '';
+}
+function unknownAddresses(text, allowedSources) {
+  const allowedText = allowedSources.filter(Boolean).join(' \n ');
+  const ok = new Set((allowedText.match(ADDRESS_RE) || []).map(addrKey));
+  // also allow "160 Cuthberts" written without the street type
+  const loose = allowedText.toLowerCase();
+  return (String(text).match(ADDRESS_RE) || []).filter(a => !ok.has(addrKey(a)) && !loose.includes(addrKey(a)));
+}
+
 function smsOpening(ctx, firstContact) {
   const n = ctx.card.firstName;
   const usable = n && !/^(\d|lot\b)/i.test(n) && !/\d/.test(ctx.card.contactName.split(',')[0].split(' ')[0]);
@@ -654,7 +752,7 @@ async function draftOutbound(lead) {
     st = nurtureState(lead.fields, await leadMessages(lead.fields));
     if (await pauseIfQuiet(lead, st)) return null;
     plan = await planNurture(lead, st);
-    goal = 'Write a nurture text. ' + plan.brief + ' Keep it warm and useful - this person is not ready yet, so the aim is simply to be helpful and let them know we are here if they have questions.' +
+    goal = 'Write a nurture text. ' + plan.brief + ' ' + (st.t.goal || 'Keep it warm and useful - this person is not ready yet, so the aim is simply to be helpful and let them know we are here if they have questions.') +
       (st.recentTexts.length ? '\nRECENT TEXTS ALEX ALREADY SENT THEM (do not repeat their wording, openers or ideas):\n' + st.recentTexts.map(t => '- ' + t).join('\n') : '');
   } else {
     goal = `Write a message offering to book a free market appraisal${ctx.card.appraisalType ? ' (' + ctx.card.appraisalType + ')' : ''} with the agent, asking what days or times generally suit them. Do not offer specific times.`;
@@ -667,11 +765,27 @@ async function draftOutbound(lead) {
     `TASK: ${goal}\n\nThe message will automatically start with: "${opening}" - write ONLY what comes after that. ` +
     'Do not greet them again, do not introduce Alex again and do not sign off.\n\n' +
     'Return JSON only: {"sms": "...", "reasoning": "one short sentence for the agent on what you picked up from the card"}';
-  const out = await claudeJSON(VOICE, user, 500);
-  let body = String(out.sms || '').trim()
-    .replace(/^(hey|hi|hello)\b[^,.!]*[,.!]\s*/i, '')            // drop a repeated greeting
-    .replace(/^(this is|it's|it is|i'm)\s+alex\b[^.!?]*[.!?]\s*/i, ''); // drop a repeated intro
-  body = body.charAt(0).toUpperCase() + body.slice(1);
+  const tidy = sms => {
+    let b = String(sms || '').trim()
+      .replace(/^(hey|hi|hello)\b[^,.!]*[,.!]\s*/i, '')            // drop a repeated greeting
+      .replace(/^(this is|it's|it is|i'm)\s+alex\b[^.!?]*[.!?]\s*/i, ''); // drop a repeated intro
+    return b.charAt(0).toUpperCase() + b.slice(1);
+  };
+  // Guard against made-up addresses: every street address in the text must be one we gave it
+  const allowed = [goal, ctx.card.address, ctx.card.contactName];
+  let out = await claudeJSON(VOICE, user, 500);
+  let body = tidy(out.sms);
+  let bad = unknownAddresses(body, allowed);
+  if (bad.length) {
+    console.warn('Alex leads: draft had an address not in the brief (' + bad.join(', ') + ') – retrying');
+    out = await claudeJSON(VOICE, user + `\n\nIMPORTANT: your last attempt mentioned "${bad.join('", "')}", which is not a real address from the brief. Only mention addresses exactly as given above.`, 500);
+    body = tidy(out.sms);
+    bad = unknownAddresses(body, allowed);
+  }
+  if (bad.length) {
+    console.warn('Alex leads: still an unknown address – using the plain fallback text');
+    body = plan && plan.fallback ? plan.fallback : body.replace(ADDRESS_RE, 'a nearby home');
+  }
   let draft = opening + ' ' + body;
   if (firstContact && !draft.includes(OPT_OUT_LINE)) draft += ' ' + OPT_OUT_LINE;
   const reasoning = (plan ? `${st.t.label}, text ${st.n + 1}: ${plan.label}. ` : '') + String(out.reasoning || '').trim();
@@ -765,6 +879,7 @@ async function handleVendorSMS(from, body) {
   const user =
     `TODAY: ${today}\nAGENT: ${ctx.agent ? ctx.agent.name : 'the agent'}\nLEAD CARD: ${JSON.stringify(ctx.card)}\n\nNOTES & HISTORY (oldest first):\n${historyText(ctx.history)}\n\n` +
     `THE VENDOR JUST TEXTED: "${text}"\n\n` +
+    (/rental provider|landlord/i.test(sel(f[L.nurtureReason])) ? 'NOTE: this person is a rental provider - the card property is their investment property, managed by Stone Ballarat\'s property management team. If they raise rent, tenants, the lease, repairs, maintenance or anything else property management handles, do not try to answer it: reply that you\'ll pass it straight to our property management team, and set urgent_for_agent true with the details in reasoning.\n\n' : '') +
     'Work out what this means for the agent and draft Alex\'s reply. Return JSON only:\n' +
     '{"reply_sms": "Alex\'s reply (or empty string if no reply is needed)",\n' +
     ' "reasoning": "one short sentence for the agent",\n' +

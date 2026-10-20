@@ -2192,6 +2192,8 @@ function fieldsFor(card, c) {
   if (/^\d{4}-\d{2}-\d{2}$/.test(c.next_action_date || '')) upd[L.nextActionDate] = c.next_action_date;
   const appt = melbToISO(c.appraisal_at); if (appt) upd[L_APPT_AT] = appt;
   const mtg = melbToISO(c.listing_meeting_at); if (mtg) upd[L_MTG_AT] = mtg;
+  if (c.source && SOURCE_LIST.includes(c.source)) upd[L.source] = c.source;
+  if (c.source_detail && String(c.source_detail).trim()) upd[L.sourceDetail] = String(c.source_detail).trim();
   const call = melbToISO(c.call_at);
   if (call) {
     upd[L_CALL_AT] = call;
@@ -2207,8 +2209,72 @@ function fieldsFor(card, c) {
   return upd;
 }
 
+// Mobiles in a text that aren't on any of the agent's cards → the agent is telling Alex about someone new
+const MOBILE_RE = /(?:\+?61\s?|0)4(?:[\s-]?\d){8}/g;
+function unknownMobiles(text, cards) {
+  const mine = new Set(cards.map(c => normalisePhone(c.fields[L.phone] || '')).filter(Boolean));
+  const out = [];
+  for (const m of String(text).match(MOBILE_RE) || []) {
+    const n = normalisePhone(m.replace(/[\s-]/g, ''));
+    if (n && !out.includes(n) && !mine.has(n)) out.push(n);
+  }
+  return out;
+}
+// A focused read of a new contact's details (one job only, so it isn't confused with updating a card)
+async function extractNewContact(text, prev) {
+  const now = melbNow();
+  const user = `TODAY: ${now.weekday} ${now.date} (Melbourne).\n` +
+    (prev ? `DETAILS SO FAR (from the agent's earlier texts: "${prev.raw || ''}"): ${JSON.stringify(prev.draft || {})}\n` : '') +
+    `THE AGENT TEXTED: "${text}"\n\nThe agent is adding a NEW contact (not an existing card). Pull out everything they said, merging with the details so far.\n` +
+    `SOURCES: ${SOURCE_LIST.join('; ')}\nSTAGES: ${STAGE_LIST.join('; ')}\nNURTURE REASONS: ${NURTURE_REASONS.join('; ')}\n` +
+    'Rules: times as 24h local "YYYY-MM-DDTHH:MM" ("this afternoon at 1:30 pm" = today 13:30; a weekday = the NEXT such date). An appraisal time → stage "Appraisal Booked" + appraisal_at. A call agreed → "Qualifying" + call_at. Not moving for a while → "Nurture" + nurture_reason. Otherwise "Qualifying". ' +
+    'source only if they said where the lead came from (one of SOURCES), source_detail for specifics. Keep the address as written. Never invent anything.\n' +
+    'Return JSON only: {"name": "", "mobile": "", "address": "", "email": "", "source": "", "source_detail": "", "stage": "", "appraisal_at": "", "call_at": "", "next_action": "", "next_action_date": "", "nurture_reason": "", "details": {"beds": null, "baths": null, "block": null}, "motivation": "Making a move|Just an update|Unsure|", "timing": "", "notes": ""}';
+  const out = await claudeJSON('You are Alex, the sales assistant at Stone Real Estate Ballarat. You extract a new contact\'s details from an agent\'s text, accurately and conservatively.', user, 700);
+  console.log('Alex leads: new contact read as ' + JSON.stringify(out).slice(0, 400));
+  return out;
+}
+
+async function addNewContact(member, from, text, reply, pendingCard, nc, cards) {
+  const key0 = normalisePhone(from);
+  nc = Object.assign({ name: '', mobile: '', address: '', source: '' }, nc || {});
+  if (pendingCard) { for (const [k, v] of Object.entries(pendingCard.draft || {})) if (v && !nc[k]) nc[k] = v; }
+  const out = { question: '' };
+  const missing = [];
+  if (!String(nc.name || '').trim()) missing.push('name');
+  if (!isTextableMobile(nc.mobile || '')) missing.push('mobile');
+  if (!String(nc.address || '').trim()) missing.push('address');
+  if (missing.length) {
+    const parts = missing.map(m => m === 'source' ? 'where you met them' : m === 'address' ? 'the property address' : m);
+    const what = (parts.length > 1 ? parts.slice(0, -1).join(', ') + ' and ' + parts.at(-1) : parts[0]) + (missing.includes('source') ? ' (open home, referral, door knock…)' : '');
+    const question = (missing.length >= 3 ? `Great – what's their ${what}?` : null) || (out.question && String(out.question).trim()) || `Happy to add ${nc.name || 'them'} – what's their ${missing.map(m => m === 'source' ? 'lead source' : m).join(', ').replace(/, ([^,]*)$/, ' and $1')}?${missing.includes('source') ? ' (open home, referral, door knock…)' : ''}`;
+    pendingByPhone.set(key0, { kind: 'newcard', draft: nc, question, raw: [(pendingCard && pendingCard.raw) || '', text].filter(Boolean).join(' / '), at: Date.now() });
+    await reply(question);
+    return;
+  }
+  const res = await createCardFromText(member, nc, [(pendingCard && pendingCard.raw) || '', text].filter(Boolean).join(' / '));
+  if (res.createdId && !SOURCE_LIST.includes(nc.source)) {
+    const q = `Where did the lead come from (open home, referral, door knock, past client…)? I'll add it to ${firstName(nc.name) || 'their'}'s card.`;
+    res.reply += '\n' + q;
+    rememberQuestions(member, melbNow().date, [{ n: 0, leadId: res.createdId, question: `${nc.name} – LEAD SOURCE for this new card (set source to one of SOURCES, source_detail for anything more specific): ${q}` }]);
+  }
+  if (res.createdId) pendingByPhone.set(key0, { kind: 'undo', items: [], created: res.createdId, summary: `${nc.name} added`, at: Date.now() });
+  if (res.existingId) {
+    const ex = cards.find(c => c.id === res.existingId) || await getRecord(T.leads, res.existingId);
+    await reply(`${leadLabel(ex.fields)} is already one of your cards (${sel(ex.fields[L.stage])}) – I've added your text as a note. Tell me what to change on it.`);
+    return;
+  }
+  await reply(res.reply + (res.createdId ? '\nReply UNDO to remove it.' : ''));
+  return;
+}
+
 async function handleAgentUpdate(member, from, text, reply, pendingCard) {
   const cards = await agentCards(member);
+  // New contact first: said so, answering Alex's question about one, or a mobile that's on no card
+  const saysNew = /\bnew\s+(contact|client|lead|vendor|person|customer|card)\b/i.test(text) || /^\s*(it'?s\s+)?(a\s+)?new\b/i.test(text);
+  if (pendingCard || saysNew || unknownMobiles(text, cards).length) {
+    return addNewContact(member, from, text, reply, pendingCard, await extractNewContact(text, pendingCard), cards);
+  }
   const now = melbNow();
   const key = normalisePhone(from);
   const asked = checkinsByPhone.get(key);
@@ -2217,7 +2283,7 @@ async function handleAgentUpdate(member, from, text, reply, pendingCard) {
     `TODAY: ${now.weekday} ${now.date} (Melbourne). AGENT: ${member.fields[TM.name]}\n\n` +
     `THE AGENT'S CARDS (id | contact | address | stage | task or track):\n${cards.map(cardLine).join('\n')}\n\n` +
     (questions.length ? `QUESTIONS ALEX ASKED THE AGENT TODAY (the agent may answer by number, e.g. "1 booked Thu 2pm, 2 sent, 3b"):\n${questions.map(q => `${q.n ? q.n + ' – ' : ''}[${q.leadId}] ${q.question}`).join('\n')}\n\n` : '') +
-    (pendingCard ? `A NEW CONTACT THE AGENT IS ADDING – details so far: ${JSON.stringify(pendingCard.draft)}. Alex asked: "${pendingCard.question}". The agent's text below most likely answers that – merge it into new_card.\n\n` : '') +
+    (pendingCard ? `A NEW CONTACT THE AGENT IS ADDING – details so far: ${JSON.stringify(pendingCard.draft)}. The agent's earlier text: "${pendingCard.raw || ''}". Alex asked: "${pendingCard.question}". The agent's text below most likely answers that – merge it into new_card.\n\n` : '') +
     `THE AGENT TEXTED ALEX: "${text}"\n\n` +
     `SOURCES (for a new contact): ${SOURCE_LIST.join('; ')}\n` +
     `STAGES: ${STAGE_LIST.join('; ')}\nNURTURE REASONS: ${NURTURE_REASONS.join('; ')}\nLOST REASONS: ${LOST_REASONS.join('; ')}\n\n` +
@@ -2235,39 +2301,21 @@ async function handleAgentUpdate(member, from, text, reply, pendingCard) {
     'If a card shows "time options offered" and the agent picks one (by number with the name, by the time, or a bare number when only that card has options), set appraisal_at (or listing_meeting_at) to that time in local "YYYY-MM-DDTHH:MM" and stage "Appraisal Booked" (or "Listing Meeting Booked"); another time they give works the same way. ' +
     '"CALL" / "I\'ll ring them" about a card with time options → next_action "Call <first name> to book the appraisal" due today, and clear_offer true. ' +
     'A call time agreed with a contact → call_at (and stage "Qualifying" if the card is New or No Contact). "No answer" to an after-call question → no_answer true. ' +
-    'NEW CONTACTS: if the agent is telling Alex about someone who is NOT one of their cards ("New contact: Jo Smith 0412 345 678, 5 High St Sebastopol, met at open home, appraisal Tue 10am"), fill new_card instead of updates: ' +
-    'name, mobile, address are required and source should be one of SOURCES (source_detail for anything more specific); stage = "Appraisal Booked" if an appraisal time is given, "Nurture" (+ nurture_reason) if they are not moving for a while, otherwise "Qualifying"; ' +
+    'NEW CONTACTS: "new contact", "new client", "new lead", "new vendor", or a booking with someone whose name, mobile and address match none of THE AGENT\'S CARDS, is a new contact even if no details are given yet ("Booked an appraisal with a new client Thu 10am") – set new_contact true and fill new_card with whatever is known (empty strings for the rest); never answer "which card?" for a new contact. ' +
+    'If the agent is telling Alex about someone who is NOT one of their cards ("New contact: Jo Smith 0412 345 678, 5 High St Sebastopol, met at open home, appraisal Tue 10am"), fill new_card instead of updates: ' +
+    'name, mobile and address are required; source = one of SOURCES only if the agent said where the lead came from (else empty; Alex asks after creating the card), source_detail for anything more specific; email if given; stage = "Appraisal Booked" if an appraisal time is given, "Nurture" (+ nurture_reason) if they are not moving for a while, otherwise "Qualifying"; ' +
     'list anything required that is missing in missing[] (use "source" if no source was given) and put ONE short question asking for all of it in question. ' +
     'Use 24h local times "YYYY-MM-DDTHH:MM"; resolve weekdays to the NEXT such date. ' +
     'If you cannot tell which card or what they mean, set question and return no updates. confidence "high" only when every card and change is unambiguous.\n' +
-    'new_card shape: {"name": "", "mobile": "", "address": "", "source": "", "source_detail": "", "stage": "", "appraisal_at": "", "call_at": "", "next_action": "", "next_action_date": "", "nurture_reason": "", "details": {"beds": null, "baths": null, "block": null}, "motivation": "Making a move|Just an update|Unsure|", "timing": "", "notes": ""} or null; missing: [].\n' +
-    'Return JSON only: {"updates": [{"lead_id": "rec...", "changes": {"stage": "", "next_action": "", "next_action_date": "", "appraisal_at": "", "listing_meeting_at": "", "nurture_reason": "", "lost_reason": "", "authority_ends": "", "priority": false, "complete_task": false, "restart_no_contact": false, "call_at": "", "no_answer": false, "clear_offer": false, "vendor_price_expectation": "", "agent_price_guide": "", "decision_makers": "", "other_agents": ""}, "note": "fact worth logging, or empty", "summary": "e.g. Sarah Jones → Appraisal Booked, Thu 23 Oct 2pm (say if you tick off a task)"}], "new_card": null, "missing": [], "confidence": "high|low", "question": ""}';
+    'new_card shape: {"name": "", "mobile": "", "address": "", "email": "", "source": "", "source_detail": "", "stage": "", "appraisal_at": "", "call_at": "", "next_action": "", "next_action_date": "", "nurture_reason": "", "details": {"beds": null, "baths": null, "block": null}, "motivation": "Making a move|Just an update|Unsure|", "timing": "", "notes": ""} or null; missing: [].\n' +
+    'Return JSON only: {"updates": [{"lead_id": "rec...", "changes": {"stage": "", "next_action": "", "next_action_date": "", "appraisal_at": "", "listing_meeting_at": "", "nurture_reason": "", "lost_reason": "", "authority_ends": "", "priority": false, "complete_task": false, "restart_no_contact": false, "call_at": "", "no_answer": false, "clear_offer": false, "source": "", "source_detail": "", "vendor_price_expectation": "", "agent_price_guide": "", "decision_makers": "", "other_agents": ""}, "note": "fact worth logging, or empty", "summary": "e.g. Sarah Jones → Appraisal Booked, Thu 23 Oct 2pm (say if you tick off a task)"}], "new_contact": false, "new_card": null, "missing": [], "confidence": "high|low", "question": ""}';
   const out = await claudeJSON('You are Alex, the sales assistant at Stone Real Estate Ballarat. You read short texts from agents and update their lead cards accurately and conservatively.', user, 1400);
   const updates = (out.updates || []).filter(u => cards.some(c => c.id === u.lead_id));
   const key0 = normalisePhone(from);
   // A new contact added by text
-  const nc = out.new_card && typeof out.new_card === 'object' && (out.new_card.name || out.new_card.mobile || out.new_card.address) ? out.new_card : null;
-  if (nc) {
-    const missing = [];
-    if (!String(nc.name || '').trim()) missing.push('name');
-    if (!isTextableMobile(nc.mobile || '')) missing.push('mobile');
-    if (!String(nc.address || '').trim()) missing.push('address');
-    if (!SOURCE_LIST.includes(nc.source)) missing.push('source');
-    if (missing.length) {
-      const question = (out.question && String(out.question).trim()) || `Happy to add ${nc.name || 'them'} – what's their ${missing.map(m => m === 'source' ? 'lead source' : m).join(', ').replace(/, ([^,]*)$/, ' and $1')}?${missing.includes('source') ? ' (open home, referral, door knock…)' : ''}`;
-      pendingByPhone.set(key0, { kind: 'newcard', draft: nc, question, at: Date.now() });
-      await reply(question);
-      return;
-    }
-    const res = await createCardFromText(member, nc, text);
-    if (res.createdId) pendingByPhone.set(key0, { kind: 'undo', items: [], created: res.createdId, summary: `${nc.name} added`, at: Date.now() });
-    if (res.existingId) {
-      const ex = cards.find(c => c.id === res.existingId) || await getRecord(T.leads, res.existingId);
-      await reply(`${leadLabel(ex.fields)} is already one of your cards (${sel(ex.fields[L.stage])}) – I've added your text as a note. Tell me what to change on it.`);
-      return;
-    }
-    await reply(res.reply + (res.createdId ? '\nReply UNDO to remove it.' : ''));
-    return;
+  console.log('Alex leads: agent update read as ' + JSON.stringify(out).slice(0, 500));
+  if (out.new_contact === true || (out.new_card && typeof out.new_card === 'object' && (out.new_card.name || out.new_card.mobile || out.new_card.address))) {
+    return addNewContact(member, from, text, reply, pendingCard, await extractNewContact(text, pendingCard), cards);
   }
   if (!cards.length) { await reply(out.question || "I couldn't find any cards for you yet – to add someone, text me their name, mobile, address and where the lead came from."); return; }
   if (!updates.length || out.question) {
@@ -2325,7 +2373,8 @@ async function handleTeamSMS(from, body) {
   const member = await teamByPhone(from);
   if (!member && !approver) return false;
   const text = String(body || '').trim();
-  const reply = msg => sendSMS(from, msg);
+  const reply = msg => { console.log('Alex leads → ' + from + ': ' + String(msg).replace(/\n/g, ' / ')); return sendSMS(from, msg); };
+  console.log('Alex leads: team text from ' + (member ? member.fields[TM.name] : 'approver') + (member && !member.fields[TM.alexActive] ? ' (not Alex Active)' : ''));
   const key = normalisePhone(from);
 
   // 1. UNDO / confirmation of the last card change
@@ -2790,6 +2839,7 @@ async function createCardFromText(member, nc, rawText) {
   const num = v => (v === null || v === undefined || v === '' || isNaN(Number(v))) ? undefined : Number(v);
   const fields = {
     [L.name]: nc.name, [L.phone]: mobile || undefined, [L.address]: nc.address || undefined, [L.agent]: [member.id],
+    [L.email]: /\S+@\S+\.\S+/.test(nc.email || '') ? String(nc.email).trim() : undefined,
     [L.source]: SOURCE_LIST.includes(nc.source) ? nc.source : 'Other', [L.sourceDetail]: nc.source_detail || undefined, [L.enteredVia]: 'Agent by text',
     [L.stage]: stage, [L_RECEIVED]: melbClock().date, [L_STATE]: '{"flow":"newlead","phase":"skip","why":"agent added by text"}',
     [L_APPT_AT]: melbToISO(nc.appraisal_at) || undefined, [L_CALL_AT]: melbToISO(nc.call_at) || undefined,

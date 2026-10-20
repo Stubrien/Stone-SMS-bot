@@ -382,7 +382,8 @@ module.exports = function(app) {
     // and replies from vendors on pilot agents' leads are handled by alex-leads.js
     if (alexLeads.enabled()) {
       try {
-        if (alexLeads.isApprover(From) && await alexLeads.handleApproverSMS(Body)) {
+        // Texts from Stu or an agent on the Team table: preview commands, approvals and card updates
+        if (await alexLeads.handleTeamSMS(From, Body)) {
           return res.type('text/xml').send('<Response></Response>');
         }
         if (!alexLeads.isApprover(From) && await alexLeads.handleVendorSMS(From, Body)) {

@@ -1,10 +1,13 @@
 // alex-leads.js
-// Alex <-> Airtable Sales Leads integration (pilot).
-// - Sweeps Airtable for vendor leads that are due a nurture check-in or need an appraisal booked
-// - Drafts each SMS with Claude using the lead card + notes/history
-// - Texts every draft to the approver (Stu) for YES / EDIT / NO / KEEP before anything is sent
-// - Handles replies from pilot vendors: logs them, updates Key Facts / follow-up date, drafts a reply
+// Alex <-> Airtable Sales Leads integration.
+// - Nurture: drafts the day's nurture texts each weekday morning (max 5 per agent), texts each agent ONE midday
+//   preview, and sends at 2pm unless the agent replies CHANGE <code> … or CANCEL <code> (no per-text approval)
+// - Track 8 (listed with another agency): monthly check-ins, one offer of help around when their agreement ends,
+//   stops when Market Sales shows it sold, moves back to Qualifying when the agreement ends unsold
+// - Agents text Alex to update their cards ("Booked Sarah Thu 2pm") – applied with UNDO, or confirmed first if unclear
+// - Replies from vendors: logged, Key Facts / track / follow-up updated, reply drafted for Stu's approval
 // - Creates new vendor enquiries in Airtable (Entered Via = Alex) instead of Pipedrive
+// Parked cards (Parked for test) are ignored.
 //
 // Env vars: AIRTABLE_TOKEN, AIRTABLE_BASE (default below), APPROVER_MOBILE, APPROVER_NAME (default Stu),
 //           ALEX_PHONE_NUMBER, ANTHROPIC_API_KEY, TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN,
@@ -167,7 +170,7 @@ function historyText(history) {
 
 // Soft opt-out added to the end of the first text Alex sends anyone.
 // Any reply asking to be left alone is treated as an opt-out (see handleVendorSMS).
-const OPT_OUT_LINE = "If now's not the right time or your situation has changed, no worries at all, just reply and let me know and I'll leave it there.";
+const OPT_OUT_LINE = "If it's not the right time or you'd rather be left alone, just let me know.";
 const OPT_OUT_ACK = "No worries at all, I'll leave it there. Thanks for letting me know. – Alex, Stone Ballarat";
 
 const VOICE = "You write SMS messages as Alex from Stone Ballarat, writing on behalf of one of our sales agents. " +
@@ -191,7 +194,10 @@ async function nextCode() {
   const recent = await listAll(T.messages, { maxRecords: '50', 'sort[0][field]': M.created, 'sort[0][direction]': 'desc', [`fields[]`]: M.code });
   let max = 0;
   for (const r of recent) { const m = String(r.fields[M.code] || '').match(/^A(\d+)$/i); if (m) max = Math.max(max, parseInt(m[1], 10)); }
-  const n = max >= 99 ? 1 : max + 1;
+  // never reuse a code that is still waiting, scheduled or previewed
+  const live = new Set((await activeDrafts()).map(r => String(r.fields[M.code] || '').toUpperCase()));
+  let n = max >= 99 ? 1 : max + 1;
+  for (let i = 0; i < 99 && live.has('A' + n); i++) n = n >= 99 ? 1 : n + 1;
   return 'A' + n;
 }
 
@@ -233,6 +239,10 @@ async function sendApproved(msgRec) {
     return 'NOT sent – ' + why + (why.includes('mobile') ? ' (fix the Phone field on the card)' : '');
   }
   const lead = leadNow;
+  if (sel(f[M.purpose]) === 'Nurture check-in' && (sel(lead.fields[L.stage]) !== 'Nurture' || lead.fields[L.pauseAlex] || lead.fields[L_PARKED])) {
+    await updateRecord(T.messages, msgRec.id, { [M.status]: 'Rejected', [M.error]: 'Not sent – card no longer in Nurture (or paused / parked)' });
+    return 'not sent – the card has moved on';
+  }
   if (lead.fields[L.doNotContact]) {
     await updateRecord(T.messages, msgRec.id, { [M.status]: 'Rejected', [M.error]: 'Do Not Contact ticked before sending' });
     return 'blocked (Do Not Contact)';
@@ -267,6 +277,10 @@ async function sendApproved(msgRec) {
 async function waitingDrafts() {
   return listAll(T.messages, { filterByFormula: `{${M.status}}='Awaiting approval'` });
 }
+// Drafts that are still in play: waiting for Stu's approval, or nurture texts scheduled / previewed for today
+async function activeDrafts() {
+  return listAll(T.messages, { filterByFormula: `OR({${M.status}}='Awaiting approval',{${M.status}}='Scheduled',{${M.status}}='Previewed')` });
+}
 
 // Returns true when the SMS was an approver command (so the normal Alex chat flow is skipped)
 // An EDIT reply that starts like an instruction is treated as a request to change the draft, not as the new text.
@@ -279,8 +293,8 @@ function looksLikeInstruction(t) {
 //   "NO A21", "nope A21", "A21 no", "EDIT A21 <wording>", "CHANGE A21 <instruction>", "KEEP A21", "LIST"
 const CMD_WORDS = {
   YES: /^(yes|y|yep|yeah|yup|ya|ok|okay|k|send|send it|approve|approved|go|go ahead|sure|good|perfect|👍|✅)$/i,
-  NO: /^(no|n|nope|nah|bin|bin it|reject|don'?t send|dont send|skip|❌)$/i,
-  EDIT: /^edit$/i, CHANGE: /^change$/i, KEEP: /^keep$/i, LIST: /^list$/i
+  NO: /^(no|n|nope|nah|bin|bin it|reject|don'?t send|dont send|skip|cancel|❌)$/i,
+  EDIT: /^edit$/i, CHANGE: /^change$/i, KEEP: /^keep$/i, LIST: /^list$/i, SHOW: /^show$/i
 };
 function cmdOf(word) { for (const [k, re] of Object.entries(CMD_WORDS)) if (re.test(word)) return k; return null; }
 function parseApproverCommand(text) {
@@ -309,7 +323,7 @@ function parseApproverCommand(text) {
     const c = w && cmdOf(clean(w[1]));
     if (!c) return null;
     const tail = clean(w[2] || '');
-    if (['YES', 'NO', 'KEEP', 'LIST'].includes(c) && tail && !/^(please|pls|thanks|thank you|thx|cheers|mate|ta)$/i.test(tail)) return null; // a sentence, not a command
+    if (['YES', 'NO', 'KEEP', 'LIST', 'SHOW'].includes(c) && tail && !/^(please|pls|thanks|thank you|thx|cheers|mate|ta)$/i.test(tail)) return null; // a sentence, not a command
     return { cmd: c, code: '', rest: ['EDIT', 'CHANGE'].includes(c) ? lead(w[2] || '') : '' };
   }
   if (!cmd) return null;
@@ -356,7 +370,13 @@ async function handleApproverSMS(body) {
 
   if (cmd === 'NO' || cmd === 'N') {
     await updateRecord(T.messages, rec.id, { [M.status]: 'Rejected', [M.approverReply]: text, [M.approvedBy]: by, [M.approvedAt]: new Date().toISOString() });
-    await sendSMS(approverMobile(), `${code} binned – nothing sent.`);
+    // A binned nurture check-in skips this round: roll the follow-up date on by the track so Alex
+    // doesn't draft a fresh one at the next sweep (it used to re-draft within 15 minutes).
+    let next = '';
+    if (sel(rec.fields[M.purpose]) === 'Nurture check-in') {
+      try { next = await skipNurtureRound((rec.fields[M.lead] || [])[0], code); } catch (e) { console.error('Alex leads: skip round failed', e.message); }
+    }
+    await sendSMS(approverMobile(), `${code} binned – nothing sent.` + (next ? ` Next check-in ${dmy(next)}.` : ''));
     return true;
   }
   if ((cmd === 'EDIT' || cmd === 'CHANGE') && !rest) { await sendSMS(approverMobile(), `Send the new wording after the code (EDIT ${code} Hey Sonya…) or an instruction (CHANGE ${code} make it shorter).`); return true; }
@@ -411,29 +431,39 @@ const MS = {
 const M_CONTENT = 'fldsb2ITupyCZ67y2';      // Alex Messages → Nurture Content
 const L_MESSAGES = 'fldZjakyGET3iL1An';     // Leads → Alex Messages (inverse link)
 const SALE_MAX_AGE_DAYS = 92;
+const L_AUTH_ENDS = 'fldK9PEbayGAWN58s';   // Leads → Authority Ends (Track 8)
+const L_SOLD = { date: 'fldZgX338TKAQcw24', price: 'fldZVXw0itDG4JGE5', agency: 'fldnkloI5sKozRTYi' };
+const L_PARKED = 'fldneHAgicjDiwSGo';      // Leads → Parked for test (Alex ignores parked cards)
+const L_LOST_REASON = 'fldBQPieV4jPtzHt9';
 const UNANSWERED_LIMIT = 3;
 
+// Agreed 20 Oct 2026 (Pipeline redesign doc). Track 1 (selling in 1–2 months) is no longer a nurture track: those cards move
+// to Qualifying with a weekly agent follow-up (the Airtable 'card changed' automation does the move). No track pauses for
+// silence any more – the time-on-track review decides. Day counts must match the Airtable automations.
 const TRACKS = {
-  1: { label: 'Track 1 · weekly', days: 7, slowDays: 14, seq: ['sale', 'tip', 'suburb', 'tip'], ask: null },
   2: { label: 'Track 2 · fortnightly', days: 14, seq: ['sale', 'tip', 'ask'], ask: 'soft' },
   3: { label: 'Track 3 · monthly', days: 30, seq: ['sale', 'tip', 'ask'], ask: 'full' },
-  4: { label: 'Track 4 · monthly', days: 30, seq: ['sale', 'tip', 'suburb', 'ask'], ask: 'full' },
-  // Cold / no contact: every 2 months, market news first, an in-person price update offer every 4th text, never paused for silence
-  5: { label: 'Track 5 · cold, every 2 months', days: 60, seq: ['market', 'sale', 'tip', 'ask'], ask: 'price', neverPause: true },
+  4: { label: 'Track 4 · every 2 months', days: 61, seq: ['sale', 'tip', 'suburb', 'ask'], ask: 'full' },
+  // Cold / no contact: every 3 months, market news first, an in-person price update offer every 4th text
+  5: { label: 'Track 5 · cold, every 3 months', days: 91, seq: ['market', 'sale', 'tip', 'ask'], ask: 'price', neverPause: true },
   // Annual check-in: recently moved in / settled, or a light touch to stay front of mind. A friendly text every 6 months
   // (alternating a check-in with a price-update offer and a plain local market update); the agent reviews the card each year.
   6: { label: 'Track 6 · annual check-in, 6-monthly text', days: 182, seq: ['annual', 'annual-market'], ask: null, neverPause: true,
        goal: 'This person has recently bought/moved in or settled, or simply gets a friendly text from us every six months so we stay front of mind. They are not selling. Keep it light and neighbourly - no selling tips and no pressure.' },
   // Rental providers / landlords whose property Stone manages: quarterly, investor angle, never property-management matters.
-  7: { label: 'Track 7 · rental provider, quarterly', days: 90, seq: ['sale', 'market', 'ask'], ask: 'investor', neverPause: true,
-       goal: 'This person is a rental provider (landlord) - the property on the card is their investment property, leased through Stone Ballarat\'s property management team. Talk about it as their investment property, never as their home. The aim is to stay front of mind as their local sales contact for a price update or appraisal, market advice, or help if they ever want to sell or buy another investment property. Never mention rent, tenants, the lease, repairs or anything the property management team handles, and never give financial or tax advice.' }
+  7: { label: 'Track 7 · rental provider, 6-monthly', days: 182, seq: ['sale', 'market', 'ask'], ask: 'investor', neverPause: true,
+       goal: 'This person is a rental provider (landlord) - the property on the card is their investment property, leased through Stone Ballarat\'s property management team. Talk about it as their investment property, never as their home. The aim is to stay front of mind as their local sales contact for a price update or appraisal, market advice, or help if they ever want to sell or buy another investment property. Never mention rent, tenants, the lease, repairs or anything the property management team handles, and never give financial or tax advice.' },
+  // Listed with another agency: monthly. A friendly check-in, a recent nearby sale or market note for context, and - once,
+  // around when their agreement ends - an offer of help. No selling tips or presentation advice (that is their agent's job).
+  8: { label: 'Track 8 · listed elsewhere, monthly', days: 30, seq: ['checkin8', 'sale', 'checkin8', 'market'], ask: null, neverPause: true,
+       goal: 'This person has listed their property for sale with ANOTHER agency. Stay a friendly, useful local contact so that if their agreement ends without a sale they think of us. Never criticise or compare their agent or agency, never give selling tips or presentation advice, never suggest ending their agreement early, never ask about their price or offers in detail.' }
 };
 function trackFor(fields) {
   const r = sel(fields[L.nurtureReason]);
+  if (/listed|another agent/i.test(r)) return 8;
   if (/annual/i.test(r)) return 6;
   if (/rental provider|landlord/i.test(r)) return 7;
-  if (/1.2 months/i.test(r)) return 1;
-  if (/3 months|stalled/i.test(r)) return 2;
+  if (/3 months|stalled|1.2 months/i.test(r)) return 2; // 1–2 months cards are moved to Qualifying by Airtable
   if (/no contact|cold|quiet/i.test(r)) return 5;
   if (/12 months/i.test(r)) return 4;
   return 3; // ~6 months, or not set
@@ -615,7 +645,7 @@ function nurtureState(leadFields, msgs) {
   const used = new Set(msgs.map(m => m.fields[M_CONTENT]).filter(Boolean));
   const unanswered = unansweredCount(msgs);
   const t = TRACKS[track];
-  const days = track === 1 && unanswered >= UNANSWERED_LIMIT ? t.slowDays : t.days;
+  const days = t.days;
   const askCount = sentNurture.filter(m => String(m.fields[M_CONTENT] || '').startsWith('ask:')).length;
   return { track, t, n: sentNurture.length, askCount, used, unanswered, days, recentTexts: sentNurture.slice(-4).map(m => m.fields[M.finalText] || m.fields[M.draft]) };
 }
@@ -624,6 +654,21 @@ function nurtureState(leadFields, msgs) {
 async function planNurture(lead, st) {
   const address = lead.fields[L.address] || '';
   let type = st.t.seq[st.n % st.t.seq.length];
+  if (st.track === 8) {
+    // Once only, around when their agreement with the other agency ends (or after two texts if we don't know the date)
+    const ends = lead.fields[L_AUTH_ENDS] || '';
+    const today = melbNow().date;
+    const offerDue = !st.used.has('offer8') && (ends ? ends <= addDays(today, 21) : st.n >= 2);
+    if (offerDue) return {
+      key: 'offer8', label: 'offer of help if their agreement ends',
+      brief: 'Check in on how the sale is going, then say in one easy sentence that if their agreement finishes and they would like a fresh set of eyes, the agent is happy to help - no pressure at all. ' +
+        'Never suggest ending their current agreement early, never criticise their agent, and keep it short and kind.'
+    };
+    if (type === 'checkin8') return {
+      key: 'checkin8:' + today.slice(0, 7), label: 'how is the sale going',
+      brief: 'Ask, in a friendly way, how the sale is going and whether they have had any enquiries that look promising. One easy question they can answer in a few words. No tips, no advice, never mention their agent or agency by name.'
+    };
+  }
   if (type === 'annual-market') {
     const wrap = (await suburbWrap(address, st.used)) || (await ballaratWrap(st.used));
     return {
@@ -686,15 +731,7 @@ async function planNurture(lead, st) {
   return { key: 'tip:' + tip[0], label: 'tip – ' + tip[0].replace(/-/g, ' '), brief: `Share this selling-prep tip in your own words, tied to their situation if the notes allow: ${tip[1]} Do not ask them for anything.` };
 }
 
-// Leads that have gone quiet: Track 1 slows to fortnightly; other tracks pause and the agent gets a task.
-async function pauseIfQuiet(lead, st) {
-  if (st.track === 1 || st.t.neverPause || st.unanswered < UNANSWERED_LIMIT) return false;
-  const today = melbNow().date;
-  await updateRecord(T.leads, lead.id, { [L.pauseAlex]: true, [L.nextAction]: 'Call – Alex paused after ' + st.unanswered + ' unanswered texts', [L.nextActionDate]: today });
-  await logActivity(lead.id, { summary: `Alex paused – ${st.unanswered} texts without a reply`, detail: 'Untick Pause Alex on the card to restart texts.', type: 'General', kind: 'History' });
-  await sendSMS(approverMobile(), `${lead.fields[L.name]} hasn't replied to ${st.unanswered} texts, so Alex has paused and set a call task for the agent. Untick Pause Alex on the card to restart.`);
-  return true;
-}
+// (Pausing after unanswered texts was removed on 20 Oct 2026 – the time-on-track review decides instead.)
 
 // ---------------------------------------------------------------- outbound sweep
 
@@ -703,21 +740,43 @@ async function alexActiveAgentIds() {
   return new Set(team.map(t => t.id));
 }
 
+// After a nurture draft is binned, move the card's next check-in on by its track so the round is skipped.
+async function skipNurtureRound(leadId, code) {
+  if (!leadId) return '';
+  const lead = await getRecord(T.leads, leadId);
+  if (sel(lead.fields[L.stage]) !== 'Nurture') return '';
+  const st = nurtureState(lead.fields, await leadMessages(lead.fields));
+  const next = addDays(melbNow().date, st.days);
+  await updateRecord(T.leads, leadId, { [L.followUp]: next });
+  await logActivity(leadId, { summary: `Alex draft ${code} binned – next check-in ${dmy(next)}`, type: 'Follow-up date changed', kind: 'History' });
+  return next;
+}
+
+// Leads whose nurture draft was rejected or expired in the last 7 days - don't draft them again straight away
+// (covers drafts rejected on the Airtable page, where the follow-up date isn't moved).
+async function recentlyBinnedLeadIds() {
+  const since = addDays(melbNow().date, -7);
+  const recs = await listAll(T.messages, { filterByFormula: `AND(OR({${M.status}}='Rejected',{${M.status}}='Expired'),{${M.direction}}='To vendor',IS_AFTER({${M.created}},'${since}'))` });
+  return new Set(recs.map(r => (r.fields[M.lead] || [])[0]).filter(Boolean));
+}
+
 async function eligibleLeads() {
   const agents = await alexActiveAgentIds();
   if (!agents.size) return [];
   const leads = await listAll(T.leads, {
-    filterByFormula: `AND(OR({${L.stage}}='Nurture',{${L.stage}}='Qualifying'),NOT({${L.doNotContact}}),NOT({${L.pauseAlex}}),{${L.phone}}!='')`
+    filterByFormula: `AND(OR({${L.stage}}='Nurture',{${L.stage}}='Qualifying'),NOT({${L.doNotContact}}),NOT({${L.pauseAlex}}),NOT({${L_PARKED}}),{${L.phone}}!='')`
   });
   const today = melbNow().date;
   const cutoff = Date.now() - MIN_DAYS_BETWEEN_TEXTS * 86400000;
-  const waiting = await waitingDrafts();
+  const waiting = await activeDrafts();
   const waitingLeadIds = new Set(waiting.map(w => (w.fields[M.lead] || [])[0]));
+  const binnedLeadIds = await recentlyBinnedLeadIds();
   return leads.filter(l => {
     const f = l.fields;
     if (!(f[L.agent] || []).some(id => agents.has(id))) return false;
     if (!isTextableMobile(f[L.phone])) return false; // e.g. an email or landline typed into Phone
     if (waitingLeadIds.has(l.id)) return false;
+    if (binnedLeadIds.has(l.id)) return false; // a draft was just binned - wait for the next round
     if (f[L.alexLastContact] && new Date(f[L.alexLastContact]).getTime() > cutoff) return false;
     const stage = sel(f[L.stage]);
     if (stage === 'Nurture') return !!f[L.followUp] && f[L.followUp] <= today;
@@ -759,7 +818,6 @@ async function draftOutbound(lead) {
   let goal, plan = null, st = null;
   if (purpose === 'Nurture check-in') {
     st = nurtureState(lead.fields, await leadMessages(lead.fields));
-    if (await pauseIfQuiet(lead, st)) return null;
     plan = await planNurture(lead, st);
     goal = 'Write a nurture text. ' + plan.brief + ' ' + (st.t.goal || 'Keep it warm and useful - this person is not ready yet, so the aim is simply to be helpful and let them know we are here if they have questions.') +
       (st.recentTexts.length ? '\nRECENT TEXTS ALEX ALREADY SENT THEM (do not repeat their wording, openers or ideas):\n' + st.recentTexts.map(t => '- ' + t).join('\n') : '');
@@ -801,20 +859,183 @@ async function draftOutbound(lead) {
   return { ctx, purpose, draft, reasoning, content: plan ? plan.key : '', trackLabel: st ? st.t.label : '' };
 }
 
+// ---------------------------------------------------------------- nurture: schedule → midday preview → 2pm send
+// Agreed 20 Oct 2026: no approval text for each nurture message. Alex drafts the day's nurture texts in the morning
+// (status Scheduled), at 12pm texts each agent ONE preview of what is going out, and sends at 2pm unless the agent
+// replies CHANGE <code> … or CANCEL <code>. A cancelled text skips that round; it is not redrafted.
+const DAILY_NURTURE_CAP = 5;      // nurture texts per agent per day
+const PREVIEW_HOUR = 12;
+const SEND_HOUR = 14;
+const MIN_PREVIEW_LEAD_MINUTES = 90; // a text always goes at least 90 min after its preview
+
+let teamCache = { at: 0, rows: [] };
+async function teamRows() {
+  if (Date.now() - teamCache.at < 10 * 60000) return teamCache.rows;
+  teamCache = { at: Date.now(), rows: await listAll(T.team) };
+  return teamCache.rows;
+}
+async function teamByPhone(from) {
+  return (await teamRows()).find(t => samePhone(t.fields[TM.mobile], from)) || null;
+}
+async function teamById(id) { return (await teamRows()).find(t => t.id === id) || null; }
+
+async function leadsByIds(ids) {
+  const out = [];
+  const list = Array.from(new Set(ids.filter(Boolean)));
+  for (let i = 0; i < list.length; i += 40) {
+    const chunk = list.slice(i, i + 40);
+    out.push(...await listAll(T.leads, { filterByFormula: 'OR(' + chunk.map(id => `RECORD_ID()='${id}'`).join(',') + ')' }));
+  }
+  return out;
+}
+
+// Short description of a drafted nurture text for the preview, e.g. "recent sale in their suburb"
+function planLabel(rec) {
+  const m = String(rec.fields[M.reasoning] || '').match(/text \d+: ([^.]+)\./);
+  return m ? m[1] : 'check-in';
+}
+
+// How many nurture texts each agent already has today (scheduled, previewed or sent)
+async function nurtureCountsToday() {
+  const today = melbNow().date;
+  const recs = await listAll(T.messages, { filterByFormula: `AND({${M.purpose}}='Nurture check-in',OR({${M.status}}='Scheduled',{${M.status}}='Previewed',{${M.status}}='Sent'),DATETIME_FORMAT(SET_TIMEZONE({${M.created}},'${TZ}'),'YYYY-MM-DD')='${today}')` });
+  const leads = await leadsByIds(recs.map(r => (r.fields[M.lead] || [])[0]));
+  const agentOf = Object.fromEntries(leads.map(l => [l.id, (l.fields[L.agent] || [])[0]]));
+  const counts = {};
+  for (const r of recs) { const a = agentOf[(r.fields[M.lead] || [])[0]]; if (a) counts[a] = (counts[a] || 0) + 1; }
+  return counts;
+}
+
+async function scheduleNurtureDrafts() {
+  const due = (await eligibleLeads()).filter(l => sel(l.fields[L.stage]) === 'Nurture');
+  if (!due.length) return;
+  const counts = await nurtureCountsToday();
+  let made = 0;
+  // oldest follow-up date first, so anyone overdue goes before someone due today
+  due.sort((a, b) => String(a.fields[L.followUp] || '') < String(b.fields[L.followUp] || '') ? -1 : 1);
+  for (const lead of due) {
+    if (made >= 8) break; // keep each sweep short; the next sweep carries on
+    const agentId = (lead.fields[L.agent] || [])[0];
+    if ((counts[agentId] || 0) >= DAILY_NURTURE_CAP) continue;
+    try {
+      const d = await draftOutbound(lead);
+      if (!d || !d.draft) continue;
+      const code = await nextCode();
+      await createRecord(T.messages, {
+        [M.code]: code, [M.lead]: [lead.id], [M.direction]: 'To vendor', [M.purpose]: 'Nurture check-in', [M.status]: 'Scheduled',
+        [M.draft]: d.draft, [M.reasoning]: d.reasoning || '', [M.number]: normalisePhone(lead.fields[L.phone]), [M_CONTENT]: d.content || ''
+      });
+      counts[agentId] = (counts[agentId] || 0) + 1;
+      made++;
+      console.log('Alex leads: nurture text ' + code + ' scheduled for ' + lead.id);
+    } catch (e) { console.error('Alex leads: nurture draft failed for ' + lead.id, e.message); }
+  }
+}
+
+// One preview text per agent at 12pm listing the texts going out at 2pm
+async function sendMiddayPreviews() {
+  const recs = await listAll(T.messages, { filterByFormula: `{${M.status}}='Scheduled'` });
+  if (!recs.length) return;
+  const leads = await leadsByIds(recs.map(r => (r.fields[M.lead] || [])[0]));
+  const leadById = Object.fromEntries(leads.map(l => [l.id, l]));
+  const byAgent = {};
+  for (const r of recs) {
+    const lead = leadById[(r.fields[M.lead] || [])[0]];
+    const agentId = lead ? (lead.fields[L.agent] || [])[0] || 'none' : 'none';
+    (byAgent[agentId] = byAgent[agentId] || []).push({ r, lead });
+  }
+  const sendAt = melbNow().hour >= SEND_HOUR ? 'in about 90 minutes' : 'at 2pm';
+  for (const [agentId, items] of Object.entries(byAgent)) {
+    const agent = agentId === 'none' ? null : await teamById(agentId);
+    const to = agent && isTextableMobile(agent.fields[TM.mobile]) ? normalisePhone(agent.fields[TM.mobile]) : approverMobile();
+    const lines = items.map(({ r, lead }) => `${r.fields[M.code]} – ${lead ? lead.fields[L.name] : 'unknown card'}: ${planLabel(r)}`);
+    const first = items[0].r.fields[M.code];
+    const text = `Alex – nurture texts going ${sendAt}:\n${lines.join('\n')}\n\nReply SHOW ${first} to see one, CHANGE ${first} [what to change] or CANCEL ${first}. No reply needed otherwise.`;
+    try {
+      await sendSMS(to, text);
+      for (const { r } of items) await updateRecord(T.messages, r.id, { [M.status]: 'Previewed', [M.approvedAt]: new Date().toISOString(), [M.approvedBy]: 'Midday preview' });
+      console.log(`Alex leads: midday preview sent (${items.length} texts) to ${agent ? agent.fields[TM.name] : 'approver'}`);
+    } catch (e) { console.error('Alex leads: preview failed', e.message); }
+  }
+}
+
+async function sendPreviewedTexts() {
+  const recs = await listAll(T.messages, { filterByFormula: `{${M.status}}='Previewed'` });
+  const cutoff = Date.now() - MIN_PREVIEW_LEAD_MINUTES * 60000;
+  for (const r of recs) {
+    const at = r.fields[M.approvedAt] ? new Date(r.fields[M.approvedAt]).getTime() : 0;
+    if (at > cutoff) continue;
+    try { const res = await sendApproved(r); console.log('Alex leads: sent ' + r.fields[M.code] + ' ' + res); }
+    catch (e) { console.error('Alex leads: send failed', e.message); }
+  }
+}
+
+// ---------------------------------------------------------------- Track 8 housekeeping (once a day)
+// Listed elsewhere: stop when Market Sales shows the property sold; when their agreement has ended unsold,
+// move the card back to Qualifying with a call task for the agent.
+function ownSale(address, sales) {
+  const known = Array.from(new Set(sales.map(s => s.fields[MS.suburb]).filter(Boolean).concat(Object.keys(NEIGHBOURS))));
+  const { suburb, street } = suburbOf(address, known);
+  if (!suburb || !street) return null;
+  const k = streetKey(street), n = numberKey(street);
+  if (!k || !n) return null;
+  return sales.find(s => s.fields[MS.suburb] === suburb && streetKey(s.fields[MS.street]) === k && numberKey(s.fields[MS.street]) === n) || null;
+}
+async function textAgentOf(lead, text) {
+  const agent = await teamById((lead.fields[L.agent] || [])[0]);
+  const to = agent && isTextableMobile(agent.fields[TM.mobile]) ? normalisePhone(agent.fields[TM.mobile]) : approverMobile();
+  try { await sendSMS(to, text); } catch (e) { console.error('Alex leads: agent text failed', e.message); }
+}
+let lastHousekeepDate = null;
+async function track8Housekeeping() {
+  const today = melbNow().date;
+  if (lastHousekeepDate === today) return;
+  lastHousekeepDate = today;
+  const agents = await alexActiveAgentIds();
+  const leads = (await listAll(T.leads, { filterByFormula: `AND({${L.stage}}='Nurture',NOT({${L_PARKED}}),NOT({${L.pauseAlex}}),FIND('another agent',{${L.nurtureReason}}&''))` }))
+    .filter(l => (l.fields[L.agent] || []).some(id => agents.has(id)));
+  if (!leads.length) return;
+  const sales = await recentSales();
+  for (const lead of leads) {
+    const f = lead.fields;
+    const first = firstName(f[L.name]) || f[L.name];
+    const sale = ownSale(f[L.address], sales);
+    try {
+      if (sale) {
+        const sf = sale.fields;
+        await updateRecord(T.leads, lead.id, {
+          [L.pauseAlex]: true, [L_SOLD.date]: sf[MS.date] || null, [L_SOLD.price]: sf[MS.price] || null,
+          [L.nextAction]: `${first}'s property sold through another agency – move to the Annual check-in track or close the card`, [L.nextActionDate]: today
+        });
+        await logActivity(lead.id, { summary: `Market Sales shows ${f[L.address]} sold${sf[MS.price] ? ' for ' + fmtPrice(sf[MS.price]) : ''}${sf[MS.date] ? ' (' + dmy(sf[MS.date]) + ')' : ''} – Alex has stopped Track 8 texts`, type: 'General', kind: 'History' });
+        await textAgentOf(lead, `${f[L.name]}, ${f[L.address]} has sold through another agency${sf[MS.price] ? ' (' + fmtPrice(sf[MS.price]) + ')' : ''}. I've stopped the Track 8 texts. Suggest moving them to the Annual check-in track (or a buyer chat if they're buying next) – it's a task on the card.`);
+      } else if (f[L_AUTH_ENDS] && f[L_AUTH_ENDS] < today) {
+        await updateRecord(T.leads, lead.id, {
+          [L.stage]: 'Qualifying',
+          [L.nextAction]: `Call ${first} – their agreement with the other agency has ended`, [L.nextActionDate]: today
+        });
+        await logActivity(lead.id, { summary: `Authority with the other agency ended ${dmy(f[L_AUTH_ENDS])} with no sale showing – moved to Qualifying`, type: 'General', kind: 'History' });
+        await textAgentOf(lead, `${f[L.name]}'s agreement with the other agency ended ${dmy(f[L_AUTH_ENDS])} and Market Sales doesn't show a sale. I've moved the card to Qualifying with a call task for today.`);
+      }
+    } catch (e) { console.error('Alex leads: track 8 housekeeping failed for ' + lead.id, e.message); }
+  }
+}
+
 let lastDigestDate = null;
 async function sweep() {
   if (!sweepEnabled()) return;
   if (!inSendWindow()) return;
+  const now = melbNow();
   try {
-    // 1. send anything approved outside hours
+    // 1. send anything Stu approved outside hours (replies to vendors and appraisal-booking texts still go via approval)
     const approved = await listAll(T.messages, { filterByFormula: `OR({${M.status}}='Approved',{${M.status}}='Edited & approved')` });
     for (const r of approved) {
       try { const res = await sendApproved(r); console.log('Alex leads: sent approved ' + r.fields[M.code] + ' ' + res); }
       catch (e) { console.error('Alex leads: send failed', e.message); }
     }
 
-    // 2. morning digest of drafts still waiting from earlier days; expire after 2 days
-    const today = melbNow().date;
+    // 2. morning digest of drafts still waiting from earlier days; expire after 3 days
+    const today = now.date;
     const waiting = await waitingDrafts();
     const old = waiting.filter(w => String(w.fields[M.created] || w.createdTime).slice(0, 10) < today);
     for (const w of old) {
@@ -829,9 +1050,17 @@ async function sweep() {
       lastDigestDate = today;
     }
 
-    // 3. new drafts for leads that are due (max 5 per sweep so the approver isn't flooded)
-    const due = (await eligibleLeads()).slice(0, 5);
-    for (const lead of due) {
+    // 3. Track 8 housekeeping (sold / agreement ended), once a day
+    await track8Housekeeping();
+
+    // 4. nurture texts: draft in the morning, preview at 12, send from 2pm
+    if (now.hour < PREVIEW_HOUR) await scheduleNurtureDrafts();
+    else await sendMiddayPreviews();
+    if (now.hour >= SEND_HOUR) await sendPreviewedTexts();
+
+    // 5. appraisal-booking drafts for Qualifying cards whose task starts with "Alex" – still approved by Stu
+    const qual = (await eligibleLeads()).filter(l => sel(l.fields[L.stage]) === 'Qualifying').slice(0, 3);
+    for (const lead of qual) {
       try {
         const d = await draftOutbound(lead);
         if (d && d.draft) await queueDraft({ lead, ctx: d.ctx, purpose: d.purpose, draft: d.draft, reasoning: d.reasoning, content: d.content, trackLabel: d.trackLabel });
@@ -851,7 +1080,7 @@ async function findLeadByPhone(from) {
   const found = await listAll(T.leads, { filterByFormula: formula, maxRecords: '5' });
   if (!found.length) return null;
   // prefer an active / nurture card over closed ones
-  const rank = s => (['Lost', 'Authority Signed'].includes(s) ? 1 : 0);
+  const rank = s => (['Lost', 'Lost / Not Progressing', 'Listed (Won)', 'Authority Signed'].includes(s) ? 1 : 0);
   return found.sort((a, b) => rank(sel(a.fields[L.stage])) - rank(sel(b.fields[L.stage])))[0];
 }
 
@@ -898,6 +1127,7 @@ async function handleVendorSMS(from, body) {
     ' "urgent_for_agent": true/false (true if they want to talk to the agent now, are ready to list, or are upset),\n' +
     ' "wants_agent_contact": true/false - true ONLY if they ask for the agent to call/contact them, ask to talk to someone, or say they are ready to sell/list now,\n' +
     ' "new_timeframe": if they told us a new selling timeframe, EXACTLY one of "Selling in 1–2 months" | "Not quite ready (~3 months)" | "Too early (~6 months)" | "Curious (12 months+)", else empty,\n' +
+    ' "listed_elsewhere": true/false - true ONLY if they say they have listed or signed with another agent/agency. If so, reply_sms must be gracious and short, e.g. "No worries at all – best of luck with the sale." Never criticise the other agency,\n' +
     ' "wants_no_contact": true/false - true ONLY if they clearly ask us to stop texting / leave them alone / take them off the list, or say they are no longer selling and do not want to hear from us. "Not yet" or "try me in March" is NOT an opt-out - move the follow-up date instead. If unsure, false and set urgent_for_agent}';
   const out = await claudeJSON(VOICE + ' You also extract facts for the agent accurately and conservatively.', user, 700);
 
@@ -917,6 +1147,14 @@ async function handleVendorSMS(from, body) {
 
   const extra = [];
   const leadUpd = {};
+  if (out.listed_elsewhere === true) {
+    const st = sel(f[L.stage]);
+    if (st === 'Nurture') leadUpd[L.nurtureReason] = 'Listed with another agent (Track 8)';
+    else if (!['Lost / Not Progressing', 'Listed (Won)'].includes(st)) { leadUpd[L.stage] = 'Lost / Not Progressing'; leadUpd[L_LOST_REASON] = 'Listed with competitor'; }
+    extra.push('Listed with another agency – moved to Track 8 · Listed elsewhere. If you know when their agreement ends, add it to Authority Ends on the card.');
+    out.new_timeframe = '';
+    out.new_follow_up_date = '';
+  }
   if (out.key_fact) {
     const stamp = dmy(today) + '/' + today.slice(2, 4);
     leadUpd[L.keyFacts] = ((f[L.keyFacts] || '').trim() + `\n• ${out.key_fact} (${stamp}, via Alex)`).trim();
@@ -1041,12 +1279,234 @@ async function handoffToAgent({ lead, ctx, out, text, from }) {
   console.log('Alex leads: handoff for ' + lead.id + ' to ' + (agentMobile ? 'agent' : 'approver'));
 }
 
+// ---------------------------------------------------------------- texts from the team
+// Agents (and Stu) text Alex's number. In order, Alex:
+//  1. handles UNDO / YES for its last card change,
+//  2. handles preview commands on nurture texts (SHOW / CHANGE / EDIT / CANCEL <code>) – the card's agent or Stu,
+//  3. passes Stu's approval commands (YES / EDIT / NO / KEEP / LIST) to the approval flow,
+//  4. reads anything else from an Alex-active agent as an update to one of their cards ("Booked Sarah Thu 2pm",
+//     "Sent the price update to 14 Main St", "Spoke to Tom, not till next year") and changes the card.
+//     Clear updates are made straight away with UNDO; unclear ones are confirmed first.
+
+const pendingByPhone = new Map(); // phone -> { kind: 'undo' | 'confirm', leadId, upd, prev, summary, at }
+const PENDING_MINUTES = 120;
+const L_COMPLETE = 'fldRlScLUcb3ly6wF';
+const L_APPT_AT = 'flddxWuZLNPYmuiFM';
+const L_MTG_AT = 'fldGLVhG1pa7jXwuB';
+const L_PRIORITY = 'fldtEqiFM1c8rjFG6';
+
+const STAGE_LIST = ['New', 'No Contact – Agent Follow Up', 'Qualifying', 'Appraisal Booked', 'Price Update / Desktop Required',
+  'Prepare Listing Presentation', 'Listing Meeting Booked', 'Presentation Sent', 'Decision Pending', 'Delayed / On Hold',
+  'Approved / Accepted', 'Authority Sent – Awaiting Signatures', 'Listed (Won)', 'Nurture', 'Lost / Not Progressing'];
+const NURTURE_REASONS = ['Proposal or decision stalled', 'Not quite ready (~3 months)', 'Too early (~6 months)', 'Curious (12 months+)',
+  'Cold / gone quiet', 'Annual check-in (recently settled / yearly touch)', 'Rental provider / landlord', 'Listed with another agent (Track 8)', 'Selling in 1–2 months'];
+const LOST_REASONS = ['Listed with competitor', 'Selling privately', 'Not selling', 'Not interested', 'No contact', 'Bogus or duplicate'];
+
+// "2026-10-23T14:00" in Melbourne time -> ISO UTC
+function melbToISO(local) {
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(local || '')) return null;
+  const guess = new Date(local + ':00Z');
+  const shown = new Intl.DateTimeFormat('en-CA', { timeZone: TZ, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false })
+    .format(guess).replace(', ', 'T').replace(/T24/, 'T00');
+  const diff = guess.getTime() - new Date(shown + ':00Z').getTime();
+  return new Date(guess.getTime() + diff).toISOString();
+}
+function melbWhen(iso) {
+  return new Intl.DateTimeFormat('en-AU', { timeZone: TZ, weekday: 'short', day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' }).format(new Date(iso));
+}
+
+async function findActiveByCode(code) {
+  const recs = await listAll(T.messages, { filterByFormula: `AND(UPPER({${M.code}})='${code}',OR({${M.status}}='Awaiting approval',{${M.status}}='Scheduled',{${M.status}}='Previewed'))` });
+  return recs[0] || null;
+}
+
+async function handlePreviewCommand({ parsed, rec, member, approver, reply }) {
+  const { cmd, code, rest } = parsed;
+  const leadId = (rec.fields[M.lead] || [])[0];
+  const lead = leadId ? await getRecord(T.leads, leadId) : null;
+  if (!approver && !(lead && member && (lead.fields[L.agent] || []).includes(member.id))) {
+    await reply(`${code} isn't one of your cards.`); return;
+  }
+  const name = lead ? lead.fields[L.name] : 'the contact';
+  const current = rec.fields[M.finalText] || rec.fields[M.draft];
+  const when = sel(rec.fields[M.status]) === 'Scheduled' ? 'with the rest at 2pm' : 'at 2pm';
+  const who = member ? member.fields[TM.name] : (process.env.APPROVER_NAME || 'Stu');
+  if (cmd === 'SHOW') { await reply(`${code} to ${name}: "${current}"`); return; }
+  if (cmd === 'NO') {
+    await updateRecord(T.messages, rec.id, { [M.status]: 'Rejected', [M.approverReply]: parsed.raw, [M.approvedBy]: who });
+    let next = '';
+    try { next = await skipNurtureRound(leadId, code); } catch (e) { console.error('Alex leads: skip round failed', e.message); }
+    await reply(`${code} cancelled – nothing will go to ${name}.` + (next ? ` Next check-in ${dmy(next)}.` : ''));
+    return;
+  }
+  if (cmd === 'YES') { await reply(`${code} is set to go ${when}.`); return; }
+  if ((cmd === 'EDIT' || cmd === 'CHANGE') && !rest) { await reply(`Tell me what to change, e.g. CHANGE ${code} make it shorter.`); return; }
+  if (cmd === 'CHANGE' || (cmd === 'EDIT' && looksLikeInstruction(rest))) {
+    const out = await claudeJSON(VOICE, `CURRENT SMS: "${current}"\n\nTHE AGENT WANTS THIS CHANGE: "${rest}"\n\n` +
+      'Rewrite the SMS applying exactly that change and nothing else. Keep the greeting and introduction unless asked to change them. Return JSON only: {"sms": "..."}', 400);
+    const revised = String(out.sms || '').trim();
+    if (!revised) { await reply(`Couldn't apply that to ${code} – try EDIT ${code} followed by the full wording.`); return; }
+    await updateRecord(T.messages, rec.id, { [M.draft]: revised, [M.finalText]: null, [M.approverReply]: parsed.raw });
+    await reply(`${code} changed – it goes ${when}:\n"${revised}"\nReply CANCEL ${code} to stop it.`);
+    return;
+  }
+  if (cmd === 'EDIT') {
+    await updateRecord(T.messages, rec.id, { [M.finalText]: rest, [M.approverReply]: parsed.raw });
+    await reply(`${code} updated – your wording goes ${when}.`);
+    return;
+  }
+  await reply(`For ${code} reply SHOW, CHANGE [what to change], EDIT [new wording] or CANCEL.`);
+}
+
+async function agentCards(member) {
+  const name = String(member.fields[TM.name] || '').replace(/'/g, "\\'");
+  return listAll(T.leads, { filterByFormula: `AND(FIND('${name}',ARRAYJOIN({${L.agent}})),NOT({${L_PARKED}}),{${L.stage}}!='Listed (Won)')` });
+}
+
+function cardLine(l) {
+  const f = l.fields;
+  const st = sel(f[L.stage]);
+  const bits = [l.id, f[L.name] || '', f[L.address] || '', st];
+  if (st === 'Nurture') bits.push(sel(f[L.nurtureReason]) || 'no track');
+  else if (f[L.nextAction]) bits.push(`task: ${f[L.nextAction]}${f[L.nextActionDate] ? ' (due ' + dmy(f[L.nextActionDate]) + ')' : ''}`);
+  if (f[L_APPT_AT]) bits.push('appraisal ' + melbWhen(f[L_APPT_AT]));
+  return bits.join(' | ');
+}
+
+async function applyCardChange(leadId, upd, note, authorName, rawText) {
+  const lead = await getRecord(T.leads, leadId);
+  const prev = {};
+  for (const k of Object.keys(upd)) prev[k] = lead.fields[k] === undefined ? null : lead.fields[k];
+  // selects come back as objects; write them back as names
+  for (const k of Object.keys(prev)) if (prev[k] && typeof prev[k] === 'object' && !Array.isArray(prev[k]) && prev[k].name) prev[k] = prev[k].name;
+  await updateRecord(T.leads, leadId, upd);
+  await logActivity(leadId, { summary: `${authorName} updated the card by text`, detail: (note ? note + '\n' : '') + `Text: "${rawText}"`, type: 'SMS', kind: 'Note' });
+  return prev;
+}
+
+async function handleAgentUpdate(member, from, text, reply) {
+  const cards = await agentCards(member);
+  if (!cards.length) { await reply("I couldn't find any cards for you yet."); return; }
+  const now = melbNow();
+  const user =
+    `TODAY: ${now.weekday} ${now.date} (Melbourne). AGENT: ${member.fields[TM.name]}\n\n` +
+    `THE AGENT'S CARDS (id | contact | address | stage | task or track):\n${cards.map(cardLine).join('\n')}\n\n` +
+    `THE AGENT TEXTED ALEX: "${text}"\n\n` +
+    `STAGES: ${STAGE_LIST.join('; ')}\nNURTURE REASONS: ${NURTURE_REASONS.join('; ')}\nLOST REASONS: ${LOST_REASONS.join('; ')}\n\n` +
+    'Work out which ONE card this is about and what to change. Rules: change only what the agent clearly said. ' +
+    'An appraisal booked → stage "Appraisal Booked" with appraisal_at. A listing meeting booked → "Listing Meeting Booked" with listing_meeting_at. ' +
+    '"Sent the price update/desktop" → "Presentation Sent" only if it was a presentation; a price update sent → keep the stage and set complete_task true. ' +
+    '"Sent the presentation/proposal" → "Presentation Sent". "They want to go ahead / verbal yes" → "Approved / Accepted". "Authority sent" → "Authority Sent – Awaiting Signatures". ' +
+    '"Signed up / signed the authority" → "Listed (Won)". "Not ready / next year / later" → "Nurture" with the matching nurture_reason. ' +
+    '"Listed with another agent" → "Lost / Not Progressing" with lost_reason "Listed with competitor". "No answer / left a message" → no change, note only. ' +
+    'If they did the task without changing stage, complete_task true. Use 24h local times "YYYY-MM-DDTHH:MM"; resolve weekdays to the NEXT such date. ' +
+    'If you cannot tell which card or what they mean, set question and leave changes empty. confidence "high" only when the card and the change are both unambiguous.\n' +
+    'Return JSON only: {"lead_id": "rec... or empty", "confidence": "high|low", ' +
+    '"changes": {"stage": "", "next_action": "", "next_action_date": "", "appraisal_at": "", "listing_meeting_at": "", "nurture_reason": "", "lost_reason": "", "authority_ends": "", "priority": false, "complete_task": false}, ' +
+    '"note": "any fact worth logging on the card, or empty", "summary": "what you will change, e.g. Sarah Jones (14 Main St) → Appraisal Booked, Thu 23 Oct 2pm (say if you are ticking off a task)", "question": ""}';
+  const out = await claudeJSON('You are Alex, the sales assistant at Stone Real Estate Ballarat. You read short texts from agents and update their lead cards accurately and conservatively.', user, 700);
+  const card = cards.find(c => c.id === out.lead_id);
+  if (!card || out.question) {
+    await reply(out.question || "Sorry, I couldn't tell which card that's about – can you include the name or address?");
+    return;
+  }
+  const c = out.changes || {};
+  const upd = {};
+  if (c.stage && STAGE_LIST.includes(c.stage) && c.stage !== sel(card.fields[L.stage])) upd[L.stage] = c.stage;
+  if (c.next_action) upd[L.nextAction] = c.next_action;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(c.next_action_date || '')) upd[L.nextActionDate] = c.next_action_date;
+  const appt = melbToISO(c.appraisal_at); if (appt) upd[L_APPT_AT] = appt;
+  const mtg = melbToISO(c.listing_meeting_at); if (mtg) upd[L_MTG_AT] = mtg;
+  if (c.nurture_reason && NURTURE_REASONS.includes(c.nurture_reason)) upd[L.nurtureReason] = c.nurture_reason;
+  if (c.lost_reason && LOST_REASONS.includes(c.lost_reason)) upd[L_LOST_REASON] = c.lost_reason;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(c.authority_ends || '')) upd[L_AUTH_ENDS] = c.authority_ends;
+  if (c.priority === true) upd[L_PRIORITY] = true;
+  // Completing the task only when the stage isn't changing (a stage move brings its own new task)
+  const complete = c.complete_task === true && !upd[L.stage] && card.fields[L.nextAction];
+  const authorName = firstName(member.fields[TM.name]) || member.fields[TM.name];
+  const note = String(out.note || '').trim();
+  const summary = String(out.summary || '').trim() || `${card.fields[L.name]} updated`;
+  if (!Object.keys(upd).length && !complete) {
+    if (note) {
+      await logActivity(card.id, { summary: `${authorName}: ${note}`, detail: `Text: "${text}"`, type: 'SMS', kind: 'Note' });
+      await reply(`Noted on ${card.fields[L.name]}'s card: ${note}`);
+    } else await reply(`Nothing to change on ${card.fields[L.name]}'s card – tell me what happened if something did.`);
+    return;
+  }
+  if (complete) upd[L_COMPLETE] = '✓ Done';
+  const key = normalisePhone(from);
+  if (out.confidence !== 'high') {
+    pendingByPhone.set(key, { kind: 'confirm', leadId: card.id, upd, note, summary, raw: text, author: authorName, at: Date.now() });
+    await reply(`${summary} – OK? Reply YES, or tell me what's different.`);
+    return;
+  }
+  const prev = await applyCardChange(card.id, upd, note, authorName, text);
+  delete prev[L_COMPLETE];
+  pendingByPhone.set(key, { kind: 'undo', leadId: card.id, prev, summary, at: Date.now() });
+  await reply(`Done: ${summary}.` + (Object.keys(prev).length ? ' Reply UNDO to reverse.' : ''));
+}
+
+// Returns true when the text came from the team and was handled here
+async function handleTeamSMS(from, body) {
+  if (!enabled()) return false;
+  const approver = isApprover(from);
+  const member = await teamByPhone(from);
+  if (!member && !approver) return false;
+  const text = String(body || '').trim();
+  const reply = msg => sendSMS(from, msg);
+  const key = normalisePhone(from);
+
+  // 1. UNDO / confirmation of the last card change
+  let pend = pendingByPhone.get(key);
+  if (pend && Date.now() - pend.at > PENDING_MINUTES * 60000) { pendingByPhone.delete(key); pend = null; }
+  if (/^undo\b/i.test(text)) {
+    if (!pend || pend.kind !== 'undo' || !Object.keys(pend.prev || {}).length) { await reply('Nothing to undo (a ticked-off task can be set again on the card).'); return true; }
+    await updateRecord(T.leads, pend.leadId, pend.prev);
+    await logActivity(pend.leadId, { summary: 'Card change by text undone', detail: pend.summary, type: 'General', kind: 'History' });
+    pendingByPhone.delete(key);
+    await reply(`Undone: ${pend.summary}.`);
+    return true;
+  }
+  if (pend && pend.kind === 'confirm') {
+    if (/^(yes|y|yep|yeah|ok|okay|sure|go|go ahead|correct|👍)\b/i.test(text) && !/\bA\s?\d{1,2}\b/i.test(text)) {
+      const prev = await applyCardChange(pend.leadId, pend.upd, pend.note, pend.author, pend.raw);
+      delete prev[L_COMPLETE];
+      pendingByPhone.set(key, { kind: 'undo', leadId: pend.leadId, prev, summary: pend.summary, at: Date.now() });
+      await reply(`Done: ${pend.summary}.` + (Object.keys(prev).length ? ' Reply UNDO to reverse.' : ''));
+      return true;
+    }
+    if (/^(no|n|nope|nah|cancel)$/i.test(text)) { pendingByPhone.delete(key); await reply("OK, I've left the card as it was."); return true; }
+    pendingByPhone.delete(key); // anything else is a fresh message
+  }
+
+  // 2. preview / approval commands with a code
+  const parsed = parseApproverCommand(text);
+  if (parsed) parsed.raw = text;
+  if (parsed && parsed.code) {
+    const rec = await findActiveByCode(parsed.code);
+    if (rec && ['Scheduled', 'Previewed'].includes(sel(rec.fields[M.status]))) {
+      await handlePreviewCommand({ parsed, rec, member, approver, reply });
+      return true;
+    }
+  }
+  // 3. Stu's approval flow
+  if (approver && parsed && await handleApproverSMS(text)) return true;
+
+  // 4. a card update from an Alex-active agent
+  if (member && member.fields[TM.alexActive]) {
+    try { await handleAgentUpdate(member, from, text, reply); }
+    catch (e) { console.error('Alex leads: agent update failed', e.message); await reply("Sorry, I couldn't process that – please update the card in Airtable."); }
+    return true;
+  }
+  return false;
+}
+
 // ---------------------------------------------------------------- new enquiries (replaces Pipedrive)
 
 async function createEnquiryLead({ name, phone, email, address, suburb, summary, outcome }) {
   if (!enabled()) return null;
   const existing = await findLeadByPhone(phone);
-  if (existing && !['Lost', 'Authority Signed'].includes(sel(existing.fields[L.stage]))) {
+  if (existing && !['Lost', 'Lost / Not Progressing', 'Listed (Won)', 'Authority Signed'].includes(sel(existing.fields[L.stage]))) {
     await logActivity(existing.id, { summary: 'New Alex conversation – ' + outcome, detail: summary, type: 'SMS' });
     return existing.id;
   }
@@ -1071,4 +1531,4 @@ function start() {
   setTimeout(sweep, 30000);
 }
 
-module.exports = { start, sweep, isApprover, handleApproverSMS, handleVendorSMS, createEnquiryLead, normalisePhone, enabled };
+module.exports = { start, sweep, isApprover, handleApproverSMS, handleTeamSMS, handleVendorSMS, createEnquiryLead, normalisePhone, enabled };

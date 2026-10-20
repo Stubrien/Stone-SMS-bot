@@ -11,6 +11,8 @@
 // - One 9:30am check-in text per agent (No Contact days 1/3/5, tasks due, lost reasons) and an after-appraisal question
 // - Listed (Won): texts Fiona and the agent; chases the agent if Fiona says the authority hasn't arrived
 // - Lost cards: 3-month check-in for "selling privately", Track 6 after 6 months for "not selling"
+// - GoHighLevel social-media leads texted in as "NEW LEAD / Name: … / Mobile: …" create or update the card
+//   (env GHL_LEAD_NUMBERS = the number(s) GoHighLevel sends from)
 // (The 7:45 / 12:30 / 5pm email digests and the Monday lost list are Airtable automations.)
 // - Replies from vendors: logged, Key Facts / track / follow-up updated, reply drafted for Stu's approval
 // - Creates new vendor enquiries in Airtable (Entered Via = Alex) instead of Pipedrive
@@ -1817,6 +1819,178 @@ async function lostHousekeeping() {
   }
 }
 
+// ---------------------------------------------------------------- GoHighLevel social-media leads by text
+// GoHighLevel texts each new social-media lead to Alex's number in a fixed layout:
+//   NEW LEAD
+//   Name: … / Mobile: … / Email: … / Address: … / Agent: … / Campaign: … / Notes: …
+// Only texts from the numbers in GHL_LEAD_NUMBERS (Railway env, comma-separated) – or from Stu, for testing – are read.
+//  • No card yet (matched on mobile, then address): create it in New (Source Social Media, Entered Via GoHighLevel) and
+//    start the new-lead flow straight away (BH: CALL / ALEX to the agent; outside BH: Alex texts the opener).
+//  • Card already exists: add a note that they responded to a social media ad, keep the card's agent (whatever GHL
+//    allocated), and follow the protocols – Nurture / Lost cards go back to New and into the new-lead flow; cards
+//    already in play stay put and the agent is told (straight away in business hours, otherwise from 8am).
+const GHL_LABELS = { name: 'name', 'full name': 'name', mobile: 'mobile', phone: 'mobile', email: 'email', address: 'address',
+  'property address': 'address', suburb: 'suburb', city: 'suburb', agent: 'agent', 'assigned to': 'agent', campaign: 'campaign',
+  source: 'campaign', form: 'campaign', ad: 'campaign', notes: 'notes', note: 'notes', message: 'notes', comments: 'notes' };
+
+function ghlSenderOK(from) {
+  const list = String(process.env.GHL_LEAD_NUMBERS || '').split(',').map(s => s.trim()).filter(Boolean);
+  return list.some(n => samePhone(n, from)) || isApprover(from);
+}
+function parseGhlLead(text) {
+  const t = String(text || '').replace(/\r/g, '');
+  if (!/^\s*new\s+lead\b/i.test(t)) return null;
+  const labels = Object.keys(GHL_LABELS).sort((a, b) => b.length - a.length).map(l => l.replace(/ /g, '\\s+'));
+  const re = new RegExp(`(?:^|\\n|\\s)(${labels.join('|')})\\s*:`, 'gi');
+  const hits = []; let m;
+  while ((m = re.exec(t))) hits.push({ key: GHL_LABELS[m[1].toLowerCase().replace(/\s+/g, ' ')], start: m.index, valueStart: re.lastIndex });
+  const out = {};
+  hits.forEach((h, i) => {
+    const v = t.slice(h.valueStart, i + 1 < hits.length ? hits[i + 1].start : t.length).replace(/\s+/g, ' ').trim()
+      .replace(/^(null|undefined|n\/a|-|\{\{.*\}\})$/i, '');
+    if (v && !out[h.key]) out[h.key] = v;
+  });
+  if (out.suburb && out.address && !out.address.toLowerCase().includes(out.suburb.toLowerCase())) out.address = out.address.replace(/,?\s*$/, '') + ', ' + out.suburb;
+  if (!out.address && out.suburb) out.address = out.suburb;
+  return out;
+}
+function sameAddress(a, b) {
+  const ka = addrKey(a), kb = addrKey(b);
+  if (!ka || ka !== kb) return false;
+  const lastWord = s => (String(s).toLowerCase().match(/[a-z]{4,}/g) || []).pop() || '';
+  const wa = lastWord(a), wb = lastWord(b);
+  return !wa || !wb || String(b).toLowerCase().includes(wa) || String(a).toLowerCase().includes(wb);
+}
+async function findExistingCard(lead) {
+  if (lead.mobile) { const byPhone = await findLeadByPhone(lead.mobile); if (byPhone) return byPhone; }
+  if (lead.address && /\d/.test(lead.address)) {
+    const all = await listAll(T.leads, { filterByFormula: `{${L.address}}!=''`, 'fields[]': L.address });
+    const hit = all.find(r => sameAddress(r.fields[L.address], lead.address));
+    if (hit) return getRecord(T.leads, hit.id);
+  }
+  return null;
+}
+async function matchAgent(name) {
+  const n = String(name || '').trim().toLowerCase();
+  if (!n) return null;
+  const team = await teamRows();
+  const exact = team.find(t => String(t.fields[TM.name] || '').toLowerCase() === n);
+  if (exact) return exact;
+  const byFirst = team.filter(t => String(t.fields[TM.name] || '').toLowerCase().split(' ')[0] === n.split(' ')[0]);
+  return byFirst.length === 1 ? byFirst[0] : null;
+}
+
+// Start the new-lead flow on a card in New right now (used for GoHighLevel leads and returning contacts)
+async function startNewLeadFlow(leadId, returning) {
+  const lead = await getRecord(T.leads, leadId);
+  const f = lead.fields;
+  const agents = await alexActiveAgentIds();
+  if (!(f[L.agent] || []).some(id => agents.has(id))) return 'agent not on Alex – normal allocation email only';
+  if (f[L.doNotContact] || !isTextableMobile(f[L.phone])) return 'no text (Do Not Contact or no mobile)';
+  const c = melbClock();
+  const agent = await agentOfLead(lead);
+  const nowIso = new Date().toISOString();
+  const label = leadLabel(f);
+  if (isBH(c)) {
+    const text = `${returning ? 'Returning contact – they just responded to a social media ad' : 'New lead'}: ${label}${f[L.sourceDetail] ? ' – ' + f[L.sourceDetail] : ''}. ${f[L.phone]}.` +
+      (returning ? `\n${returning}` : '') + `\nReply CALL if you'll ring them yourself, or ALEX for me to engage.`;
+    await textAgent(agent, text);
+    await setState(lead.id, { flow: 'newlead', phase: 'alerted', alertedAt: nowIso, alertHour: c.hour, lastReminderAt: nowIso, reminders: 0, returning: !!returning }, { [L_ALEX_STATUS]: 'Waiting for agent' });
+    return 'agent alerted (CALL / ALEX)';
+  }
+  await sendOpener(lead, agent);
+  await setState(lead.id, { flow: 'newlead', phase: 'engaging', openerAt: nowIso, overnight: true, returning: !!returning }, { [L_ALEX_STATUS]: 'Engaging' });
+  return 'opener sent to the contact';
+}
+
+// Queue a message for the card's agent: now in business hours, otherwise from 8am (noticeTick)
+async function noticeAgent(lead, text) {
+  if (isBH(melbClock())) { await textAgent(await agentOfLead(lead), text); return 'agent texted'; }
+  const state = getState(lead);
+  state.notices = (state.notices || []).concat(text);
+  await setState(lead.id, state);
+  return 'agent will be texted from 8am';
+}
+async function noticeTick() {
+  if (!sweepEnabled() || !isBH(melbClock())) return;
+  const leads = await listAll(T.leads, { filterByFormula: `FIND('"notices":["',{${L_STATE}}&'')` });
+  for (const lead of leads) {
+    const state = getState(lead);
+    const agent = await agentOfLead(lead);
+    for (const n of state.notices || []) await textAgent(agent, n);
+    delete state.notices;
+    await setState(lead.id, state);
+  }
+}
+
+async function handleGhlLead(from, body) {
+  if (!/^\s*new\s+lead\b/i.test(String(body || '')) || !ghlSenderOK(from)) return false;
+  const g = parseGhlLead(body);
+  if (!g || (!g.mobile && !g.address && !g.name)) { await sendSMS(approverMobile(), `A GoHighLevel lead text came in but I couldn't read it:\n"${String(body).slice(0, 300)}"`); return true; }
+  const today = melbClock().date;
+  const ghlAgent = await matchAgent(g.agent);
+  const detail = [g.campaign && `Campaign: ${g.campaign}`, g.agent && `GHL allocated: ${g.agent}`, g.notes && `Notes: ${g.notes}`, g.email && `Email: ${g.email}`].filter(Boolean).join('\n');
+  const existing = await findExistingCard(g);
+
+  if (!existing) {
+    const fields = {
+      [L.name]: g.name || g.address || g.mobile, [L.phone]: g.mobile ? normalisePhone(g.mobile) : undefined, [L.email]: g.email || undefined,
+      [L.address]: g.address || undefined, [L.source]: 'Social Media', [L.sourceDetail]: g.campaign || 'GoHighLevel social media lead',
+      [L.enteredVia]: 'GoHighLevel', [L.stage]: 'New', [L_RECEIVED]: today, [PROP.other]: g.notes || undefined,
+      [L_STATE]: '{"flow":"newlead","phase":"starting"}' // stops the 2-minute tick double-handling it
+    };
+    if (ghlAgent) fields[L.agent] = [ghlAgent.id];
+    const rec = await createRecord(T.leads, fields);
+    await logActivity(rec.id, { summary: 'New social media lead from GoHighLevel', detail, type: 'General', kind: 'History' });
+    if (!ghlAgent) {
+      await sendSMS(approverMobile(), `New social media lead: ${g.name || ''} ${g.address || ''} ${g.mobile || ''}. GoHighLevel's agent "${g.agent || 'none'}" doesn't match anyone in Team – please allocate it in the Admin Inbox.`);
+      return true;
+    }
+    const res = await startNewLeadFlow(rec.id, '');
+    console.log('Alex leads: GHL lead created ' + rec.id + ' – ' + res);
+    return true;
+  }
+
+  // Existing card: note it, keep the card's agent, follow the protocol for its stage
+  const f = existing.fields;
+  const stage = sel(f[L.stage]);
+  const cardAgent = await agentOfLead(existing);
+  const differentAgent = ghlAgent && !(f[L.agent] || []).includes(ghlAgent.id);
+  const upd = {};
+  if (g.mobile && !isTextableMobile(f[L.phone])) upd[L.phone] = normalisePhone(g.mobile);
+  if (g.email && !f[L.email]) upd[L.email] = g.email;
+  if (g.address && !f[L.address]) upd[L.address] = g.address;
+  await logActivity(existing.id, {
+    summary: `Responded to a social media advertisement${g.campaign ? ' (' + g.campaign + ')' : ''}`,
+    detail: detail + (differentAgent ? `\nGoHighLevel allocated ${ghlAgent.fields[TM.name]} – kept ${cardAgent ? cardAgent.fields[TM.name] : 'the card\'s agent'} as the agent.` : ''),
+    type: 'General', kind: 'Note'
+  });
+  const label = leadLabel(f);
+  const agentLine = differentAgent ? ` (GoHighLevel allocated ${ghlAgent.fields[TM.name]}; you stay the agent)` : '';
+  if (f[L_PARKED]) {
+    if (Object.keys(upd).length) await updateRecord(T.leads, existing.id, upd);
+    await sendSMS(approverMobile(), `${label} just responded to a social media ad, but their card is parked for the test – I've added a note and done nothing else.`);
+    return true;
+  }
+  if (f[L.doNotContact]) {
+    if (Object.keys(upd).length) await updateRecord(T.leads, existing.id, upd);
+    await noticeAgent(existing, `${label} just responded to a social media ad${agentLine}, but Do Not Contact is ticked on their card, so I haven't texted them. Untick it if you'd like me to follow up, or give them a call.`);
+    return true;
+  }
+  if (['Nurture', 'Lost / Not Progressing', 'Lost', 'Not to Progress'].includes(stage)) {
+    // A fresh enquiry from a nurture / lost contact: back to New and into the new-lead flow
+    upd[L.stage] = 'New';
+    await updateRecord(T.leads, existing.id, Object.assign(upd, { [L_STATE]: '{"flow":"newlead","phase":"starting"}' }));
+    const res = await startNewLeadFlow(existing.id, `They were in ${stage}${sel(f[L.nurtureReason]) ? ' (' + sel(f[L.nurtureReason]) + ')' : ''}${agentLine}. The card is back in New.`);
+    if (/opener/.test(res)) await noticeAgent(existing, `${label} (was in ${stage}) responded to a social media ad overnight${agentLine}. I've moved them back to New and texted them – I'll let you know how it goes.`);
+    return true;
+  }
+  if (Object.keys(upd).length) await updateRecord(T.leads, existing.id, upd);
+  const task = f[L.nextAction] ? ` Current task: ${f[L.nextAction]}${f[L.nextActionDate] ? ' (due ' + dmy(f[L.nextActionDate]) + ')' : ''}.` : '';
+  await noticeAgent(existing, `${label} (${stage}) just responded to a social media ad${agentLine}.${task} Worth a call while they're keen.`);
+  return true;
+}
+
 // ---------------------------------------------------------------- texts from the team
 // Agents (and Stu) text Alex's number. In order, Alex:
 //  1. handles UNDO / YES for its last card change,
@@ -2015,6 +2189,8 @@ async function applyPlan(key, plan, authorName, rawText, reply, noteLines) {
 // Returns true when the text came from the team and was handled here
 async function handleTeamSMS(from, body) {
   if (!enabled()) return false;
+  // GoHighLevel social-media lead texts ("NEW LEAD …" from a GHL_LEAD_NUMBERS number)
+  if (await handleGhlLead(from, body)) return true;
   const approver = isApprover(from);
   const member = await teamByPhone(from);
   if (!member && !approver) return false;
@@ -2105,6 +2281,7 @@ function start() {
     try { await newLeadTick(); } catch (e) { console.error('Alex leads: new lead tick failed', e.message); }
     try { await checkinTick(); } catch (e) { console.error('Alex leads: check-in tick failed', e.message); }
     try { await wonTick(); } catch (e) { console.error('Alex leads: won tick failed', e.message); }
+    try { await noticeTick(); } catch (e) { console.error('Alex leads: notice tick failed', e.message); }
   };
   fastTimer = setInterval(fast, 2 * 60000);
   setTimeout(fast, 45000);

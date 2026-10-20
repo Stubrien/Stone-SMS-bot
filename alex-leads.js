@@ -8,11 +8,23 @@
 // - New leads: in business hours (8am–7pm Mon–Sat) the agent gets "Reply CALL or ALEX" with hourly reminders and an
 //   end-of-day move to No Contact; outside business hours Alex engages straight away (opener, details, qualify,
 //   appraisal or call time) and asks the agent ALEX / CALL at 8am if there's no reply
-// - One 9:30am check-in text per agent (No Contact days 1/3/5, tasks due, lost reasons) and an after-appraisal question
+// - One 9:30am check-in text per agent (No Contact days 1/3/5, tasks due, lost reasons) and after-appraisal / after-meeting questions
 // - Listed (Won): texts Fiona and the agent; chases the agent if Fiona says the authority hasn't arrived
 // - Lost cards: 3-month check-in for "selling privately", Track 6 after 6 months for "not selling"
 // - GoHighLevel social-media leads texted in as "NEW LEAD / Name: … / Mobile: …" create or update the card
 //   (env GHL_LEAD_NUMBERS = the number(s) GoHighLevel sends from)
+// - Qualifying calls (Call At): morning-of text to the contact, a brief to the agent 15 min before, "how did it go?"
+//   an hour after; "no answer" → Alex texts the contact for a better time and books it from their reply
+// - Appraisal / listing meeting booked: offers the agent a confirmation text the day before and a thank-you 3h after
+//   (YES / EDIT / NO + code), handles "can we move it?" via the agent, tells Fiona if the card hasn't moved 2 business days on
+// - Qualifying 14 days, Decision Pending 21 days and cards with no next step come up in the 9:30 check-in;
+//   a sent price update gets an "Any reaction?" task 3 business days out
+// - Agents add new contacts by text (name, mobile, address, source) – duplicates are caught, UNDO removes it
+// - Appraisal times without calendar access: Alex asks the contact what suits, texts the agent up to 3 times that
+//   fit and don't clash with their Airtable bookings, and confirms with the contact once the agent picks one
+//   (business hours; held till 8am otherwise). One reminder to the agent after 2 hours. Agents add it to Outlook.
+// - Outlook (optional, dormant – env MS_TENANT_ID / MS_CLIENT_ID / MS_CLIENT_SECRET): would offer real free times
+//   and add bookings to the agent's calendar (Team → Email)
 // (The 7:45 / 12:30 / 5pm email digests and the Monday lost list are Airtable automations.)
 // - Replies from vendors: logged, Key Facts / track / follow-up updated, reply drafted for Stu's approval
 // - Creates new vendor enquiries in Airtable (Entered Via = Alex) instead of Pipedrive
@@ -339,8 +351,10 @@ function parseApproverCommand(text) {
   return { cmd, code, rest };
 }
 
-async function handleApproverSMS(body) {
+// replyTo / byName: an agent approving an offer on their own card (appraisal confirmation, thank-you)
+async function handleApproverSMS(body, replyTo, byName) {
   const text = (body || '').trim();
+  const to = replyTo || approverMobile();
   const parsed = parseApproverCommand(text);
   if (!parsed) return false;
   const { cmd } = parsed;
@@ -349,13 +363,13 @@ async function handleApproverSMS(body) {
   const waiting = await waitingDrafts();
 
   if (cmd === 'LIST') {
-    await sendSMS(approverMobile(), waiting.length ? 'Waiting: ' + waiting.map(w => w.fields[M.code]).join(', ') : 'Nothing waiting for approval.');
+    await sendSMS(to, waiting.length ? 'Waiting: ' + waiting.map(w => w.fields[M.code]).join(', ') : 'Nothing waiting for approval.');
     return true;
   }
   if (!code) {
     if (waiting.length === 1) code = String(waiting[0].fields[M.code]).toUpperCase();
     else {
-      await sendSMS(approverMobile(), waiting.length ? `Which one? Waiting: ${waiting.map(w => w.fields[M.code]).join(', ')}. e.g. YES ${waiting[0].fields[M.code]}` : 'Nothing waiting for approval.');
+      await sendSMS(to, waiting.length ? `Which one? Waiting: ${waiting.map(w => w.fields[M.code]).join(', ')}. e.g. YES ${waiting[0].fields[M.code]}` : 'Nothing waiting for approval.');
       return true;
     }
   }
@@ -365,17 +379,17 @@ async function handleApproverSMS(body) {
     const all = await listAll(T.messages, { filterByFormula: `AND(UPPER({${M.code}})='${code}',{${M.direction}}='To vendor')`, maxRecords: '5', 'sort[0][field]': M.created, 'sort[0][direction]': 'desc' });
     const rec = all[0];
     const m2 = rec && String(rec.fields[M.reasoning] || '').match(/PREV_FOLLOW_UP=(\d{4}-\d{2}-\d{2}|none)/);
-    if (!rec || !m2) { await sendSMS(approverMobile(), `No follow-up change to undo on ${code}.`); return true; }
+    if (!rec || !m2) { await sendSMS(to, `No follow-up change to undo on ${code}.`); return true; }
     const leadId = (rec.fields[M.lead] || [])[0];
     await updateRecord(T.leads, leadId, { [L.followUp]: m2[1] === 'none' ? null : m2[1] });
     await logActivity(leadId, { summary: 'Follow-up date change undone (KEEP)', type: 'Follow-up date changed', kind: 'History' });
-    await sendSMS(approverMobile(), `Done – follow-up date on ${code} put back${m2[1] === 'none' ? '' : ' to ' + dmy(m2[1])}.`);
+    await sendSMS(to, `Done – follow-up date on ${code} put back${m2[1] === 'none' ? '' : ' to ' + dmy(m2[1])}.`);
     return true;
   }
 
   const rec = waiting.find(w => String(w.fields[M.code]).toUpperCase() === code);
-  if (!rec) { await sendSMS(approverMobile(), `${code} isn't waiting for approval.`); return true; }
-  const by = process.env.APPROVER_NAME || 'Stu';
+  if (!rec) { await sendSMS(to, `${code} isn't waiting for approval.`); return true; }
+  const by = byName || process.env.APPROVER_NAME || 'Stu';
 
   if (cmd === 'NO' || cmd === 'N') {
     await updateRecord(T.messages, rec.id, { [M.status]: 'Rejected', [M.approverReply]: text, [M.approvedBy]: by, [M.approvedAt]: new Date().toISOString() });
@@ -385,10 +399,10 @@ async function handleApproverSMS(body) {
     if (sel(rec.fields[M.purpose]) === 'Nurture check-in') {
       try { next = await skipNurtureRound((rec.fields[M.lead] || [])[0], code); } catch (e) { console.error('Alex leads: skip round failed', e.message); }
     }
-    await sendSMS(approverMobile(), `${code} binned – nothing sent.` + (next ? ` Next check-in ${dmy(next)}.` : ''));
+    await sendSMS(to, `${code} binned – nothing sent.` + (next ? ` Next check-in ${dmy(next)}.` : ''));
     return true;
   }
-  if ((cmd === 'EDIT' || cmd === 'CHANGE') && !rest) { await sendSMS(approverMobile(), `Send the new wording after the code (EDIT ${code} Hey Sonya…) or an instruction (CHANGE ${code} make it shorter).`); return true; }
+  if ((cmd === 'EDIT' || cmd === 'CHANGE') && !rest) { await sendSMS(to, `Send the new wording after the code (EDIT ${code} Hey Sonya…) or an instruction (CHANGE ${code} make it shorter).`); return true; }
 
   // CHANGE, or an EDIT that reads like an instruction ("remove the opt out line"), is never sent as-is:
   // Alex rewrites the draft and sends it back for approval.
@@ -398,9 +412,9 @@ async function handleApproverSMS(body) {
       'Rewrite the SMS applying exactly that change and nothing else. Keep the greeting and introduction unless asked to change them. ' +
       'Return JSON only: {"sms": "..."}', 400);
     const revised = String(out.sms || '').trim();
-    if (!revised) { await sendSMS(approverMobile(), `Couldn't apply that to ${code} – try EDIT ${code} followed by the full wording.`); return true; }
+    if (!revised) { await sendSMS(to, `Couldn't apply that to ${code} – try EDIT ${code} followed by the full wording.`); return true; }
     await updateRecord(T.messages, rec.id, { [M.draft]: revised, [M.approverReply]: text });
-    await sendSMS(approverMobile(), `${code} revised:\n\nDraft: "${revised}"\n\nReply YES ${code} · CHANGE ${code} what to change · EDIT ${code} full wording · NO ${code}`);
+    await sendSMS(to, `${code} revised:\n\nDraft: "${revised}"\n\nReply YES ${code} · CHANGE ${code} what to change · EDIT ${code} full wording · NO ${code}`);
     return true;
   }
 
@@ -408,16 +422,18 @@ async function handleApproverSMS(body) {
   if (cmd === 'EDIT') fields[M.finalText] = rest;
   await updateRecord(T.messages, rec.id, fields);
 
-  if (!inSendWindow()) {
-    await sendSMS(approverMobile(), `${code} approved – it will go out at 9am (outside Mon–Fri 9–6).`);
+  // Appraisal confirmations and thank-yous go straight away in business hours; everything else Mon–Fri 9–6
+  const quick = ['Appraisal confirmation', 'Thank-you'].includes(sel(rec.fields[M.purpose]));
+  if (quick ? !isBH() : !inSendWindow()) {
+    await sendSMS(to, `${code} approved – it will go out at ${quick ? '8am' : '9am'} (outside ${quick ? 'business hours' : 'Mon–Fri 9–6'}).`);
     return true;
   }
   const fresh = await getRecord(T.messages, rec.id);
   try {
     const result = await sendApproved(fresh);
-    await sendSMS(approverMobile(), `${code} ${result}.`);
+    await sendSMS(to, `${code} ${result}.`);
   } catch (e) {
-    await sendSMS(approverMobile(), `${code} failed to send: ${e.message.slice(0, 120)}`);
+    await sendSMS(to, `${code} failed to send: ${e.message.slice(0, 120)}`);
   }
   return true;
 }
@@ -1128,6 +1144,11 @@ async function handleVendorSMS(from, body) {
     await handleNewLeadReply(lead, from, text);
     return true;
   }
+  // Replying with a better time after the agent's missed call
+  if (nl.awaitingCallTime) {
+    try { if (await handleCallTimeReply(lead, from, text)) return true; } catch (e) { console.error('Alex leads: call time reply failed', e.message); }
+  }
+  const booked = ['Appraisal Booked', 'Listing Meeting Booked'].includes(sel(f[L.stage]));
 
   const ctx = await leadContext(await getRecord(T.leads, lead.id));
   const today = melbNow().date;
@@ -1145,6 +1166,7 @@ async function handleVendorSMS(from, body) {
     ' "wants_agent_contact": true/false - true ONLY if they ask for the agent to call/contact them, ask to talk to someone, or say they are ready to sell/list now,\n' +
     ' "new_timeframe": if they told us a new selling timeframe, EXACTLY one of "Selling in 1–2 months" | "Not quite ready (~3 months)" | "Too early (~6 months)" | "Curious (12 months+)", else empty,\n' +
     ' "listed_elsewhere": true/false - true ONLY if they say they have listed or signed with another agent/agency. If so, reply_sms must be gracious and short, e.g. "No worries at all – best of luck with the sale." Never criticise the other agency,\n' +
+    (booked ? ' "wants_reschedule": true/false - true ONLY if they ask to move, change or cancel their booked ' + (sel(f[L.stage]) === 'Appraisal Booked' ? 'appraisal' : 'listing meeting') + ' (Alex then checks with the agent; reply_sms can be empty),\n' : '') +
     ' "wants_no_contact": true/false - true ONLY if they clearly ask us to stop texting / leave them alone / take them off the list, or say they are no longer selling and do not want to hear from us. "Not yet" or "try me in March" is NOT an opt-out - move the follow-up date instead. If unsure, false and set urgent_for_agent}';
   const out = await claudeJSON(VOICE + ' You also extract facts for the agent accurately and conservatively.', user, 700);
 
@@ -1155,6 +1177,8 @@ async function handleVendorSMS(from, body) {
     await sendSMS(approverMobile(), `${f[L.name]} asked to be left alone: "${text.slice(0, 200)}"\nDo Not Contact is now ticked and Alex replied: "${OPT_OUT_ACK}"\nIf Alex misread this, untick Do Not Contact on the card.`);
     return true;
   }
+
+  if (booked && out.wants_reschedule === true) { await startReschedule(lead, from, text); return true; }
 
   // Appraisal request or "can someone call me": hand the card straight to its agent.
   if (out.wants_appraisal === true || out.wants_agent_contact === true) {
@@ -1513,6 +1537,13 @@ async function handleNewLeadReply(lead, from, text, ctx) {
   const c = melbClock();
   const convo = await newLeadConversationHistory(await getRecord(T.leads, lead.id));
   const known = Object.fromEntries(Object.entries(PROP).map(([k, id]) => [k, f[id] === undefined ? '' : sel(f[id])]));
+  // With Outlook connected, offer two real free times for an appraisal
+  let slots = [];
+  if (calendarEnabled() && agent && agent.fields[TM_EMAIL]) {
+    try { slots = await freeSlots(agent.fields[TM_EMAIL], 2); } catch (e) { console.error('Alex leads: free slots failed', e.message); }
+  }
+  let bookings = [];
+  if (!slots.length && agent) { try { bookings = await agentBookings(agent.id); } catch (e) { console.error('Alex leads: bookings failed', e.message); } }
   const user =
     `NOW: ${c.weekday} ${c.date} ${String(c.hour).padStart(2, '0')}:${String(c.minute).padStart(2, '0')} Melbourne. AGENT: ${agentName}.\n` +
     `CARD: ${JSON.stringify({ name: f[L.name] || '', address: f[L.address] || '', source: sel(f[L.source]), sourceDetail: f[L.sourceDetail] || '' })}\n` +
@@ -1520,7 +1551,9 @@ async function handleNewLeadReply(lead, from, text, ctx) {
     'You are running the first conversation with a new enquiry, on behalf of the agent, with no one approving each text. Goals, in order: ' +
     '1) chat naturally and pick up property details (beds, bathrooms, living spaces, study, block size, outdoor area, parking, shedding, age, renovations, years owned) – ask ONE follow-up at a time, only for the gaps that matter most (beds, baths, block size, motivation, timing), never a questionnaire; ' +
     '2) qualify: "Are you thinking of making a move, or just keen to get an update on value?" and note any timing; ' +
-    '3) if they are thinking of moving, offer an appraisal and ask what days/times generally suit (the agent will confirm the exact time); ' +
+    (slots.length
+      ? `3) if they are thinking of moving, offer an appraisal at one of ${agentFirst}'s free times: ${slots.map(x => `${x.label} (${x.local})`).join(' or ')}. If they accept one of these, outcome "book_at" with book_at set to it; if neither suits, ask what days/times generally suit and use outcome "appraisal" (the agent will confirm); `
+      : `3) if they are thinking of moving, offer an appraisal and ask what days and times generally suit over the next week or so. Once they've said, outcome "appraisal": your reply thanks them and says you'll check with ${agentFirst} and confirm a time ${isBH(c) && c.hour < 17 ? 'shortly' : 'in the morning'} (never promise a time yourself); fill options with up to 3 specific times (YYYY-MM-DDTHH:MM, Mon–Sat 9:00–17:00, on the hour or half hour) that match what they said and avoid ${agentFirst}'s booked times: ${bookingsText(bookings)}; `) +
     '4) if they only want an update or an appraisal does not suit, agree a day and time for the agent to call. ' +
     'FIRM LIMITS: never give a price, valuation, range or commission (an accurate figure needs a visit); anything outside this script (legal, tenancy, complaints, upset, buying questions) → outcome "handover"; any request to stop or be left alone → outcome "opt_out". ' +
     'Keep replies to 1–3 short sentences, warm plain Australian English, no exclamation marks, never mention you are an AI unless asked. Do not greet again or re-introduce yourself. ' +
@@ -1528,7 +1561,7 @@ async function handleNewLeadReply(lead, from, text, ctx) {
     'Return JSON only: {"reply": "Alex\'s next text (empty only for opt_out)", ' +
     '"details": {"beds": null, "baths": null, "living": null, "study": null, "block": null, "outdoor": "", "parking": "", "shedding": "", "yearBuilt": "", "renos": "", "yearsOwned": null, "other": ""}, ' +
     '"motivation": "Making a move|Just an update|Unsure|", "timing": "their words or empty", ' +
-    '"outcome": "continue|appraisal|call_time|nurture|handover|opt_out", "preferred_times": "days/times they offered for an appraisal, or empty", ' +
+    '"outcome": "continue|appraisal|book_at|call_time|nurture|handover|opt_out", "book_at": "YYYY-MM-DDTHH:MM local appraisal time they accepted, or empty", "preferred_times": "days/times they offered for an appraisal, or empty", "options": ["YYYY-MM-DDTHH:MM", "…up to 3, only for outcome appraisal"], ' +
     '"call_at": "YYYY-MM-DDTHH:MM local time agreed for the agent to call, or empty", "nurture_reason": "if they are clearly not moving for 3+ months: one of ' + NURTURE_REASONS.slice(0, 5).join(' | ') + '", ' +
     '"handover_reason": "", "summary": "one line for the agent: what we learned and what happens next"}';
   const out = await claudeJSON(VOICE + ' You also extract facts accurately and conservatively.', user, 900);
@@ -1560,13 +1593,21 @@ async function handleNewLeadReply(lead, from, text, ctx) {
   const today = c.date;
   const dueNext = isBH(c) && c.hour < 17 ? today : nextBizDay(today);
   let outcome = '';
-  if (out.outcome === 'appraisal') {
+  let bookedIso = null;
+  let apptOptions = [];
+  if (out.outcome === 'book_at' && melbToISO(out.book_at)) {
+    bookedIso = melbToISO(out.book_at);
+    Object.assign(upd, { [L.stage]: 'Appraisal Booked', [L_APPT_AT]: bookedIso, [L_ALEX_STATUS]: 'Done' });
+    outcome = `appraisal booked ${melbWhen(bookedIso)}`;
+  } else if (out.outcome === 'appraisal') {
     Object.assign(upd, { [L.stage]: 'Qualifying', [L.nextAction]: `Confirm the appraisal time with ${first}` + (out.preferred_times ? ` – they suggested: ${out.preferred_times}` : ''), [L.nextActionDate]: dueNext, [L_ALEX_STATUS]: 'Done' });
-    outcome = `wants an appraisal${out.preferred_times ? ' (' + out.preferred_times + ')' : ''} – please call to confirm the time`;
+    try { if (agent) apptOptions = await cleanOptions(agent.id, Array.isArray(out.options) ? out.options : []); } catch (e) { console.error('Alex leads: options failed', e.message); }
+    outcome = `wants an appraisal${out.preferred_times ? ' (' + out.preferred_times + ')' : ''}` + (apptOptions.length ? ' – pick a time below and I\'ll confirm it with them' : ' – please call to confirm the time');
   } else if (out.outcome === 'call_time') {
     const iso = melbToISO(out.call_at);
     const when = iso ? melbWhen(iso) : 'the time they asked';
     Object.assign(upd, { [L.stage]: 'Qualifying', [L.nextAction]: `Call ${first} – ${when}`, [L.nextActionDate]: iso ? new Date(iso).toLocaleDateString('en-CA', { timeZone: TZ }) : dueNext, [L_ALEX_STATUS]: 'Done' });
+    if (iso) upd[L_CALL_AT] = iso;
     outcome = `call booked ${when}`;
   } else if (out.outcome === 'nurture' && NURTURE_REASONS.includes(out.nurture_reason)) {
     Object.assign(upd, { [L.stage]: 'Nurture', [L.nurtureReason]: out.nurture_reason, [L_ALEX_STATUS]: 'Done' });
@@ -1576,10 +1617,17 @@ async function handleNewLeadReply(lead, from, text, ctx) {
     outcome = `needs you: ${out.handover_reason || 'see the conversation'}`;
   }
   if (Object.keys(upd).length) await updateRecord(T.leads, lead.id, upd);
+  if (bookedIso) { const cal = (await addToCalendar(agent, await getRecord(T.leads, lead.id), bookedIso, 'Appraisal')).replace(/\.$/, ''); if (cal) outcome += '.' + cal; }
   if (outcome) {
     state.phase = 'done';
     state.outcomeSummary = `${leadLabel(f)} – ${out.summary || outcome}. ${outcome.charAt(0).toUpperCase() + outcome.slice(1)}.`;
     await logActivity(lead.id, { summary: `New-lead conversation: ${outcome}`, detail: out.summary || '', type: 'General', kind: 'History' });
+    // Appraisal time options: one text to the agent with the summary and the options (now in BH, otherwise from 8am)
+    if (apptOptions.length) {
+      await setState(lead.id, Object.assign(state, { summarySent: true }));
+      await offerTimesToAgent(await getRecord(T.leads, lead.id), apptOptions, 'appraisal', `${leadLabel(f)} wants an appraisal${out.preferred_times ? ' – they said ' + out.preferred_times : ''}. ${f[L.phone]}${out.summary ? '\n' + out.summary : ''}`);
+      return;
+    }
     // In BH (or a handover) tell the agent now; otherwise it goes in the 8am summary
     if (isBH(c) || out.outcome === 'handover') { await textAgent(agent, (out.outcome === 'handover' ? '⚠ ' : '') + `${state.outcomeSummary} ${f[L.phone]}`); state.summarySent = true; }
   }
@@ -1647,6 +1695,27 @@ async function checkinTick() {
     state.apptAsked = at; await setState(lead.id, state);
     if (agent) rememberQuestions(agent, c.date, [{ n: 0, leadId: lead.id, question: `${lead.fields[L.name]} – AFTER-APPRAISAL (numbers 1–5 in the reply are these options): ${q}` }]);
   }
+  // Price update sent (task ticked off, card still in Price Update): follow it up in 3 business days
+  const pu = (await listAll(T.leads, { filterByFormula: `AND({${L.stage}}='Price Update / Desktop Required',NOT({${L_PARKED}}),{${L.nextAction}}='')` }))
+    .filter(l => (l.fields[L.agent] || []).some(id => agents.has(id)));
+  for (const lead of pu) {
+    let d = c.date; for (let n = 0; n < 3;) { d = addDays(d, 1); if (isBizDay(d)) n++; }
+    await updateRecord(T.leads, lead.id, { [L.nextAction]: `Any reaction from ${firstName(lead.fields[L.name]) || lead.fields[L.name]} to the price update?`, [L.nextActionDate]: d });
+  }
+  // After-listing-meeting question, 2 hours after the meeting
+  const mtgs = (await listAll(T.leads, { filterByFormula: `AND({${L.stage}}='Listing Meeting Booked',NOT({${L_PARKED}}),{${L_MTG_AT}}!='')` }))
+    .filter(l => (l.fields[L.agent] || []).some(id => agents.has(id)));
+  for (const lead of mtgs) {
+    const at = lead.fields[L_MTG_AT];
+    const state = getState(lead);
+    if (state.mtgAsked === at || minutesSince(at) < 120 || minutesSince(at) > 3 * 24 * 60) continue;
+    const agent = await agentOfLead(lead);
+    const first = firstName(lead.fields[L.name]) || lead.fields[L.name];
+    const q = `How did the listing meeting with ${first} go? 1 – Going ahead · 2 – Thinking it over · 3 – Delayed / on hold (till when?) · 4 – Not going ahead (why?) · 5 – Something else`;
+    await textAgent(agent, q);
+    state.mtgAsked = at; await setState(lead.id, state);
+    if (agent) rememberQuestions(agent, c.date, [{ n: 0, leadId: lead.id, question: `${lead.fields[L.name]} – AFTER-MEETING (1 → "Approved / Accepted"; 2 → "Decision Pending"; 3 → "Delayed / On Hold" + next_action_date; 4 → "Lost / Not Progressing" + lost_reason, or Nurture if they're just not ready; 5 → read what they said): ${q}` }]);
+  }
   // The 9:30 check-in, once a day
   if (lastCheckinDate === c.date || c.hour < 9 || (c.hour === 9 && c.minute < 30)) return;
   lastCheckinDate = c.date;
@@ -1675,6 +1744,20 @@ async function checkinTick() {
           : `${f[L.nextAction]} – done? Or tell me what's happened.`;
         state.taskAsked = key; state.taskAskedOn = c.date; await setState(lead.id, state);
       }
+    }
+    // stage age prompts and cards with no next step
+    const entered = f[L_STAGE_ENTERED] || '';
+    const daysIn = entered ? Math.floor((Date.parse(c.date) - Date.parse(entered.slice(0, 10))) / 86400000) : 0;
+    if (!q && stage === 'Qualifying' && daysIn >= 14 && state.qual14 !== entered) {
+      q = `${first} has been in Qualifying for ${Math.floor(daysIn / 7)} weeks – what's next? a – appraisal booked (tell me when) · b – Nurture (tell me how far off) · c – something else`;
+      state.qual14 = entered; await setState(lead.id, state);
+    } else if (!q && stage === 'Decision Pending' && daysIn >= 21 && state.dp21 !== entered) {
+      q = `${first} has been deciding for ${Math.floor(daysIn / 7)} weeks – any news? a – going ahead (Approved / Accepted) · b – Nurture (Proposal or decision stalled) · c – something else`;
+      state.dp21 = entered; await setState(lead.id, state);
+    } else if (!q && !f[L.nextAction] && !['Appraisal Booked', 'Listing Meeting Booked', NO_CONTACT, 'Lost / Not Progressing', 'Price Update / Desktop Required'].includes(stage)
+      && (!state.noTaskAskedOn || bizDaysBetween(state.noTaskAskedOn, c.date) >= 5)) {
+      q = `What's the next step with ${first} (${stage})?`;
+      state.noTaskAskedOn = c.date; await setState(lead.id, state);
     }
     if (q) { const a = (f[L.agent] || [])[0]; (byAgent[a] = byAgent[a] || []).push({ leadId: lead.id, question: `${f[L.name]}: ${q}` }); }
   }
@@ -2082,6 +2165,8 @@ function cardLine(l) {
   if (st === 'Nurture') bits.push(sel(f[L.nurtureReason]) || 'no track');
   else if (f[L.nextAction]) bits.push(`task: ${f[L.nextAction]}${f[L.nextActionDate] ? ' (due ' + dmy(f[L.nextActionDate]) + ')' : ''}`);
   if (f[L_APPT_AT]) bits.push('appraisal ' + melbWhen(f[L_APPT_AT]));
+  const offer = getState(l).offer;
+  if (offer && offer.options) bits.push(`${offer.kind} time options offered: ${offer.options.map((iso, i) => `${i + 1}) ${iso.slice(0, 16)}Z = ${melbWhen(iso)}`).join(', ')}`);
   return bits.join(' | ');
 }
 
@@ -2092,7 +2177,7 @@ async function applyCardChange(leadId, upd, note, authorName, rawText, statePatc
   for (const k of Object.keys(prev)) if (prev[k] && typeof prev[k] === 'object' && !Array.isArray(prev[k]) && prev[k].name) prev[k] = prev[k].name;
   const write = Object.assign({}, upd);
   if (statePatch) write[L_STATE] = JSON.stringify(Object.assign(getState(lead), statePatch));
-  await updateRecord(T.leads, leadId, write);
+  if (Object.keys(write).length) await updateRecord(T.leads, leadId, write);
   await logActivity(leadId, { summary: `${authorName} updated the card by text`, detail: (note ? note + '\n' : '') + `Text: "${rawText}"`, type: 'SMS', kind: 'Note' });
   return prev;
 }
@@ -2105,6 +2190,11 @@ function fieldsFor(card, c) {
   if (/^\d{4}-\d{2}-\d{2}$/.test(c.next_action_date || '')) upd[L.nextActionDate] = c.next_action_date;
   const appt = melbToISO(c.appraisal_at); if (appt) upd[L_APPT_AT] = appt;
   const mtg = melbToISO(c.listing_meeting_at); if (mtg) upd[L_MTG_AT] = mtg;
+  const call = melbToISO(c.call_at);
+  if (call) {
+    upd[L_CALL_AT] = call;
+    if (!c.next_action) { upd[L.nextAction] = `Call ${firstName(card.fields[L.name]) || card.fields[L.name]} – ${melbWhen(call)}`; upd[L.nextActionDate] = new Date(call).toLocaleDateString('en-CA', { timeZone: TZ }); }
+  }
   if (c.nurture_reason && NURTURE_REASONS.includes(c.nurture_reason)) upd[L.nurtureReason] = c.nurture_reason;
   if (c.lost_reason && LOST_REASONS.includes(c.lost_reason)) upd[L_LOST_REASON] = c.lost_reason;
   if (/^\d{4}-\d{2}-\d{2}$/.test(c.authority_ends || '')) upd[L_AUTH_ENDS] = c.authority_ends;
@@ -2115,9 +2205,8 @@ function fieldsFor(card, c) {
   return upd;
 }
 
-async function handleAgentUpdate(member, from, text, reply) {
+async function handleAgentUpdate(member, from, text, reply, pendingCard) {
   const cards = await agentCards(member);
-  if (!cards.length) { await reply("I couldn't find any cards for you yet."); return; }
   const now = melbNow();
   const key = normalisePhone(from);
   const asked = checkinsByPhone.get(key);
@@ -2126,7 +2215,9 @@ async function handleAgentUpdate(member, from, text, reply) {
     `TODAY: ${now.weekday} ${now.date} (Melbourne). AGENT: ${member.fields[TM.name]}\n\n` +
     `THE AGENT'S CARDS (id | contact | address | stage | task or track):\n${cards.map(cardLine).join('\n')}\n\n` +
     (questions.length ? `QUESTIONS ALEX ASKED THE AGENT TODAY (the agent may answer by number, e.g. "1 booked Thu 2pm, 2 sent, 3b"):\n${questions.map(q => `${q.n ? q.n + ' – ' : ''}[${q.leadId}] ${q.question}`).join('\n')}\n\n` : '') +
+    (pendingCard ? `A NEW CONTACT THE AGENT IS ADDING – details so far: ${JSON.stringify(pendingCard.draft)}. Alex asked: "${pendingCard.question}". The agent's text below most likely answers that – merge it into new_card.\n\n` : '') +
     `THE AGENT TEXTED ALEX: "${text}"\n\n` +
+    `SOURCES (for a new contact): ${SOURCE_LIST.join('; ')}\n` +
     `STAGES: ${STAGE_LIST.join('; ')}\nNURTURE REASONS: ${NURTURE_REASONS.join('; ')}\nLOST REASONS: ${LOST_REASONS.join('; ')}\n\n` +
     'Work out which card(s) this is about and what to change on each. Rules: change only what the agent clearly said. ' +
     'An appraisal booked → stage "Appraisal Booked" with appraisal_at. A listing meeting booked → "Listing Meeting Booked" with listing_meeting_at. ' +
@@ -2137,11 +2228,46 @@ async function handleAgentUpdate(member, from, text, reply) {
     '"Not ready / next year / later" → "Nurture" with the matching nurture_reason. "On hold / delayed" → "Delayed / On Hold" with next_action_date when to check back. ' +
     '"Listed with another agent" → "Lost / Not Progressing" with lost_reason "Listed with competitor". A lost reason given for a Lost card → lost_reason only. ' +
     'No Contact answers: "spoke/booked" → the matching stage; "no answer / no luck" → no change (note only); "a" → "Nurture" with nurture_reason "Cold / gone quiet"; "b" or "keep trying" → restart_no_contact true; "c" → read what they said. ' +
-    'A task question answered "done/sent/yes" → complete_task true. Use 24h local times "YYYY-MM-DDTHH:MM"; resolve weekdays to the NEXT such date. ' +
+    'A task question answered "done/sent/yes" → complete_task true. ' +
+    'Options in a question (a/b/c or 1–5) map to the actions written next to them in that question. ' +
+    'If a card shows "time options offered" and the agent picks one (by number with the name, by the time, or a bare number when only that card has options), set appraisal_at (or listing_meeting_at) to that time in local "YYYY-MM-DDTHH:MM" and stage "Appraisal Booked" (or "Listing Meeting Booked"); another time they give works the same way. ' +
+    '"CALL" / "I\'ll ring them" about a card with time options → next_action "Call <first name> to book the appraisal" due today, and clear_offer true. ' +
+    'A call time agreed with a contact → call_at (and stage "Qualifying" if the card is New or No Contact). "No answer" to an after-call question → no_answer true. ' +
+    'NEW CONTACTS: if the agent is telling Alex about someone who is NOT one of their cards ("New contact: Jo Smith 0412 345 678, 5 High St Sebastopol, met at open home, appraisal Tue 10am"), fill new_card instead of updates: ' +
+    'name, mobile, address are required and source should be one of SOURCES (source_detail for anything more specific); stage = "Appraisal Booked" if an appraisal time is given, "Nurture" (+ nurture_reason) if they are not moving for a while, otherwise "Qualifying"; ' +
+    'list anything required that is missing in missing[] (use "source" if no source was given) and put ONE short question asking for all of it in question. ' +
+    'Use 24h local times "YYYY-MM-DDTHH:MM"; resolve weekdays to the NEXT such date. ' +
     'If you cannot tell which card or what they mean, set question and return no updates. confidence "high" only when every card and change is unambiguous.\n' +
-    'Return JSON only: {"updates": [{"lead_id": "rec...", "changes": {"stage": "", "next_action": "", "next_action_date": "", "appraisal_at": "", "listing_meeting_at": "", "nurture_reason": "", "lost_reason": "", "authority_ends": "", "priority": false, "complete_task": false, "restart_no_contact": false, "vendor_price_expectation": "", "agent_price_guide": "", "decision_makers": "", "other_agents": ""}, "note": "fact worth logging, or empty", "summary": "e.g. Sarah Jones → Appraisal Booked, Thu 23 Oct 2pm (say if you tick off a task)"}], "confidence": "high|low", "question": ""}';
-  const out = await claudeJSON('You are Alex, the sales assistant at Stone Real Estate Ballarat. You read short texts from agents and update their lead cards accurately and conservatively.', user, 1200);
+    'new_card shape: {"name": "", "mobile": "", "address": "", "source": "", "source_detail": "", "stage": "", "appraisal_at": "", "call_at": "", "next_action": "", "next_action_date": "", "nurture_reason": "", "details": {"beds": null, "baths": null, "block": null}, "motivation": "Making a move|Just an update|Unsure|", "timing": "", "notes": ""} or null; missing: [].\n' +
+    'Return JSON only: {"updates": [{"lead_id": "rec...", "changes": {"stage": "", "next_action": "", "next_action_date": "", "appraisal_at": "", "listing_meeting_at": "", "nurture_reason": "", "lost_reason": "", "authority_ends": "", "priority": false, "complete_task": false, "restart_no_contact": false, "call_at": "", "no_answer": false, "clear_offer": false, "vendor_price_expectation": "", "agent_price_guide": "", "decision_makers": "", "other_agents": ""}, "note": "fact worth logging, or empty", "summary": "e.g. Sarah Jones → Appraisal Booked, Thu 23 Oct 2pm (say if you tick off a task)"}], "new_card": null, "missing": [], "confidence": "high|low", "question": ""}';
+  const out = await claudeJSON('You are Alex, the sales assistant at Stone Real Estate Ballarat. You read short texts from agents and update their lead cards accurately and conservatively.', user, 1400);
   const updates = (out.updates || []).filter(u => cards.some(c => c.id === u.lead_id));
+  const key0 = normalisePhone(from);
+  // A new contact added by text
+  const nc = out.new_card && typeof out.new_card === 'object' && (out.new_card.name || out.new_card.mobile || out.new_card.address) ? out.new_card : null;
+  if (nc) {
+    const missing = [];
+    if (!String(nc.name || '').trim()) missing.push('name');
+    if (!isTextableMobile(nc.mobile || '')) missing.push('mobile');
+    if (!String(nc.address || '').trim()) missing.push('address');
+    if (!SOURCE_LIST.includes(nc.source)) missing.push('source');
+    if (missing.length) {
+      const question = (out.question && String(out.question).trim()) || `Happy to add ${nc.name || 'them'} – what's their ${missing.map(m => m === 'source' ? 'lead source' : m).join(', ').replace(/, ([^,]*)$/, ' and $1')}?${missing.includes('source') ? ' (open home, referral, door knock…)' : ''}`;
+      pendingByPhone.set(key0, { kind: 'newcard', draft: nc, question, at: Date.now() });
+      await reply(question);
+      return;
+    }
+    const res = await createCardFromText(member, nc, text);
+    if (res.createdId) pendingByPhone.set(key0, { kind: 'undo', items: [], created: res.createdId, summary: `${nc.name} added`, at: Date.now() });
+    if (res.existingId) {
+      const ex = cards.find(c => c.id === res.existingId) || await getRecord(T.leads, res.existingId);
+      await reply(`${leadLabel(ex.fields)} is already one of your cards (${sel(ex.fields[L.stage])}) – I've added your text as a note. Tell me what to change on it.`);
+      return;
+    }
+    await reply(res.reply + (res.createdId ? '\nReply UNDO to remove it.' : ''));
+    return;
+  }
+  if (!cards.length) { await reply(out.question || "I couldn't find any cards for you yet – to add someone, text me their name, mobile, address and where the lead came from."); return; }
   if (!updates.length || out.question) {
     await reply(out.question || "Sorry, I couldn't tell which card that's about – can you include the name or address?");
     return;
@@ -2155,11 +2281,12 @@ async function handleAgentUpdate(member, from, text, reply) {
     const ch = u.changes || {};
     const upd = fieldsFor(card, ch);
     const statePatch = ch.restart_no_contact === true ? { ncBase: today, ncAsked: {} } : null;
+    const after = { noAnswer: ch.no_answer === true, clearOffer: ch.clear_offer === true };
     if (statePatch && sel(card.fields[L.stage]) === NO_CONTACT) { upd[L.nextActionDate] = upd[L.nextActionDate] || addBizDays5(today); }
     const note = String(u.note || '').trim();
     const summary = String(u.summary || '').trim() || `${card.fields[L.name]} updated`;
-    if (!Object.keys(upd).length && !statePatch) { notesOnly.push({ card, note, summary }); continue; }
-    plan.push({ leadId: card.id, upd, note, summary, statePatch });
+    if (!Object.keys(upd).length && !statePatch && !after.noAnswer && !after.clearOffer) { notesOnly.push({ card, note, summary }); continue; }
+    plan.push({ leadId: card.id, upd, note, summary, statePatch, after });
   }
   for (const n of notesOnly) if (n.note) await logActivity(n.card.id, { summary: `${authorName}: ${n.note}`, detail: `Text: "${text}"`, type: 'SMS', kind: 'Note' });
   const noteLines = notesOnly.map(n => n.note ? `Noted on ${n.card.fields[L.name]}: ${n.note}` : `${n.card.fields[L.name]}: nothing to change`);
@@ -2180,8 +2307,9 @@ async function applyPlan(key, plan, authorName, rawText, reply, noteLines) {
     const prev = await applyCardChange(p.leadId, p.upd, p.note, authorName, rawText, p.statePatch);
     delete prev[L_COMPLETE];
     if (Object.keys(prev).length) undo.push({ leadId: p.leadId, prev });
+    try { p.extra = (await afterCardChange(p.leadId, p.upd, p.after, null)).trim(); } catch (e) { console.error('Alex leads: after card change failed', e.message); }
   }
-  const summaryText = plan.map(p => p.summary).join('\n');
+  const summaryText = plan.map(p => p.summary + (p.extra ? ' ' + p.extra : '')).join('\n');
   pendingByPhone.set(key, { kind: 'undo', items: undo, summary: summaryText, at: Date.now() });
   await reply(`Done:\n${summaryText}` + (noteLines && noteLines.length ? '\n' + noteLines.join('\n') : '') + (undo.length ? '\nReply UNDO to reverse.' : ''));
 }
@@ -2202,6 +2330,12 @@ async function handleTeamSMS(from, body) {
   let pend = pendingByPhone.get(key);
   if (pend && Date.now() - pend.at > PENDING_MINUTES * 60000) { pendingByPhone.delete(key); pend = null; }
   if (/^undo\b/i.test(text)) {
+    if (pend && pend.kind === 'undo' && pend.created) {
+      await at('DELETE', T.leads + '/' + pend.created);
+      pendingByPhone.delete(key);
+      await reply(`Undone – ${pend.summary.replace(/ added$/, '')} removed.`);
+      return true;
+    }
     if (!pend || pend.kind !== 'undo' || !(pend.items || []).length) { await reply('Nothing to undo (a ticked-off task can be set again on the card).'); return true; }
     for (const it of pend.items) {
       await updateRecord(T.leads, it.leadId, it.prev);
@@ -2219,6 +2353,12 @@ async function handleTeamSMS(from, body) {
     if (/^(no|n|nope|nah|cancel)$/i.test(text)) { pendingByPhone.delete(key); await reply("OK, I've left the card as it was."); return true; }
     pendingByPhone.delete(key); // anything else is a fresh message
   }
+  let pendingCard = null;
+  if (pend && pend.kind === 'newcard') {
+    pendingByPhone.delete(key);
+    if (/^(no|nah|cancel|forget it|never mind)\b/i.test(text)) { await reply("OK, I haven't added them."); return true; }
+    pendingCard = pend;
+  }
 
   // 2. CALL / ALEX for a new lead
   if (member && /^(call|alex)\b/i.test(text) && await handleCallAlex(member, from, text, reply)) return true;
@@ -2232,6 +2372,13 @@ async function handleTeamSMS(from, body) {
       await handlePreviewCommand({ parsed, rec, member, approver, reply });
       return true;
     }
+    // an offer to the card's agent (appraisal confirmation, thank-you): YES / EDIT / NO with the code
+    if (rec && !approver && member && sel(rec.fields[M.status]) === 'Awaiting approval' && ['YES', 'NO', 'EDIT', 'CHANGE'].includes(parsed.cmd)) {
+      const offerLead = (rec.fields[M.lead] || [])[0] ? await getRecord(T.leads, rec.fields[M.lead][0]) : null;
+      if (offerLead && (offerLead.fields[L.agent] || []).includes(member.id)) { await handleApproverSMS(text, from, member.fields[TM.name]); return true; }
+      await reply(`${parsed.code} isn't one of your cards.`);
+      return true;
+    }
   }
   // 4. Stu's approval flow
   if (approver && parsed && await handleApproverSMS(text)) return true;
@@ -2241,12 +2388,420 @@ async function handleTeamSMS(from, body) {
 
   // 6. a card update from an Alex-active agent (including answers to the 9:30 check-in)
   if (member && member.fields[TM.alexActive]) {
-    try { await handleAgentUpdate(member, from, text, reply); }
+    try { await handleAgentUpdate(member, from, text, reply, pendingCard); }
     catch (e) { console.error('Alex leads: agent update failed', e.message); await reply("Sorry, I couldn't process that – please update the card in Airtable."); }
     return true;
   }
   return false;
 }
+
+// ---------------------------------------------------------------- Outlook calendars (Microsoft Graph)
+// Switched on by three Railway variables from an Azure app registration with the Calendars.ReadWrite application
+// permission (admin consent): MS_TENANT_ID, MS_CLIENT_ID, MS_CLIENT_SECRET. Each agent's calendar is their Team email.
+// Without them Alex works as before: it collects preferred times and the agent confirms.
+const L_CALL_AT = 'fldiAZOtTEmOpVZN5';
+const TM_EMAIL = 'fldCwH4gZpNqZKmU1';
+const APPRAISAL_MINUTES = 60;
+const SLOT_TIMES = ['09:30', '11:00', '13:30', '15:30'];
+
+function calendarEnabled() { return !!(process.env.MS_TENANT_ID && process.env.MS_CLIENT_ID && process.env.MS_CLIENT_SECRET); }
+let graphTok = { at: 0, token: '' };
+async function graphToken() {
+  if (graphTok.token && Date.now() - graphTok.at < 50 * 60000) return graphTok.token;
+  const res = await fetch(`https://login.microsoftonline.com/${process.env.MS_TENANT_ID}/oauth2/v2.0/token`, {
+    method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ client_id: process.env.MS_CLIENT_ID, client_secret: process.env.MS_CLIENT_SECRET, scope: 'https://graph.microsoft.com/.default', grant_type: 'client_credentials' })
+  });
+  const j = await res.json();
+  if (!res.ok) throw new Error('Graph token: ' + JSON.stringify(j).slice(0, 200));
+  graphTok = { at: Date.now(), token: j.access_token };
+  return j.access_token;
+}
+async function graph(method, path, body) {
+  const res = await fetch('https://graph.microsoft.com/v1.0' + path, {
+    method, headers: { Authorization: 'Bearer ' + await graphToken(), 'Content-Type': 'application/json', Prefer: 'outlook.timezone="UTC"' },
+    body: body ? JSON.stringify(body) : undefined
+  });
+  const j = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error('Graph ' + method + ' ' + path + ' ' + res.status + ': ' + JSON.stringify(j).slice(0, 200));
+  return j;
+}
+const utcStamp = iso => new Date(iso).toISOString().slice(0, 19);
+async function busyTimes(email, fromIso, toIso) {
+  const j = await graph('POST', `/users/${encodeURIComponent(email)}/calendar/getSchedule`, {
+    schedules: [email], startTime: { dateTime: utcStamp(fromIso), timeZone: 'UTC' }, endTime: { dateTime: utcStamp(toIso), timeZone: 'UTC' }, availabilityViewInterval: 30
+  });
+  return ((j.value || [])[0] || {}).scheduleItems?.filter(i => i.status !== 'free').map(i => ({ start: i.start.dateTime + 'Z', end: i.end.dateTime + 'Z', subject: i.subject || 'busy' })) || [];
+}
+const overlaps = (aS, aE, b) => new Date(aS) < new Date(b.end) && new Date(aE) > new Date(b.start);
+// Two free appraisal times on different days over the next week (business days, Mon–Fri)
+async function freeSlots(email, count) {
+  const c = melbClock();
+  const days = []; let d = c.date;
+  while (days.length < 6) { d = addDays(d, 1); if (isBizDay(d)) days.push(d); }
+  const from = melbToISO(days[0] + 'T00:00'), to = melbToISO(addDays(days[days.length - 1], 1) + 'T00:00');
+  const busy = await busyTimes(email, from, to);
+  const out = [];
+  for (const day of days) {
+    for (const t of SLOT_TIMES) {
+      const s = melbToISO(day + 'T' + t); const e = new Date(new Date(s).getTime() + APPRAISAL_MINUTES * 60000).toISOString();
+      if (!busy.some(b => overlaps(s, e, b))) { out.push({ local: day + 'T' + t, iso: s, label: melbWhen(s) }); break; } // one per day
+    }
+    if (out.length >= (count || 2)) break;
+  }
+  return out;
+}
+async function clashes(email, startIso, minutes) {
+  const end = new Date(new Date(startIso).getTime() + (minutes || APPRAISAL_MINUTES) * 60000).toISOString();
+  return (await busyTimes(email, startIso, end)).filter(b => overlaps(startIso, end, b));
+}
+async function addToCalendar(agent, lead, startIso, kind) {
+  const email = agent && agent.fields[TM_EMAIL];
+  if (!calendarEnabled() || !email) return '';
+  try {
+    const f = lead.fields;
+    const clash = await clashes(email, startIso);
+    const end = new Date(new Date(startIso).getTime() + APPRAISAL_MINUTES * 60000).toISOString();
+    const prop = [f[PROP.beds] && f[PROP.beds] + ' bed', f[PROP.baths] && f[PROP.baths] + ' bath', f[PROP.block] && f[PROP.block] + 'm²'].filter(Boolean).join(', ');
+    await graph('POST', `/users/${encodeURIComponent(email)}/events`, {
+      subject: `${kind} – ${f[L.name] || ''}${f[L.address] ? ', ' + f[L.address] : ''}`,
+      start: { dateTime: utcStamp(startIso), timeZone: 'UTC' }, end: { dateTime: utcStamp(end), timeZone: 'UTC' },
+      location: { displayName: f[L.address] || '' },
+      body: { contentType: 'text', content: [`${f[L.name] || ''} · ${f[L.phone] || ''}`, prop, sel(f[PROP.motivation]) && 'Motivation: ' + sel(f[PROP.motivation]), f[PROP.timing] && 'Timing: ' + f[PROP.timing], 'Booked by Alex – card in Airtable Sales Leads.'].filter(Boolean).join('\n') }
+    });
+    return clash.length ? ` Added to your Outlook calendar – heads-up, it overlaps "${clash[0].subject}".` : ' Added to your Outlook calendar.';
+  } catch (e) { console.error('Alex leads: calendar add failed', e.message); return ' (Couldn\'t add it to your Outlook calendar – please add it.)'; }
+}
+
+// ---------------------------------------------------------------- appointment options for the agent (no calendar access)
+// Alex can't see Outlook, so it uses the bookings already on the agent's cards in Airtable (appraisals, listing
+// meetings, calls) to avoid clashes, offers the agent up to 3 times that fit what the contact said, and confirms
+// with the contact once the agent picks one (in business hours).
+async function agentBookings(agentId) {
+  const nowIso = new Date(Date.now()).toISOString();
+  const recs = await listAll(T.leads, { filterByFormula: `OR({${L_APPT_AT}}!='',{${L_MTG_AT}}!='',{${L_CALL_AT}}!='')` });
+  const out = [];
+  for (const r of recs) {
+    if (!(r.fields[L.agent] || []).includes(agentId) || r.fields[L_PARKED]) continue;
+    for (const [fid, mins, kind] of [[L_APPT_AT, APPRAISAL_MINUTES, 'appraisal'], [L_MTG_AT, APPRAISAL_MINUTES, 'listing meeting'], [L_CALL_AT, 20, 'call']]) {
+      const st = r.fields[fid];
+      if (!st || st < nowIso) continue;
+      out.push({ start: st, end: new Date(new Date(st).getTime() + mins * 60000).toISOString(), subject: `${kind} – ${r.fields[L.name] || ''}`, leadId: r.id });
+    }
+  }
+  return out.sort((a, b) => a.start < b.start ? -1 : 1);
+}
+// Keep options that are in the future, Mon–Sat 8am–6pm, and clear of the agent's bookings (30 min travel buffer)
+async function cleanOptions(agentId, locals, skipLeadId) {
+  const busy = (await agentBookings(agentId)).filter(b => b.leadId !== skipLeadId)
+    .map(b => ({ start: new Date(new Date(b.start).getTime() - 30 * 60000).toISOString(), end: new Date(new Date(b.end).getTime() + 30 * 60000).toISOString() }));
+  const seen = new Set(); const out = [];
+  for (const loc of locals || []) {
+    const iso = melbToISO(loc);
+    if (!iso || seen.has(iso) || Date.parse(iso) < Date.now() + 2 * 3600000) continue;
+    const day = loc.slice(0, 10), hhmm = loc.slice(11);
+    if (new Date(day + 'T00:00:00Z').getUTCDay() === 0 || hhmm < '08:00' || hhmm > '18:00') continue;
+    const end = new Date(new Date(iso).getTime() + APPRAISAL_MINUTES * 60000).toISOString();
+    if (busy.some(b => overlaps(iso, end, b))) continue;
+    seen.add(iso); out.push(iso);
+    if (out.length >= 3) break;
+  }
+  return out;
+}
+function bookingsText(list) { return list.slice(0, 15).map(b => `${melbWhen(b.start)} (${b.subject})`).join('; ') || 'none'; }
+function optionsText(isos) { return isos.map((iso, i) => `${i + 1} – ${melbWhen(iso)}`).join(' · '); }
+// Text the agent the options (now in business hours, otherwise from 8am) and keep them on the card for their reply
+async function offerTimesToAgent(lead, isos, kind, intro) {
+  const state = getState(lead);
+  state.offer = { kind: kind || 'appraisal', options: isos, at: new Date(Date.now()).toISOString(), reminded: false };
+  await setState(lead.id, state);
+  const text = `${intro}\nTimes that suit them and are clear in Airtable: ${optionsText(isos)}.\nReply with the number (e.g. "${firstName(lead.fields[L.name]) || 'them'} 2"), another time, or CALL if you'll ring them.`;
+  return noticeAgent(await getRecord(T.leads, lead.id), text);
+}
+// The contact is told once the agent has picked a time; outside business hours it waits until 8am
+async function confirmToContact(lead, iso, kind) {
+  const f = lead.fields;
+  if (f[L.doNotContact] || !isTextableMobile(f[L.phone])) return '';
+  const agent = await agentOfLead(lead);
+  const agentFirst = agent ? firstName(agent.fields[TM.name]) : 'our agent';
+  const text = `All set${firstName(f[L.name]) ? ' ' + firstName(f[L.name]) : ''} – ${agentFirst} will see you ${melbWhen(iso)}${f[L.address] ? ' at ' + f[L.address] : ''}${kind === 'listing meeting' ? ' for the listing meeting' : ''}. If anything changes, just reply here. – Alex, Stone Ballarat`;
+  if (!isBH()) {
+    const st = getState(lead); st.pendingConfirm = { iso, kind, text }; await setState(lead.id, st);
+    return ` I'll confirm it with ${firstName(f[L.name]) || 'them'} at 8am.`;
+  }
+  const sid = await sendSMS(f[L.phone], text); await logOut(lead, text, 'Other', sid);
+  return ` I've confirmed it with ${firstName(f[L.name]) || 'them'}.`;
+}
+// Every few minutes in business hours: send held confirmations; remind the agent once if options are 2h unanswered
+async function offerTick() {
+  if (!sweepEnabled() || !isBH()) return;
+  const leads = await listAll(T.leads, { filterByFormula: `OR(FIND('"pendingConfirm":',{${L_STATE}}&''),FIND('"offer":',{${L_STATE}}&''))` });
+  for (const lead of leads) {
+    const f = lead.fields;
+    const state = getState(lead);
+    try {
+      if (state.pendingConfirm && isTextableMobile(f[L.phone]) && !f[L.doNotContact]) {
+        const sid = await sendSMS(f[L.phone], state.pendingConfirm.text); await logOut(lead, state.pendingConfirm.text, 'Other', sid);
+        delete state.pendingConfirm; await setState(lead.id, state);
+      } else if (state.pendingConfirm) { delete state.pendingConfirm; await setState(lead.id, state); }
+      if (state.offer && !state.offer.reminded && minutesSince(state.offer.at) >= 120) {
+        const live = state.offer.options.filter(iso => Date.parse(iso) > Date.now() + 3600000);
+        if (!live.length) { delete state.offer; await setState(lead.id, state); continue; }
+        await textAgent(await agentOfLead(lead), `Reminder – ${leadLabel(f)} is waiting on ${state.offer.kind === 'appraisal' ? 'an' : 'a'} ${state.offer.kind} time: ${optionsText(live)}. Reply with the number, another time, or CALL.`);
+        state.offer.reminded = true; await setState(lead.id, state);
+      }
+    } catch (e) { console.error('Alex leads: offer tick failed for ' + lead.id, e.message); }
+  }
+}
+
+// ---------------------------------------------------------------- Qualifying: the agreed call
+// Morning of the call Alex texts the contact; 15 minutes before it briefs the agent; an hour after it asks how it went.
+function minutesUntil(iso) { return (new Date(iso).getTime() - Date.now()) / 60000; }
+async function recentContactLines(lead, n) {
+  const msgs = await leadMessages(lead.fields);
+  return msgs.filter(m => sel(m.fields[M.direction]) === 'From vendor').slice(-(n || 2)).map(m => `"${String(m.fields[M.finalText] || '').slice(0, 160)}"`);
+}
+function propLine(f) {
+  return [f[PROP.beds] && f[PROP.beds] + ' bed', f[PROP.baths] && f[PROP.baths] + ' bath', f[PROP.living] && f[PROP.living] + ' living', f[PROP.block] && f[PROP.block] + 'm²', f[PROP.renos]].filter(Boolean).join(', ');
+}
+async function callTick() {
+  if (!sweepEnabled()) return;
+  const c = melbClock();
+  if (c.weekday === 'Sun' || c.hour < 8 || c.hour >= 20) return;
+  const agents = await alexActiveAgentIds();
+  if (!agents.size) return;
+  const leads = (await listAll(T.leads, { filterByFormula: `AND({${L_CALL_AT}}!='',NOT({${L_PARKED}}),{${L.stage}}!='Nurture',{${L.stage}}!='Listed (Won)',{${L.stage}}!='Lost / Not Progressing')` }))
+    .filter(l => (l.fields[L.agent] || []).some(id => agents.has(id)));
+  for (const lead of leads) {
+    const f = lead.fields;
+    const at = f[L_CALL_AT];
+    const state = getState(lead);
+    const agent = await agentOfLead(lead);
+    const agentFirst = agent ? firstName(agent.fields[TM.name]) : 'our agent';
+    const first = firstName(f[L.name]) || f[L.name] || 'them';
+    const until = minutesUntil(at);
+    const callDay = new Date(at).toLocaleDateString('en-CA', { timeZone: TZ });
+    const time = new Intl.DateTimeFormat('en-AU', { timeZone: TZ, hour: 'numeric', minute: '2-digit' }).format(new Date(at));
+    try {
+      // morning-of text to the contact (only for calls from 9am, and at least 45 minutes ahead)
+      if (callDay === c.date && state.callMorning !== at && until >= 45 && new Date(at).toLocaleTimeString('en-GB', { timeZone: TZ }) >= '09:00' && !f[L.doNotContact] && isTextableMobile(f[L.phone])) {
+        const text = `Hi ${first}, just a heads-up that ${agentFirst} will give you a call around ${time} today${f[L.address] ? ' about ' + f[L.address] : ''}. – Alex, Stone Ballarat`;
+        const sid = await sendSMS(f[L.phone], text); await logOut(lead, text, 'Other', sid);
+        state.callMorning = at; await setState(lead.id, state);
+      }
+      // brief to the agent 15 minutes before
+      if (state.callBrief !== at && until <= 15 && until > -10) {
+        const said = await recentContactLines(lead, 2);
+        const lines = [
+          `Call ${f[L.name]} at ${time} – ${f[L.phone] || ''}`,
+          f[L.address] && `Property: ${f[L.address]}${propLine(f) ? ' – ' + propLine(f) : ''}`,
+          (sel(f[PROP.motivation]) || f[PROP.timing]) && `Motivation / timing: ${[sel(f[PROP.motivation]), f[PROP.timing]].filter(Boolean).join(' – ')}`,
+          f[PROP.otherAgents] && `Other agents: ${f[PROP.otherAgents]}`,
+          said.length && `They said: ${said.join(' · ')}`,
+          `Suggested opener: "Hi ${first}, it's ${agentFirst} from Stone – thanks for chatting with Alex about ${f[L.address] || 'your place'}. Have you got a few minutes?"`
+        ].filter(Boolean);
+        await textAgent(agent, lines.join('\n'));
+        state.callBrief = at; await setState(lead.id, state);
+      }
+      // an hour after: how did it go?
+      if (state.callAsked !== at && until <= -60 && until > -24 * 60 && isBH(c)) {
+        const q = `How did the call with ${first} go? 1 – Booked appraisal (tell me when) · 2 – Wants a desktop appraisal · 3 – Not ready · 4 – No answer · 5 – Something else`;
+        await textAgent(agent, q);
+        state.callAsked = at; await setState(lead.id, state);
+        if (agent) rememberQuestions(agent, c.date, [{ n: 0, leadId: lead.id, question: `${f[L.name]} – AFTER-CALL (1 → Appraisal Booked + appraisal_at; 2 → "Price Update / Desktop Required"; 3 → Nurture with a matching nurture_reason; 4 → no_answer true; 5 → read what they said): ${q}` }]);
+      }
+    } catch (e) { console.error('Alex leads: call tick failed for ' + lead.id, e.message); }
+  }
+}
+
+// After the agent says "no answer": Alex texts the contact for a better time, and books the new call time from their reply
+async function missedCallText(lead, agent) {
+  const f = lead.fields;
+  if (f[L.doNotContact] || !isTextableMobile(f[L.phone])) return '';
+  const first = firstName(f[L.name]) || 'there';
+  const agentFirst = agent ? firstName(agent.fields[TM.name]) : 'our agent';
+  const text = `Hi ${first}, ${agentFirst} just tried to give you a call – when's a better time to chat? – Alex, Stone Ballarat`;
+  const sid = await sendSMS(f[L.phone], text); await logOut(lead, text, 'Other', sid);
+  const state = getState(lead); state.awaitingCallTime = true;
+  await setState(lead.id, state, { [L_CALL_AT]: null });
+  return ` I've texted ${first} for a better time.`;
+}
+async function handleCallTimeReply(lead, from, text) {
+  const f = lead.fields;
+  const agent = await agentOfLead(lead);
+  const agentFirst = agent ? firstName(agent.fields[TM.name]) : 'our agent';
+  const c = melbClock();
+  const out = await claudeJSON('You read a short text reply and extract a call time. Be conservative.',
+    `NOW: ${c.weekday} ${c.date} ${c.hour}:${String(c.minute).padStart(2, '0')} Melbourne. We asked "${agentFirst} just tried to give you a call – when's a better time to chat?" The contact replied: "${text}".\n` +
+    'Return JSON only: {"call_at": "YYYY-MM-DDTHH:MM local, or empty if no clear time", "other": true/false (true if the reply is about something else or they do not want a call)}', 200);
+  const iso = melbToISO(out.call_at);
+  if (!iso || out.other) return false; // let the normal reply handling deal with it
+  const when = melbWhen(iso);
+  const first = firstName(f[L.name]) || f[L.name];
+  const reply = `Thanks ${firstName(f[L.name]) || ''} – ${agentFirst} will call you ${when}. – Alex, Stone Ballarat`.replace('Thanks  –', 'Thanks –');
+  const sid = await sendSMS(from, reply); await logOut(lead, reply, 'Other', sid);
+  const state = getState(lead); delete state.awaitingCallTime;
+  await setState(lead.id, state, { [L_CALL_AT]: iso, [L.nextAction]: `Call ${first} – ${when}`, [L.nextActionDate]: new Date(iso).toLocaleDateString('en-CA', { timeZone: TZ }) });
+  await noticeAgent(await getRecord(T.leads, lead.id), `${leadLabel(f)} replied – call them ${when}. It's on the card and I'll remind you 15 minutes before.`);
+  return true;
+}
+
+// ---------------------------------------------------------------- Appraisal Booked: confirmation, thank-you, escalation
+// Offers go to the agent with a code: YES A12 sends it, EDIT A12 [wording] sends their wording, NO A12 skips it.
+async function offerText(lead, agent, purpose, draft, intro) {
+  const code = await nextCode();
+  await createRecord(T.messages, {
+    [M.code]: code, [M.lead]: [lead.id], [M.direction]: 'To vendor', [M.purpose]: purpose, [M.status]: 'Awaiting approval',
+    [M.draft]: draft, [M.reasoning]: intro, [M.number]: normalisePhone(lead.fields[L.phone])
+  });
+  await textAgent(agent, `${intro}\n"${draft}"\nReply YES ${code} · EDIT ${code} [your wording] · NO ${code}`);
+  return code;
+}
+let lastEscalateDate = null;
+async function appraisalTick() {
+  if (!sweepEnabled()) return;
+  const c = melbClock();
+  if (!isBH(c)) return;
+  const agents = await alexActiveAgentIds();
+  if (!agents.size) return;
+  const leads = (await listAll(T.leads, { filterByFormula: `AND(OR({${L.stage}}='Appraisal Booked',{${L.stage}}='Listing Meeting Booked'),NOT({${L_PARKED}}))` }))
+    .filter(l => (l.fields[L.agent] || []).some(id => agents.has(id)));
+  for (const lead of leads) {
+    const f = lead.fields;
+    const stage = sel(f[L.stage]);
+    const at = stage === 'Appraisal Booked' ? f[L_APPT_AT] : f[L_MTG_AT];
+    if (!at) continue;
+    const kind = stage === 'Appraisal Booked' ? 'appraisal' : 'listing meeting';
+    const state = getState(lead);
+    const agent = await agentOfLead(lead);
+    const agentFirst = agent ? firstName(agent.fields[TM.name]) : 'our agent';
+    const first = firstName(f[L.name]) || f[L.name];
+    const day = new Date(at).toLocaleDateString('en-CA', { timeZone: TZ });
+    const time = new Intl.DateTimeFormat('en-AU', { timeZone: TZ, hour: 'numeric', minute: '2-digit' }).format(new Date(at));
+    const weekday = new Intl.DateTimeFormat('en-AU', { timeZone: TZ, weekday: 'long' }).format(new Date(at));
+    const textable = !f[L.doNotContact] && isTextableMobile(f[L.phone]);
+    try {
+      // day before, from 10am: offer a confirmation text
+      if (textable && day === addDays(c.date, 1) && c.hour >= 10 && state.confirmOffered !== at) {
+        const draft = `Hi ${first}, just confirming ${agentFirst} will see you tomorrow (${weekday}) at ${time}${f[L.address] ? ' at ' + f[L.address] : ''}. If anything changes, just reply here. – Alex, Stone Ballarat`;
+        await offerText(lead, agent, 'Appraisal confirmation', draft, `Want me to send ${first} a quick confirmation of tomorrow's ${kind}?`);
+        state.confirmOffered = at; await setState(lead.id, state);
+      }
+      // same afternoon, 3 hours after the appraisal: offer a thank-you
+      if (textable && stage === 'Appraisal Booked' && day === c.date && minutesSince(at) >= 180 && state.thanksOffered !== at) {
+        const draft = `Thanks for having ${agentFirst} through today, ${first} – your proposal will be with you shortly. – Alex, Stone Ballarat`;
+        await offerText(lead, agent, 'Thank-you', draft, `Want me to send ${first} a thank-you for today?`);
+        state.thanksOffered = at; await setState(lead.id, state);
+      }
+      // 2 business days after the appraisal and the card hasn't moved: tell Fiona (once)
+      if (stage === 'Appraisal Booked' && day < c.date && bizDaysBetween(day, c.date) >= 2 && state.fionaEscalated !== at && lastEscalateDate !== c.date + lead.id) {
+        await textFiona(`Hi Fiona – ${leadLabel(f)}: ${agentFirst}'s appraisal was ${weekday} ${dmy(day)} and the card hasn't moved since. Could you check in with ${agentFirst} about the proposal?`);
+        state.fionaEscalated = at; await setState(lead.id, state);
+        lastEscalateDate = c.date + lead.id;
+      }
+    } catch (e) { console.error('Alex leads: appraisal tick failed for ' + lead.id, e.message); }
+  }
+}
+
+// The contact asked to move their appraisal: Alex acknowledges and asks the agent for the new time.
+async function startReschedule(lead, from, text) {
+  const f = lead.fields;
+  const agent = await agentOfLead(lead);
+  const agentFirst = agent ? firstName(agent.fields[TM.name]) : 'our agent';
+  const first = firstName(f[L.name]) || '';
+  const stage = sel(f[L.stage]);
+  const at = stage === 'Listing Meeting Booked' ? f[L_MTG_AT] : f[L_APPT_AT];
+  const ack = `No problem${first ? ' ' + first : ''} – I'll check with ${agentFirst} and come back to you ${isBH() && melbClock().hour < 17 ? 'shortly' : 'in the morning'} with a new time. – Alex, Stone Ballarat`;
+  const sid = await sendSMS(from, ack); await logOut(lead, ack, 'Other', sid);
+  const state = getState(lead); state.reschedule = true; await setState(lead.id, state);
+  let options = '';
+  if (calendarEnabled() && agent && agent.fields[TM_EMAIL]) {
+    try { const s = await freeSlots(agent.fields[TM_EMAIL], 2); if (s.length) options = ` Your next free times: ${s.map(x => x.label).join(' or ')}.`; } catch (e) { /* ignore */ }
+  } else if (agent) {
+    try {
+      const c = melbClock();
+      const out = await claudeJSON('You read a short text and suggest appointment times. Be conservative.',
+        `NOW: ${c.weekday} ${c.date} Melbourne. The contact wants to move their ${stage === 'Listing Meeting Booked' ? 'listing meeting' : 'appraisal'} and said: "${text}". ` +
+        `The agent is already booked: ${bookingsText(await agentBookings(agent.id))}. Suggest up to 3 times (Mon–Sat 9:00–17:00, on the hour or half hour, from tomorrow) that fit what they said. ` +
+        'Return JSON only: {"options": ["YYYY-MM-DDTHH:MM"]} (empty if they gave no clue about timing)', 200);
+      const isos = await cleanOptions(agent.id, out.options || [], lead.id);
+      if (isos.length) {
+        const st = getState(await getRecord(T.leads, lead.id));
+        st.offer = { kind: stage === 'Listing Meeting Booked' ? 'listing meeting' : 'appraisal', options: isos, at: new Date(Date.now()).toISOString(), reminded: false };
+        await setState(lead.id, st);
+        options = ` Times that might suit and are clear in Airtable: ${optionsText(isos)}.`;
+      }
+    } catch (e) { console.error('Alex leads: reschedule options failed', e.message); }
+  }
+  const q = `${leadLabel(f)} wants to move the ${stage === 'Listing Meeting Booked' ? 'listing meeting' : 'appraisal'}${at ? ' (' + melbWhen(at) + ')' : ''}: "${text.slice(0, 200)}".${options}` +
+    (/Times that might suit/.test(options) ? `\nReply with the number (e.g. "${first || 'them'} 2"), another time, or CALL if you'll ring them.` : ` Reply with the new time (e.g. "${first || 'them'} Fri 2pm") and I'll confirm with them, or tell me if you'll call.`);
+  await noticeAgent(await getRecord(T.leads, lead.id), q);
+  if (agent) rememberQuestions(agent, melbClock().date, [{ n: 0, leadId: lead.id, question: `RESCHEDULE (a time in the reply → appraisal_at or listing_meeting_at for this card): ${q}` }]);
+  await logActivity(lead.id, { summary: 'Contact asked to reschedule – agent asked for a new time', detail: text, type: 'General', kind: 'History' });
+}
+// Called after a card change by text: confirm a rescheduled time to the contact, add bookings to Outlook
+async function afterCardChange(leadId, upd, after, agent) {
+  const lead = await getRecord(T.leads, leadId);
+  const f = lead.fields;
+  const state = getState(lead);
+  agent = agent || await agentOfLead(lead);
+  let note = '';
+  const newAppt = upd[L_APPT_AT] || upd[L_MTG_AT];
+  const kind = upd[L_MTG_AT] ? 'listing meeting' : 'appraisal';
+  if (newAppt) {
+    const cal = await addToCalendar(agent, lead, newAppt, upd[L_MTG_AT] ? 'Listing meeting' : 'Appraisal');
+    note += cal;
+    if (state.reschedule || state.offer) {
+      delete state.reschedule; delete state.offer; delete state.confirmOffered;
+      await setState(lead.id, state);
+      note += await confirmToContact(await getRecord(T.leads, lead.id), newAppt, kind);
+      if (!cal) note += ' Please add it to your Outlook calendar.';
+    }
+  }
+  if (after && after.clearOffer && state.offer) { delete state.offer; await setState(lead.id, state); }
+  if (after && after.noAnswer) note += await missedCallText(lead, agent);
+  return note;
+}
+
+// ---------------------------------------------------------------- agents add new contacts by text
+const SOURCE_LIST = ['Social Media', 'Rental Dept', 'Walk/Phone In', 'Open Home', 'Referral', 'Radio', 'Letterbox Drop', 'Stone Website', 'Portal/s', 'Agent Prospecting Call', 'Door Knock', 'Email Campaign', 'For Sale Sign', 'Past Client', 'Stone Office Referral', 'Other'];
+async function createCardFromText(member, nc, rawText) {
+  const mobile = normalisePhone(nc.mobile || '');
+  const existing = await findExistingCard({ mobile, address: nc.address });
+  const authorName = firstName(member.fields[TM.name]) || member.fields[TM.name];
+  if (existing) {
+    const theirs = (existing.fields[L.agent] || []).includes(member.id);
+    await logActivity(existing.id, { summary: `${authorName} texted Alex about this contact`, detail: rawText, type: 'SMS', kind: 'Note' });
+    if (!theirs) {
+      const other = await agentOfLead(existing);
+      return { reply: `${leadLabel(existing.fields)} is already on ${other ? other.fields[TM.name] + "'s" : 'another'} card (${sel(existing.fields[L.stage])}), so I haven't made a new one – I've added a note there. Have a word with ${other ? firstName(other.fields[TM.name]) : 'them'}${other && isApprover(other.fields[TM.mobile]) ? '' : ' or ' + (process.env.APPROVER_NAME || 'Stu')}.` };
+    }
+    return { existingId: existing.id, reply: '' };
+  }
+  const stage = STAGE_LIST.includes(nc.stage) ? nc.stage : (melbToISO(nc.appraisal_at) ? 'Appraisal Booked' : 'Qualifying');
+  const d = nc.details || {};
+  const num = v => (v === null || v === undefined || v === '' || isNaN(Number(v))) ? undefined : Number(v);
+  const fields = {
+    [L.name]: nc.name, [L.phone]: mobile || undefined, [L.address]: nc.address || undefined, [L.agent]: [member.id],
+    [L.source]: SOURCE_LIST.includes(nc.source) ? nc.source : 'Other', [L.sourceDetail]: nc.source_detail || undefined, [L.enteredVia]: 'Agent by text',
+    [L.stage]: stage, [L_RECEIVED]: melbClock().date, [L_STATE]: '{"flow":"newlead","phase":"skip","why":"agent added by text"}',
+    [L_APPT_AT]: melbToISO(nc.appraisal_at) || undefined, [L_CALL_AT]: melbToISO(nc.call_at) || undefined,
+    [L.nurtureReason]: stage === 'Nurture' && NURTURE_REASONS.includes(nc.nurture_reason) ? nc.nurture_reason : undefined,
+    [L.nextAction]: nc.next_action || undefined, [L.nextActionDate]: /^\d{4}-\d{2}-\d{2}$/.test(nc.next_action_date || '') ? nc.next_action_date : undefined,
+    [PROP.beds]: num(d.beds), [PROP.baths]: num(d.baths), [PROP.block]: num(d.block), [PROP.motivation]: ['Making a move', 'Just an update', 'Unsure'].includes(nc.motivation) ? nc.motivation : undefined,
+    [PROP.timing]: nc.timing || undefined, [PROP.other]: nc.notes || undefined
+  };
+  for (const k of Object.keys(fields)) if (fields[k] === undefined) delete fields[k];
+  const rec = await createRecord(T.leads, fields);
+  await logActivity(rec.id, { summary: `${authorName} added this contact by text`, detail: rawText, type: 'SMS', kind: 'Note' });
+  const card = await getRecord(T.leads, rec.id);
+  let extra = '';
+  if (fields[L_APPT_AT]) extra += await addToCalendar(member, card, fields[L_APPT_AT], 'Appraisal');
+  const when = fields[L_APPT_AT] ? ', ' + melbWhen(fields[L_APPT_AT]) : fields[L_CALL_AT] ? ', call ' + melbWhen(fields[L_CALL_AT]) : '';
+  const track = fields[L.nurtureReason] ? ` (track: ${fields[L.nurtureReason]} – tell me if another fits better)` : '';
+  return { createdId: rec.id, reply: `Done: ${nc.name}${nc.address ? ', ' + nc.address : ''} → ${stage}${when}${track}.${extra}` };
+}
+
 
 // ---------------------------------------------------------------- new enquiries (replaces Pipedrive)
 
@@ -2282,6 +2837,9 @@ function start() {
     try { await checkinTick(); } catch (e) { console.error('Alex leads: check-in tick failed', e.message); }
     try { await wonTick(); } catch (e) { console.error('Alex leads: won tick failed', e.message); }
     try { await noticeTick(); } catch (e) { console.error('Alex leads: notice tick failed', e.message); }
+    try { await callTick(); } catch (e) { console.error('Alex leads: call tick failed', e.message); }
+    try { await appraisalTick(); } catch (e) { console.error('Alex leads: appraisal tick failed', e.message); }
+    try { await offerTick(); } catch (e) { console.error('Alex leads: offer tick failed', e.message); }
   };
   fastTimer = setInterval(fast, 2 * 60000);
   setTimeout(fast, 45000);

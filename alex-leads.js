@@ -20,9 +20,10 @@
 // - Qualifying 14 days, Decision Pending 21 days and cards with no next step come up in the 9:30 check-in;
 //   a sent price update gets an "Any reaction?" task 3 business days out
 // - Agents add new contacts by text (name, mobile, address, source) – duplicates are caught, UNDO removes it
+// - Every confirmation to a contact (appraisal / meeting times, call times, day-before reminders, thank-yous) is
+//   drafted for the agent first: YES / EDIT / NO + code; approved after hours, it goes at 8am
 // - Appraisal times without calendar access: Alex asks the contact what suits, texts the agent up to 3 times that
-//   fit and don't clash with their Airtable bookings, and confirms with the contact once the agent picks one
-//   (business hours; held till 8am otherwise). One reminder to the agent after 2 hours. Agents add it to Outlook.
+//   fit and don't clash with their Airtable bookings, and drafts the contact's confirmation once the agent picks one. One reminder to the agent after 2 hours. Agents add it to Outlook.
 // - Outlook (optional, dormant – env MS_TENANT_ID / MS_CLIENT_ID / MS_CLIENT_SECRET): would offer real free times
 //   and add bookings to the agent's calendar (Team → Email)
 // (The 7:45 / 12:30 / 5pm email digests and the Monday lost list are Airtable automations.)
@@ -351,6 +352,7 @@ function parseApproverCommand(text) {
   return { cmd, code, rest };
 }
 
+const QUICK_PURPOSES = ['Appraisal confirmation', 'Thank-you', 'Call confirmation']; // offers the agent approves: sent in business hours (8am–7pm Mon–Sat)
 // replyTo / byName: an agent approving an offer on their own card (appraisal confirmation, thank-you)
 async function handleApproverSMS(body, replyTo, byName) {
   const text = (body || '').trim();
@@ -423,7 +425,7 @@ async function handleApproverSMS(body, replyTo, byName) {
   await updateRecord(T.messages, rec.id, fields);
 
   // Appraisal confirmations and thank-yous go straight away in business hours; everything else Mon–Fri 9–6
-  const quick = ['Appraisal confirmation', 'Thank-you'].includes(sel(rec.fields[M.purpose]));
+  const quick = QUICK_PURPOSES.includes(sel(rec.fields[M.purpose]));
   if (quick ? !isBH() : !inSendWindow()) {
     await sendSMS(to, `${code} approved – it will go out at ${quick ? '8am' : '9am'} (outside ${quick ? 'business hours' : 'Mon–Fri 9–6'}).`);
     return true;
@@ -2518,23 +2520,24 @@ async function offerTimesToAgent(lead, isos, kind, intro) {
   const text = `${intro}\nTimes that suit them and are clear in Airtable: ${optionsText(isos)}.\nReply with the number (e.g. "${firstName(lead.fields[L.name]) || 'them'} 2"), another time, or CALL if you'll ring them.`;
   return noticeAgent(await getRecord(T.leads, lead.id), text);
 }
-// The contact is told once the agent has picked a time; outside business hours it waits until 8am
+// Once the agent has picked a time, Alex drafts the contact's confirmation and the agent approves it (YES / EDIT / NO + code)
 async function confirmToContact(lead, iso, kind) {
   const f = lead.fields;
   if (f[L.doNotContact] || !isTextableMobile(f[L.phone])) return '';
   const agent = await agentOfLead(lead);
   const agentFirst = agent ? firstName(agent.fields[TM.name]) : 'our agent';
-  const text = `All set${firstName(f[L.name]) ? ' ' + firstName(f[L.name]) : ''} – ${agentFirst} will see you ${melbWhen(iso)}${f[L.address] ? ' at ' + f[L.address] : ''}${kind === 'listing meeting' ? ' for the listing meeting' : ''}. If anything changes, just reply here. – Alex, Stone Ballarat`;
-  if (!isBH()) {
-    const st = getState(lead); st.pendingConfirm = { iso, kind, text }; await setState(lead.id, st);
-    return ` I'll confirm it with ${firstName(f[L.name]) || 'them'} at 8am.`;
-  }
-  const sid = await sendSMS(f[L.phone], text); await logOut(lead, text, 'Other', sid);
-  return ` I've confirmed it with ${firstName(f[L.name]) || 'them'}.`;
+  const first = firstName(f[L.name]);
+  const draft = `All set${first ? ' ' + first : ''} – ${agentFirst} will see you ${melbWhen(iso)}${f[L.address] ? ' at ' + f[L.address] : ''}${kind === 'listing meeting' ? ' for the listing meeting' : ''}. If anything changes, just reply here. – Alex, Stone Ballarat`;
+  const o = await offerDraft(lead, 'Appraisal confirmation', draft, `Want me to send ${first || 'them'} this confirmation?`);
+  return '\n' + o.text;
 }
 // Every few minutes in business hours: send held confirmations; remind the agent once if options are 2h unanswered
 async function offerTick() {
   if (!sweepEnabled() || !isBH()) return;
+  // offers the agent approved outside business hours go out from 8am
+  const approved = (await listAll(T.messages, { filterByFormula: `OR({${M.status}}='Approved',{${M.status}}='Edited & approved')` }))
+    .filter(r => QUICK_PURPOSES.includes(sel(r.fields[M.purpose])));
+  for (const r of approved) { try { await sendApproved(r); } catch (e) { console.error('Alex leads: approved offer send failed', e.message); } }
   const leads = await listAll(T.leads, { filterByFormula: `OR(FIND('"pendingConfirm":',{${L_STATE}}&''),FIND('"offer":',{${L_STATE}}&''))` });
   for (const lead of leads) {
     const f = lead.fields;
@@ -2638,24 +2641,28 @@ async function handleCallTimeReply(lead, from, text) {
   if (!iso || out.other) return false; // let the normal reply handling deal with it
   const when = melbWhen(iso);
   const first = firstName(f[L.name]) || f[L.name];
-  const reply = `Thanks ${firstName(f[L.name]) || ''} – ${agentFirst} will call you ${when}. – Alex, Stone Ballarat`.replace('Thanks  –', 'Thanks –');
-  const sid = await sendSMS(from, reply); await logOut(lead, reply, 'Other', sid);
+  const draft = `Thanks${firstName(f[L.name]) ? ' ' + firstName(f[L.name]) : ''} – ${agentFirst} will call you ${when}. – Alex, Stone Ballarat`;
   const state = getState(lead); delete state.awaitingCallTime;
   await setState(lead.id, state, { [L_CALL_AT]: iso, [L.nextAction]: `Call ${first} – ${when}`, [L.nextActionDate]: new Date(iso).toLocaleDateString('en-CA', { timeZone: TZ }) });
-  await noticeAgent(await getRecord(T.leads, lead.id), `${leadLabel(f)} replied – call them ${when}. It's on the card and I'll remind you 15 minutes before.`);
+  const o = await offerDraft(lead, 'Call confirmation', draft, `${leadLabel(f)} replied "${String(text).slice(0, 120)}" – I've put a call on the card for ${when} and I'll remind you 15 minutes before. Want me to confirm it with ${first}?`);
+  await noticeAgent(await getRecord(T.leads, lead.id), o.text + `\n(Or text me a different time, e.g. "${first} Mon 10am".)`);
   return true;
 }
 
 // ---------------------------------------------------------------- Appraisal Booked: confirmation, thank-you, escalation
 // Offers go to the agent with a code: YES A12 sends it, EDIT A12 [wording] sends their wording, NO A12 skips it.
-async function offerText(lead, agent, purpose, draft, intro) {
+async function offerDraft(lead, purpose, draft, intro) {
   const code = await nextCode();
   await createRecord(T.messages, {
     [M.code]: code, [M.lead]: [lead.id], [M.direction]: 'To vendor', [M.purpose]: purpose, [M.status]: 'Awaiting approval',
     [M.draft]: draft, [M.reasoning]: intro, [M.number]: normalisePhone(lead.fields[L.phone])
   });
-  await textAgent(agent, `${intro}\n"${draft}"\nReply YES ${code} · EDIT ${code} [your wording] · NO ${code}`);
-  return code;
+  return { code, text: `${intro}\n"${draft}"\nReply YES ${code} · EDIT ${code} [your wording] · NO ${code}` };
+}
+async function offerText(lead, agent, purpose, draft, intro) {
+  const o = await offerDraft(lead, purpose, draft, intro);
+  await textAgent(agent, o.text);
+  return o.code;
 }
 let lastEscalateDate = null;
 async function appraisalTick() {

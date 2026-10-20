@@ -420,9 +420,10 @@ const TRACKS = {
   4: { label: 'Track 4 · monthly', days: 30, seq: ['sale', 'tip', 'suburb', 'ask'], ask: 'full' },
   // Cold / no contact: every 2 months, market news first, an in-person price update offer every 4th text, never paused for silence
   5: { label: 'Track 5 · cold, every 2 months', days: 60, seq: ['market', 'sale', 'tip', 'ask'], ask: 'price', neverPause: true },
-  // Annual check-in: recently moved in / settled, or just a yearly touch. One friendly text a year: local market + an easy price-update offer.
-  6: { label: 'Track 6 · annual check-in', days: 365, seq: ['annual'], ask: null, neverPause: true,
-       goal: 'This person has recently bought/moved in or settled, or simply gets one friendly text a year from us so we stay front of mind. They are not selling. Keep it light and neighbourly - no selling tips and no pressure.' },
+  // Annual check-in: recently moved in / settled, or a light touch to stay front of mind. A friendly text every 6 months
+  // (alternating a check-in with a price-update offer and a plain local market update); the agent reviews the card each year.
+  6: { label: 'Track 6 · annual check-in, 6-monthly text', days: 182, seq: ['annual', 'annual-market'], ask: null, neverPause: true,
+       goal: 'This person has recently bought/moved in or settled, or simply gets a friendly text from us every six months so we stay front of mind. They are not selling. Keep it light and neighbourly - no selling tips and no pressure.' },
   // Rental providers / landlords whose property Stone manages: quarterly, investor angle, never property-management matters.
   7: { label: 'Track 7 · rental provider, quarterly', days: 90, seq: ['sale', 'market', 'ask'], ask: 'investor', neverPause: true,
        goal: 'This person is a rental provider (landlord) - the property on the card is their investment property, leased through Stone Ballarat\'s property management team. Talk about it as their investment property, never as their home. The aim is to stay front of mind as their local sales contact for a price update or appraisal, market advice, or help if they ever want to sell or buy another investment property. Never mention rent, tenants, the lease, repairs or anything the property management team handles, and never give financial or tax advice.' }
@@ -623,11 +624,19 @@ function nurtureState(leadFields, msgs) {
 async function planNurture(lead, st) {
   const address = lead.fields[L.address] || '';
   let type = st.t.seq[st.n % st.t.seq.length];
+  if (type === 'annual-market') {
+    const wrap = (await suburbWrap(address, st.used)) || (await ballaratWrap(st.used));
+    return {
+      key: 'annual-market:' + melbNow().date.slice(0, 7), label: '6-monthly market update',
+      brief: 'Write a short, friendly half-yearly hello' + (wrap ? ` sharing this local market snapshot in plain words: ${wrap.fact}.` : ' letting them know the agent is around if they ever have a property question.') +
+        ' No offer, no questions they have to answer, zero pressure.'
+    };
+  }
   if (type === 'annual') {
     const wrap = (await suburbWrap(address, st.used)) || (await ballaratWrap(st.used));
     return {
-      key: 'annual:' + melbNow().date.slice(0, 4), label: 'annual check-in',
-      brief: 'Write their once-a-year check-in. Hope they are enjoying the place/the area' + (wrap ? `, share this quick local market snapshot in plain words: ${wrap.fact},` : ',') +
+      key: 'annual:' + melbNow().date.slice(0, 7), label: 'annual check-in',
+      brief: 'Write their half-yearly check-in. Hope they are enjoying the place/the area' + (wrap ? `, share this quick local market snapshot in plain words: ${wrap.fact},` : ',') +
         ' and mention in one easy sentence that if they are ever curious what their place is worth, the agent is happy to pop out for a no-obligation price update (an accurate figure needs a visit - never give a price by text). No questions they have to answer, zero pressure.'
     };
   }

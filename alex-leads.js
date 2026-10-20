@@ -9,6 +9,9 @@
 //   end-of-day move to No Contact; outside business hours Alex engages straight away (opener, details, qualify,
 //   appraisal or call time) and asks the agent ALEX / CALL at 8am if there's no reply
 // - One 9:30am check-in text per agent (No Contact days 1/3/5, tasks due, lost reasons) and an after-appraisal question
+// - Listed (Won): texts Fiona and the agent; chases the agent if Fiona says the authority hasn't arrived
+// - Lost cards: 3-month check-in for "selling privately", Track 6 after 6 months for "not selling"
+// (The 7:45 / 12:30 / 5pm email digests and the Monday lost list are Airtable automations.)
 // - Replies from vendors: logged, Key Facts / track / follow-up updated, reply drafted for Stu's approval
 // - Creates new vendor enquiries in Airtable (Entered Via = Alex) instead of Pipedrive
 // Parked cards (Parked for test) are ignored.
@@ -1054,8 +1057,9 @@ async function sweep() {
       lastDigestDate = today;
     }
 
-    // 3. Track 8 housekeeping (sold / agreement ended), once a day
+    // 3. Track 8 housekeeping (sold / agreement ended) and lost-card follow-ups, once a day
     await track8Housekeeping();
+    await lostHousekeeping();
 
     // 4. nurture texts: draft in the morning, preview at 12, send from 2pm
     if (now.hour < PREVIEW_HOUR) await scheduleNurtureDrafts();
@@ -1683,6 +1687,136 @@ async function checkinTick() {
 
 let fastTimer = null;
 
+// ---------------------------------------------------------------- Part 3: signed-up handover to Fiona, lost-card follow-ups
+// When a card reaches Listed (Won) the Airtable automation creates the listing in Listing Onboarding (0. Awaiting Authority).
+// Alex then texts Fiona and confirms to the agent. If Fiona replies that the authority hasn't arrived, Alex chases the agent
+// and keeps a task on the card until the listing's Authority Signed Date is filled in (or Fiona says she has it).
+const LISTINGS = 'tbl7rq0yT4S55joAJ';
+const LST = { address: 'fldSRLtRIu0xYW1O3', authDate: 'fldnvCHHO6Doclbib' };
+const L_LISTING = 'fldzRjMIf6xgaD3kE';
+const FIONA_FALLBACK_MOBILE = '+61412185313';
+
+async function fionaRow() { return (await teamRows()).find(t => /^fiona\b/i.test(String(t.fields[TM.name] || ''))) || null; }
+async function textFiona(text) {
+  const f = await fionaRow();
+  const to = f && isTextableMobile(f.fields[TM.mobile]) ? normalisePhone(f.fields[TM.mobile]) : FIONA_FALLBACK_MOBILE;
+  await sendSMS(to, text);
+}
+
+async function wonTick() {
+  if (!sweepEnabled()) return;
+  const c = melbClock();
+  const agents = await alexActiveAgentIds();
+  if (!agents.size) return;
+  const won = (await listAll(T.leads, { filterByFormula: `AND({${L.stage}}='Listed (Won)',NOT({${L_PARKED}}))` }))
+    .filter(l => (l.fields[L.agent] || []).some(id => agents.has(id)));
+  for (const lead of won) {
+    const f = lead.fields;
+    const state = getState(lead);
+    if (state.authorityReceived) continue;
+    const agent = await agentOfLead(lead);
+    const agentFirst = agent ? firstName(agent.fields[TM.name]) : 'the agent';
+    const address = f[L.address] || f[L.name];
+    try {
+      // the listing's Authority Signed Date filled in = Fiona has the authority
+      const listingId = (f[L_LISTING] || [])[0];
+      if (listingId) {
+        const listing = await getRecord(LISTINGS, listingId).catch(() => null);
+        if (listing && listing.fields[LST.authDate]) {
+          state.authorityReceived = true;
+          const upd = /signed authority/i.test(f[L.nextAction] || '') ? { [L.nextAction]: '', [L.nextActionDate]: null } : {};
+          await setState(lead.id, state, upd);
+          continue;
+        }
+      }
+      const enteredRecently = !f[L_STAGE_ENTERED] || f[L_STAGE_ENTERED] >= addDays(c.date, -3);
+      if (!state.fionaTexted && enteredRecently && isBH(c)) {
+        if (!listingId) { // give the Airtable automation a few minutes to create the listing
+          if (!state.wonSeenAt) { state.wonSeenAt = new Date().toISOString(); await setState(lead.id, state); continue; }
+          if (minutesSince(state.wonSeenAt) < 4) continue;
+        }
+        await textFiona(`Hey Fiona, it looks like ${agentFirst} has signed up ${address}. I've sent this to the onboarding pipeline while you await the authority hard copy/email. If you don't have it in the next few hours, let me know and I'll follow up ${agentFirst} for you.`);
+        await textAgent(agent, `Done – ${address} is with Fiona for onboarding (0. Awaiting Authority). If you haven't already, email the signed authority to Fiona or drop the hard copy on her desk.`);
+        state.fionaTexted = new Date().toISOString();
+        await setState(lead.id, state, { [L_ALEX_STATUS]: 'Done' });
+        await logActivity(lead.id, { summary: 'Alex told Fiona the vendor signed up – listing is in Listing Onboarding (0. Awaiting Authority)', type: 'General', kind: 'History' });
+      }
+    } catch (e) { console.error('Alex leads: won handover failed for ' + lead.id, e.message); }
+  }
+}
+
+// Fiona's replies about authorities
+async function handleFionaSMS(member, text, reply) {
+  const pending = (await listAll(T.leads, { filterByFormula: `AND({${L.stage}}='Listed (Won)',FIND('"fionaTexted"',{${L_STATE}}&''),NOT(FIND('"authorityReceived":true',{${L_STATE}}&'')))` }));
+  if (!pending.length) return false;
+  const words = text.toLowerCase();
+  let lead = pending.length === 1 ? pending[0] : pending.find(l => {
+    const a = String(l.fields[L.address] || '').toLowerCase().split(/[\s,]+/).filter(w => w.length > 2 && !/^\d+$/.test(w));
+    return a.some(w => words.includes(w));
+  });
+  const notYet = /(not|haven'?t|hasn'?t|no|nothing|still)\b.*\b(received|got|arrived|come|in|here|yet)|not here|chase|no authority|missing/i.test(text);
+  const gotIt = !notYet && /\b(got it|received|have it|arrived|all good|it'?s here|thanks)\b/i.test(text);
+  if (!notYet && !gotIt) return false;
+  if (!lead) { await reply(`Which one? ${pending.map(l => l.fields[L.address] || l.fields[L.name]).join(' · ')}`); return true; }
+  const state = getState(lead);
+  const agent = await agentOfLead(lead);
+  const agentFirst = agent ? firstName(agent.fields[TM.name]) : 'the agent';
+  const address = lead.fields[L.address] || lead.fields[L.name];
+  if (gotIt) {
+    state.authorityReceived = true;
+    await setState(lead.id, state, /signed authority/i.test(lead.fields[L.nextAction] || '') ? { [L.nextAction]: '', [L.nextActionDate]: null } : {});
+    await reply(`Thanks Fiona – noted that you have the authority for ${address}.`);
+    return true;
+  }
+  await textAgent(agent, `Fiona hasn't received the authority for ${address} yet – can you email it or drop it to her desk?`);
+  await updateRecord(T.leads, lead.id, { [L.nextAction]: `Get the signed authority for ${address} to Fiona`, [L.nextActionDate]: melbClock().date });
+  await logActivity(lead.id, { summary: `Fiona hasn't received the authority – ${agentFirst} asked to send it`, type: 'General', kind: 'History' });
+  await reply(`Thanks Fiona – I've asked ${agentFirst} to get it to you, and it's a task on the card until you have it.`);
+  return true;
+}
+
+// Lost cards: "Selling privately" gets one friendly check-in after 3 months (goes out with the midday preview);
+// "Not selling" moves to Track 6 · Annual check-in after 6 months. Runs once a day.
+let lastLostDate = null;
+async function lostHousekeeping() {
+  const today = melbNow().date;
+  if (lastLostDate === today) return;
+  lastLostDate = today;
+  const agents = await alexActiveAgentIds();
+  const lost = (await listAll(T.leads, { filterByFormula: `AND({${L.stage}}='Lost / Not Progressing',NOT({${L_PARKED}}),NOT({${L.doNotContact}}),{${L.followUp}}!='',IS_BEFORE({${L.followUp}},DATEADD(TODAY(),1,'days')))` }))
+    .filter(l => (l.fields[L.agent] || []).some(id => agents.has(id)));
+  for (const lead of lost) {
+    const f = lead.fields;
+    const reason = sel(f[L_LOST_REASON]);
+    try {
+      if (/not selling/i.test(reason)) {
+        await updateRecord(T.leads, lead.id, { [L.stage]: 'Nurture', [L.nurtureReason]: 'Annual check-in (recently settled / yearly touch)' });
+        // the Airtable automation sets the first check-in 6 months out; this one is due now
+        setTimeout(() => updateRecord(T.leads, lead.id, { [L.followUp]: today }).catch(e => console.error('Alex leads: annual follow-up reset failed', e.message)), 60000);
+        await logActivity(lead.id, { summary: 'Not selling 6 months ago – moved to Track 6 · Annual check-in', type: 'General', kind: 'History' });
+      } else if (/privately/i.test(reason) && isTextableMobile(f[L.phone])) {
+        const ctx = await leadContext(lead);
+        const opening = smsOpening(ctx, false);
+        const out = await claudeJSON(VOICE, `AGENT: ${ctx.agent ? ctx.agent.name : 'the agent'}\nLEAD CARD: ${JSON.stringify(ctx.card)}\n\nNOTES & HISTORY:\n${historyText(ctx.history)}\n\n` +
+          `TASK: About three months ago they told us they were selling privately. Write ONE friendly check-in: ask how the sale went, and say in one easy sentence that if it's still on the market or they'd like a hand, the agent is happy to help – no pressure. ` +
+          `The message will automatically start with: "${opening}" - write ONLY what comes after that. Return JSON only: {"sms": "..."}`, 400);
+        let body = String(out.sms || '').trim().replace(/^(hey|hi|hello)\b[^,.!]*[,.!]\s*/i, '');
+        if (/^[A-Z][a-z]/.test(body) && !/^I\b/.test(body)) body = body.charAt(0).toLowerCase() + body.slice(1);
+        if (body) {
+          const code = await nextCode();
+          await createRecord(T.messages, {
+            [M.code]: code, [M.lead]: [lead.id], [M.direction]: 'To vendor', [M.purpose]: 'Other', [M.status]: 'Scheduled',
+            [M.draft]: opening + ' ' + body, [M.reasoning]: 'Lost – selling privately, text 1: 3-month check-in on their private sale.', [M.number]: normalisePhone(f[L.phone])
+          });
+        }
+        await updateRecord(T.leads, lead.id, { [L.followUp]: null });
+      } else {
+        await updateRecord(T.leads, lead.id, { [L.followUp]: null });
+      }
+    } catch (e) { console.error('Alex leads: lost housekeeping failed for ' + lead.id, e.message); }
+  }
+}
+
 // ---------------------------------------------------------------- texts from the team
 // Agents (and Stu) text Alex's number. In order, Alex:
 //  1. handles UNDO / YES for its last card change,
@@ -1926,7 +2060,10 @@ async function handleTeamSMS(from, body) {
   // 4. Stu's approval flow
   if (approver && parsed && await handleApproverSMS(text)) return true;
 
-  // 5. a card update from an Alex-active agent (including answers to the 9:30 check-in)
+  // 5. Fiona replying about an authority
+  if (member && /^fiona\b/i.test(String(member.fields[TM.name] || '')) && await handleFionaSMS(member, text, reply)) return true;
+
+  // 6. a card update from an Alex-active agent (including answers to the 9:30 check-in)
   if (member && member.fields[TM.alexActive]) {
     try { await handleAgentUpdate(member, from, text, reply); }
     catch (e) { console.error('Alex leads: agent update failed', e.message); await reply("Sorry, I couldn't process that – please update the card in Airtable."); }
@@ -1967,6 +2104,7 @@ function start() {
   const fast = async () => {
     try { await newLeadTick(); } catch (e) { console.error('Alex leads: new lead tick failed', e.message); }
     try { await checkinTick(); } catch (e) { console.error('Alex leads: check-in tick failed', e.message); }
+    try { await wonTick(); } catch (e) { console.error('Alex leads: won tick failed', e.message); }
   };
   fastTimer = setInterval(fast, 2 * 60000);
   setTimeout(fast, 45000);

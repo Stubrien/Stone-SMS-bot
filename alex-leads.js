@@ -19,6 +19,9 @@
 //   (YES / EDIT / NO + code), handles "can we move it?" via the agent, tells Fiona if the card hasn't moved 2 business days on
 // - Qualifying 14 days, Decision Pending 21 days and cards with no next step come up in the 9:30 check-in;
 //   a sent price update gets an "Any reaction?" task 3 business days out
+// - Team texts go to a tool-using assistant: it searches/opens/lists/updates/creates cards, follows the editable
+//   playbook (zAlex Playbook table), remembers the conversation (Team → zAlex Chat) and asks when unsure
+//   (env ALEX_ASSISTANT=off for the older one-shot reader; ALEX_ASSISTANT_MODEL to pick the model)
 // - Agents add new contacts by text (name, mobile, address, source) – duplicates are caught, UNDO removes it
 // - Every confirmation to a contact (appraisal / meeting times, call times, day-before reminders, thank-yous) is
 //   drafted for the agent first: YES / EDIT / NO + code; approved after hours, it goes at 8am
@@ -2381,10 +2384,13 @@ async function handleTeamSMS(from, body) {
   let pend = pendingByPhone.get(key);
   if (pend && Date.now() - pend.at > PENDING_MINUTES * 60000) { pendingByPhone.delete(key); pend = null; }
   if (/^undo\b/i.test(text)) {
-    if (pend && pend.kind === 'undo' && pend.created) {
-      await at('DELETE', T.leads + '/' + pend.created);
+    const createdIds = pend && pend.kind === 'undo' ? [].concat(pend.created || []) : [];
+    if (createdIds.length && !(pend.items || []).length) {
+      for (const id of createdIds) await at('DELETE', T.leads + '/' + id);
       pendingByPhone.delete(key);
-      await reply(`Undone – ${pend.summary.replace(/ added$/, '')} removed.`);
+      if (typeof leadsChanged === 'function') leadsChanged();
+      await reply(`Undone – ${pend.summary.replace(/ added$/, '').replace(/^created /, '')} removed.`);
+      if (member) await rememberTurn(member, 'UNDO', 'Undone: ' + pend.summary);
       return true;
     }
     if (!pend || pend.kind !== 'undo' || !(pend.items || []).length) { await reply('Nothing to undo (a ticked-off task can be set again on the card).'); return true; }
@@ -2392,8 +2398,11 @@ async function handleTeamSMS(from, body) {
       await updateRecord(T.leads, it.leadId, it.prev);
       await logActivity(it.leadId, { summary: 'Card change by text undone', detail: pend.summary, type: 'General', kind: 'History' });
     }
+    for (const id of createdIds) await at('DELETE', T.leads + '/' + id);
     pendingByPhone.delete(key);
+    leadsChanged();
     await reply(`Undone:\n${pend.summary}`);
+    if (member) await rememberTurn(member, 'UNDO', 'Undone: ' + pend.summary);
     return true;
   }
   if (pend && pend.kind === 'confirm') {
@@ -2431,14 +2440,23 @@ async function handleTeamSMS(from, body) {
       return true;
     }
   }
-  // 4. Stu's approval flow
-  if (approver && parsed && await handleApproverSMS(text)) return true;
+  // 4. Stu's approval flow. A bare "yes"/"no" with no code goes to the assistant instead when it asked something in the
+  //    last 2 hours, or when no draft is waiting for approval.
+  const assistantAsked = member && assistantOn() && (() => { const c = chatOf(member).at(-1); return c && c.r === 'alex' && /\?/.test(c.t) && minutesSince(c.at) < 120; })();
+  const bareReply = parsed && !parsed.code && ['YES', 'NO'].includes(parsed.cmd);
+  if (approver && parsed && !(bareReply && (assistantAsked || !(await waitingDrafts()).length)) && await handleApproverSMS(text)) return true;
 
   // 5. Fiona replying about an authority
   if (member && /^fiona\b/i.test(String(member.fields[TM.name] || '')) && await handleFionaSMS(member, text, reply)) return true;
 
   // 6. a card update from an Alex-active agent (including answers to the 9:30 check-in)
   if (member && member.fields[TM.alexActive]) {
+    if (assistantOn()) {
+      // answered in the background (several AI steps can take longer than Twilio waits); one person's texts stay in order
+      const job = enqueueAssistant(key, () => runAssistant(member, from, text, reply));
+      if (process.env.ALEX_ASSISTANT_WAIT) await job;
+      return true;
+    }
     try { await handleAgentUpdate(member, from, text, reply, pendingCard); }
     catch (e) { console.error('Alex leads: agent update failed', e.message); await reply("Sorry, I couldn't process that – please update the card in Airtable."); }
     return true;
@@ -2859,6 +2877,321 @@ async function createCardFromText(member, nc, rawText) {
   return { createdId: rec.id, reply: `Done: ${nc.name}${nc.address ? ', ' + nc.address : ''} → ${stage}${when}${track}.${extra}` };
 }
 
+
+// ---------------------------------------------------------------- team assistant (tool-using)
+// Texts from Alex-active team members that aren't a command (CALL / ALEX, a code, UNDO, Fiona's authority replies) go to
+// the assistant. It works in steps with tools – search, open, list, update and create cards, add notes – reads the
+// playbook (zAlex Playbook table: glossary, tracks, rules), remembers the last 20 messages with each person (Team →
+// zAlex Chat), and asks when it isn't sure. Guard rails are in code: valid values only, agents change only their own
+// cards (Stu any), big changes need the person's yes first, and nothing is ever texted to a contact from here.
+// ALEX_ASSISTANT=off falls back to the older one-shot reader.
+const PLAYBOOK_TABLE = 'tblZtfnktcD2SzhKL';
+const PB = { title: 'fldcj6s3mBZMQbyzx', kind: 'fldnEfcnvTxuNl4Qd', text: 'fldBtf9Mtemdm6Y6y', active: 'fldTSqqnNfEneMfR8', order: 'fld4eZkWoTWT66PGh' };
+const TM_CHAT = 'fldSxqIRmD1WsmJfF';
+const CHAT_KEEP = 20;
+const ASSIST_MAX_STEPS = 8;
+
+function assistantOn() { return String(process.env.ALEX_ASSISTANT || 'on').toLowerCase() !== 'off'; }
+async function assistantCall(params) { return anthropic.messages.create(params); }
+
+let playbookCache = { at: 0, text: '' };
+async function playbookText() {
+  if (Date.now() - playbookCache.at < 10 * 60000 && playbookCache.text) return playbookCache.text;
+  try {
+    const rows = (await listAll(PLAYBOOK_TABLE, {})).filter(r => r.fields[PB.active])
+      .sort((a, b) => (a.fields[PB.order] || 999) - (b.fields[PB.order] || 999));
+    playbookCache = { at: Date.now(), text: rows.map(r => `• [${sel(r.fields[PB.kind]) || 'Note'}] ${r.fields[PB.title] || ''}: ${r.fields[PB.text] || ''}`).join('\n') };
+  } catch (e) { console.error('Alex leads: playbook load failed', e.message); }
+  return playbookCache.text;
+}
+
+let leadsCache = { at: 0, rows: [] };
+async function allLeads() {
+  if (Date.now() - leadsCache.at < 60000) return leadsCache.rows;
+  leadsCache = { at: Date.now(), rows: await listAll(T.leads, {}) };
+  return leadsCache.rows;
+}
+function leadsChanged() { leadsCache.at = 0; }
+
+function digits(s) { return String(s || '').replace(/\D/g, ''); }
+function briefCard(l, team) {
+  const f = l.fields;
+  const agent = (f[L.agent] || []).map(id => (team.find(t => t.id === id) || { fields: {} }).fields[TM.name] || '').filter(Boolean).join(', ') || 'no agent';
+  const st = sel(f[L.stage]);
+  const bits = [l.id, f[L.name] || '(no name)', f[L.address] || '', f[L.phone] || '', 'agent: ' + agent, st];
+  if (st === 'Nurture') bits.push('track: ' + (sel(f[L.nurtureReason]) || 'not set'));
+  if (f[L.nextAction]) bits.push(`task: ${f[L.nextAction]}${f[L.nextActionDate] ? ' (due ' + f[L.nextActionDate] + ')' : ''}`);
+  if (f[L_APPT_AT]) bits.push('appraisal ' + melbWhen(f[L_APPT_AT]));
+  if (f[L_MTG_AT]) bits.push('listing meeting ' + melbWhen(f[L_MTG_AT]));
+  if (f[L_CALL_AT]) bits.push('call ' + melbWhen(f[L_CALL_AT]));
+  if (f[L_LOST_REASON]) bits.push('lost: ' + sel(f[L_LOST_REASON]));
+  const flags = [f[L_PRIORITY] && 'Priority', f[L.doNotContact] && 'Do Not Contact', f[L.pauseAlex] && 'Alex paused', f[L_PARKED] && 'Parked for test'].filter(Boolean);
+  if (flags.length) bits.push(flags.join(', '));
+  const offer = getState(l).offer;
+  if (offer && offer.options) bits.push(`${offer.kind} time options offered: ${offer.options.map((iso, i) => `${i + 1}) ${melbWhen(iso)} [${new Date(iso).toLocaleString('sv-SE', { timeZone: TZ }).slice(0, 16).replace(' ', 'T')}]`).join(', ')}`);
+  return bits.join(' | ');
+}
+
+// ---- conversation memory (Team → zAlex Chat)
+function chatOf(member) { try { return JSON.parse(member.fields[TM_CHAT] || '[]') || []; } catch (e) { return []; } }
+async function saveChat(member, turns) {
+  member.fields[TM_CHAT] = JSON.stringify(turns.slice(-CHAT_KEEP));
+  try { await updateRecord(T.team, member.id, { [TM_CHAT]: member.fields[TM_CHAT] }); } catch (e) { console.error('Alex leads: chat save failed', e.message); }
+}
+async function rememberTurn(member, userText, alexText) {
+  if (!member) return;
+  const now = new Date(Date.now()).toISOString();
+  await saveChat(member, chatOf(member).concat([{ r: 'user', t: userText, at: now }, { r: 'alex', t: alexText, at: now }]));
+}
+
+// ---- the tools Alex can use
+const ASSIST_TOOLS = [
+  { name: 'search_cards', description: 'Find lead cards by name, address, suburb or phone, across all agents and all stages (including Nurture, Lost and Parked). Use this whenever a person or property is mentioned.',
+    input_schema: { type: 'object', properties: { query: { type: 'string', description: 'A name, part of an address, suburb or phone number' } }, required: ['query'] } },
+  { name: 'get_card', description: 'Open one card: all its details, recent history notes and recent texts.',
+    input_schema: { type: 'object', properties: { card_id: { type: 'string' } }, required: ['card_id'] } },
+  { name: 'list_cards', description: 'List cards to answer questions like "what\'s on my plate today", "who is in Decision Pending", "my overdue tasks", "Leanne\'s cold nurture contacts".',
+    input_schema: { type: 'object', properties: {
+      agent: { type: 'string', description: '"me" (default), "all", or an agent\'s name' },
+      stage: { type: 'string', description: 'A stage name, or empty' },
+      nurture_reason: { type: 'string', description: 'A nurture reason, or empty' },
+      due: { type: 'string', enum: ['', 'overdue', 'today', 'this_week'], description: 'Filter by task due date' },
+      priority_only: { type: 'boolean' }, limit: { type: 'number' } } } },
+  { name: 'update_card', description: 'Change a card. Only set what the person asked for. Times are Melbourne local "YYYY-MM-DDTHH:MM", dates "YYYY-MM-DD". Big changes (Lost, Listed (Won), Do Not Contact, changing the agent, someone else\'s card) need confirmed=true, which you may only set after the person has said yes to exactly that change.',
+    input_schema: { type: 'object', properties: {
+      card_id: { type: 'string' },
+      changes: { type: 'object', properties: {
+        stage: { type: 'string' }, nurture_reason: { type: 'string' }, lost_reason: { type: 'string' },
+        next_action: { type: 'string' }, next_action_date: { type: 'string' }, complete_task: { type: 'boolean' },
+        appraisal_at: { type: 'string' }, listing_meeting_at: { type: 'string' }, call_at: { type: 'string' }, no_answer: { type: 'boolean', description: 'The agent called at the agreed time and got no answer' },
+        authority_ends: { type: 'string' }, priority: { type: 'boolean' }, do_not_contact: { type: 'boolean' }, pause_alex: { type: 'boolean' },
+        vendor_price_expectation: { type: 'string' }, agent_price_guide: { type: 'string' }, decision_makers: { type: 'string' }, other_agents: { type: 'string' },
+        source: { type: 'string' }, source_detail: { type: 'string' }, name: { type: 'string' }, mobile: { type: 'string' }, email: { type: 'string' }, address: { type: 'string' },
+        key_fact: { type: 'string', description: 'A short fact to add to Key Facts' }, agent: { type: 'string', description: 'Reassign to this agent (Stu only)' } } },
+      note: { type: 'string', description: 'Anything worth logging on the card' },
+      confirmed: { type: 'boolean' } }, required: ['card_id', 'changes'] } },
+  { name: 'add_note', description: 'Log a note on a card without changing anything else.',
+    input_schema: { type: 'object', properties: { card_id: { type: 'string' }, note: { type: 'string' } }, required: ['card_id', 'note'] } },
+  { name: 'create_card', description: 'Add a new contact (someone not already on a card – search first). Needs name, mobile and address; ask for anything missing before calling.',
+    input_schema: { type: 'object', properties: {
+      name: { type: 'string' }, mobile: { type: 'string' }, address: { type: 'string' }, email: { type: 'string' },
+      source: { type: 'string' }, source_detail: { type: 'string' }, stage: { type: 'string' }, appraisal_at: { type: 'string' }, call_at: { type: 'string' },
+      next_action: { type: 'string' }, next_action_date: { type: 'string' }, nurture_reason: { type: 'string' },
+      details: { type: 'object', properties: { beds: { type: 'number' }, baths: { type: 'number' }, block: { type: 'number' } } },
+      motivation: { type: 'string', enum: ['', 'Making a move', 'Just an update', 'Unsure'] }, timing: { type: 'string' }, notes: { type: 'string' },
+      agent: { type: 'string', description: 'Whose card it is, if not the sender\'s (Stu only)' } }, required: ['name'] } }
+];
+
+const BIG_STAGES = ['Lost / Not Progressing', 'Listed (Won)'];
+async function runTool(name, input, ctx) {
+  const team = await teamRows();
+  const mine = l => (l.fields[L.agent] || []).includes(ctx.member.id);
+  const canChange = l => ctx.admin || mine(l);
+  if (name === 'search_cards') {
+    const q = String(input.query || '').toLowerCase().trim();
+    if (!q) return 'Give me something to search for.';
+    const qd = digits(q).replace(/^61/, '0');
+    const words = q.split(/[\s,]+/).filter(w => w.length > 1);
+    const hits = (await allLeads()).filter(l => {
+      const f = l.fields;
+      const hay = `${f[L.name] || ''} ${f[L.address] || ''} ${f[L.email] || ''}`.toLowerCase();
+      if (qd.length >= 6 && digits(f[L.phone]).replace(/^61/, '0').includes(qd)) return true;
+      return words.length && words.every(w => hay.includes(w));
+    }).slice(0, 12);
+    return hits.length ? hits.map(l => briefCard(l, team)).join('\n') : 'No cards match "' + input.query + '".';
+  }
+  if (name === 'get_card') {
+    let l; try { l = await getRecord(T.leads, input.card_id); } catch (e) { return 'No card with id ' + input.card_id; }
+    const f = l.fields;
+    const pick = {};
+    for (const [k, id] of Object.entries(L)) if (f[id] !== undefined && !['activity', 'agent'].includes(k)) pick[k] = sel(f[id]);
+    for (const [k, id] of Object.entries(PROP)) if (f[id] !== undefined) pick[k] = sel(f[id]);
+    for (const [k, id] of [['appraisalAt', L_APPT_AT], ['listingMeetingAt', L_MTG_AT], ['callAt', L_CALL_AT], ['lostReason', L_LOST_REASON], ['authorityEnds', L_AUTH_ENDS], ['priority', L_PRIORITY], ['parked', L_PARKED], ['stageEntered', L_STAGE_ENTERED]])
+      if (f[id] !== undefined) pick[k] = /At$/.test(k) ? melbWhen(f[id]) : sel(f[id]);
+    let history = '';
+    const actIds = (f[L.activity] || []).slice(-8);
+    if (actIds.length) {
+      try {
+        const acts = await listAll(T.activity, { filterByFormula: 'OR(' + actIds.map(id => `RECORD_ID()='${id}'`).join(',') + ')' });
+        history = acts.sort((a, b) => String(a.fields[A.loggedAt] || a.createdTime) < String(b.fields[A.loggedAt] || b.createdTime) ? -1 : 1)
+          .map(a => `${String(a.fields[A.loggedAt] || a.createdTime).slice(0, 10)} ${a.fields[A.summary] || ''}${a.fields[A.detail] ? ' – ' + String(a.fields[A.detail]).slice(0, 160) : ''}`).join('\n');
+      } catch (e) { /* ignore */ }
+    }
+    let texts = '';
+    try { texts = (await leadMessages(f)).slice(-6).map(m => `${sel(m.fields[M.direction]) === 'From vendor' ? 'CONTACT' : 'ALEX'}: ${String(m.fields[M.finalText] || m.fields[M.draft] || '').slice(0, 200)}`).join('\n'); } catch (e) { /* ignore */ }
+    return `${briefCard(l, team)}\nDETAILS: ${JSON.stringify(pick)}\nHISTORY:\n${history || '(none)'}\nRECENT TEXTS:\n${texts || '(none)'}`;
+  }
+  if (name === 'list_cards') {
+    const who = String(input.agent || 'me').toLowerCase();
+    const today = melbNow().date;
+    let rows = (await allLeads()).filter(l => !l.fields[L_PARKED]);
+    if (who === 'me' || !who) rows = rows.filter(mine);
+    else if (who !== 'all') { const a = await matchAgent(input.agent); rows = a ? rows.filter(l => (l.fields[L.agent] || []).includes(a.id)) : []; }
+    if (input.stage) rows = rows.filter(l => sel(l.fields[L.stage]).toLowerCase() === String(input.stage).toLowerCase());
+    if (input.nurture_reason) rows = rows.filter(l => sel(l.fields[L.nurtureReason]).toLowerCase() === String(input.nurture_reason).toLowerCase());
+    if (input.priority_only) rows = rows.filter(l => l.fields[L_PRIORITY]);
+    const d = l => l.fields[L.nextActionDate] || '';
+    if (input.due === 'overdue') rows = rows.filter(l => d(l) && d(l) < today);
+    if (input.due === 'today') rows = rows.filter(l => d(l) && d(l) <= today);
+    if (input.due === 'this_week') rows = rows.filter(l => d(l) && d(l) <= addDays(today, 7));
+    if (input.due) rows.sort((a, b) => d(a) < d(b) ? -1 : 1);
+    const n = rows.length;
+    return n ? `${n} card${n === 1 ? '' : 's'}${n > (input.limit || 25) ? ' (first ' + (input.limit || 25) + ')' : ''}:\n` + rows.slice(0, input.limit || 25).map(l => briefCard(l, team)).join('\n') : 'No cards match.';
+  }
+  if (name === 'add_note') {
+    let l; try { l = await getRecord(T.leads, input.card_id); } catch (e) { return 'No card with id ' + input.card_id; }
+    if (!canChange(l)) return `That's ${briefCard(l, team).split(' | ')[4]}'s card – only they or Stu can add to it.`;
+    await logActivity(l.id, { summary: `${ctx.author}: ${String(input.note).slice(0, 200)}`, detail: `Text: "${ctx.text}"`, type: 'SMS', kind: 'Note' });
+    ctx.done.push(`noted on ${l.fields[L.name]}`);
+    return 'Noted.';
+  }
+  if (name === 'update_card') {
+    let l; try { l = await getRecord(T.leads, input.card_id); } catch (e) { return 'No card with id ' + input.card_id; }
+    if (!canChange(l)) return `REFUSED: that's ${briefCard(l, team).split(' | ')[4].replace('agent: ', '')}'s card – only they or Stu can change it. Tell the person.`;
+    const c = Object.assign({}, input.changes || {});
+    const errs = [];
+    if (c.stage && !STAGE_LIST.includes(c.stage)) errs.push(`stage "${c.stage}" isn't one of: ${STAGE_LIST.join('; ')}`);
+    if (c.nurture_reason && !NURTURE_REASONS.includes(c.nurture_reason)) errs.push(`nurture_reason "${c.nurture_reason}" isn't one of: ${NURTURE_REASONS.join('; ')}`);
+    if (c.lost_reason && !LOST_REASONS.includes(c.lost_reason)) errs.push(`lost_reason "${c.lost_reason}" isn't one of: ${LOST_REASONS.join('; ')}`);
+    if (c.source && !SOURCE_LIST.includes(c.source)) errs.push(`source "${c.source}" isn't one of: ${SOURCE_LIST.join('; ')}`);
+    for (const k of ['appraisal_at', 'listing_meeting_at', 'call_at']) if (c[k] && !melbToISO(c[k])) errs.push(`${k} must be "YYYY-MM-DDTHH:MM"`);
+    for (const k of ['next_action_date', 'authority_ends']) if (c[k] && !/^\d{4}-\d{2}-\d{2}$/.test(c[k])) errs.push(`${k} must be "YYYY-MM-DD"`);
+    if (c.agent && !ctx.admin) errs.push('only Stu can change the agent on a card');
+    if (c.stage === 'Lost / Not Progressing' && !c.lost_reason && !l.fields[L_LOST_REASON]) errs.push('a lost card needs lost_reason – ask why');
+    if (c.stage === 'Nurture' && !c.nurture_reason && !l.fields[L.nurtureReason]) errs.push('Nurture needs a nurture_reason (the track)');
+    if (errs.length) return 'NOT CHANGED: ' + errs.join('; ');
+    const big = BIG_STAGES.includes(c.stage) || c.do_not_contact === true || !!c.agent || !mine(l);
+    if (big && input.confirmed !== true) return 'NOT CHANGED: this is a big change – tell the person exactly what will change and ask them to confirm; call again with confirmed=true only after they say yes.';
+    const upd = fieldsFor(l, c);
+    if (c.stage === 'Nurture' && c.nurture_reason) upd[L.nurtureReason] = c.nurture_reason;
+    if (c.do_not_contact !== undefined) upd[L.doNotContact] = !!c.do_not_contact;
+    if (c.pause_alex !== undefined) upd[L.pauseAlex] = !!c.pause_alex;
+    if (c.priority === false) upd[L_PRIORITY] = false;
+    if (c.name) upd[L.name] = c.name;
+    if (c.mobile) { const m = normalisePhone(c.mobile); if (!isTextableMobile(m)) return 'NOT CHANGED: that mobile doesn\'t look right'; upd[L.phone] = m; }
+    if (c.email) upd[L.email] = c.email;
+    if (c.address) upd[L.address] = c.address;
+    if (c.key_fact) { const t = melbNow().date; upd[L.keyFacts] = ((l.fields[L.keyFacts] || '').trim() + `\n• ${c.key_fact} (${dmy(t)}/${t.slice(2, 4)}, via ${ctx.author})`).trim(); }
+    if (c.agent) { const a = await matchAgent(c.agent); if (!a) return `NOT CHANGED: no team member called "${c.agent}"`; upd[L.agent] = [a.id]; }
+    const after = { noAnswer: c.no_answer === true };
+    const statePatch = null;
+    if (!Object.keys(upd).length && !after.noAnswer) return 'NOT CHANGED: nothing to change (already set, or no recognised change).';
+    const prev = await applyCardChange(l.id, upd, input.note || '', ctx.author, ctx.text, statePatch);
+    delete prev[L_COMPLETE];
+    if (Object.keys(prev).length) ctx.undo.push({ leadId: l.id, prev });
+    leadsChanged();
+    let extra = '';
+    try { extra = (await afterCardChange(l.id, upd, after, null)).trim(); } catch (e) { console.error('Alex leads: after card change failed', e.message); }
+    const said = Object.entries(c).filter(([, v]) => v !== '' && v !== undefined && v !== null).map(([k, v]) => `${k}=${v}`).join(', ');
+    ctx.done.push(`${l.fields[L.name]}: ${said}`);
+    if (extra) ctx.extras.push(extra);
+    return 'DONE: ' + said + (extra ? '\nALSO (tell the person, word for word if it is a question with a code): ' + extra : '');
+  }
+  if (name === 'create_card') {
+    const nc = Object.assign({}, input);
+    const missing = ['name', 'mobile', 'address'].filter(k => k === 'mobile' ? !isTextableMobile(normalisePhone(nc.mobile || '') || '') : !String(nc[k] || '').trim());
+    if (missing.length) return 'NOT CREATED: missing ' + missing.join(', ') + ' – ask for them.';
+    if (nc.stage && !STAGE_LIST.includes(nc.stage)) return 'NOT CREATED: stage must be one of ' + STAGE_LIST.join('; ');
+    let owner = ctx.member;
+    if (nc.agent) { if (!ctx.admin) return 'NOT CREATED: only Stu can add a card for another agent'; const a = await matchAgent(nc.agent); if (!a) return `NOT CREATED: no team member called "${nc.agent}"`; owner = a; }
+    const res = await createCardFromText(owner, nc, ctx.text);
+    leadsChanged();
+    if (res.existingId) return 'ALREADY ON A CARD (' + res.existingId + '): ' + (res.reply || 'it is one of this person\'s cards – update that card instead.');
+    if (!res.createdId) return 'NOT CREATED: ' + (res.reply || 'unknown problem');
+    ctx.created.push(res.createdId);
+    ctx.done.push(`created ${nc.name}`);
+    return 'CREATED ' + res.createdId + ': ' + res.reply + (SOURCE_LIST.includes(nc.source) ? '' : ' (no lead source yet – ask where the lead came from)');
+  }
+  return 'Unknown tool ' + name;
+}
+
+function assistantSystem(ctx, playbook, cards, team, questions) {
+  const c = melbClock();
+  return `You are Alex, the sales assistant at Stone Real Estate Ballarat, texting with ${ctx.member.fields[TM.name]}${ctx.admin ? ' (the principal – may change any card)' : ' (a sales agent – may change only their own cards)'}.
+NOW: ${c.weekday} ${c.date} ${String(c.hour).padStart(2, '0')}:${String(c.minute).padStart(2, '0')} Melbourne time.
+
+You keep the team's Airtable sales pipeline up to date from their texts and answer their questions about it. You talk only to the team here – nothing you do sends a text to a contact (except the confirmations the tools offer, which the agent approves with a code).
+
+HOW TO WORK
+- When a person or property is mentioned, use search_cards (or the list below) to find the card. Never guess an id.
+- Work out what they mean using the PLAYBOOK. If it's clear, do it with the tools, then reply with what you did in one or two short lines.
+- If it isn't clear (two possible cards, an unknown phrase, a missing detail, a rule in the playbook says to check), ask ONE short question instead of acting. Offer the likely options, e.g. "Did you mean Track 5 · Cold (every 3 months)?".
+- Big changes need a yes first: the tools will tell you. When the person replies "yes" to your question, do exactly what you proposed.
+- Questions ("what's on my plate?", "when did we last hear from X?") → look it up and answer briefly.
+- Never invent facts, prices or dates. Times are Melbourne local "YYYY-MM-DDTHH:MM"; "Thursday" means the NEXT Thursday; "this afternoon 1:30" means today 13:30.
+- Replies are SMS: plain text, no markdown, under 500 characters unless listing cards. Use first names. No "Hi" every time.
+- If a tool says ALSO with a question and code (e.g. "Want me to send … YES A12"), include it in your reply exactly.
+
+VALID VALUES
+Stages: ${STAGE_LIST.join('; ')}
+Nurture reasons (tracks): ${NURTURE_REASONS.join('; ')}
+Lost reasons: ${LOST_REASONS.join('; ')}
+Sources: ${SOURCE_LIST.join('; ')}
+
+PLAYBOOK (how we work – follow it)
+${playbook || '(empty)'}
+${questions.length ? `\nQUESTIONS ALEX ASKED ${firstName(ctx.member.fields[TM.name]).toUpperCase()} TODAY (they may answer by number, e.g. "1 booked Thu 2pm, 2 sent, 3b"; options in a question map to the actions written beside them):\n${questions.map(q => `${q.n ? q.n + ' – ' : ''}[${q.leadId}] ${q.question}`).join('\n')}\n` : ''}
+${firstName(ctx.member.fields[TM.name]).toUpperCase()}'S ACTIVE CARDS (id | name | address | phone | agent | stage | …):
+${cards.slice(0, 60).map(l => briefCard(l, team)).join('\n') || '(none)'}${cards.length > 60 ? `\n…and ${cards.length - 60} more – use search_cards / list_cards` : ''}`;
+}
+
+const assistantQueues = new Map(); // phone -> promise, so one person's texts are handled in order
+function enqueueAssistant(key, job) {
+  const prev = assistantQueues.get(key) || Promise.resolve();
+  const next = prev.then(job, job);
+  assistantQueues.set(key, next.catch(() => {}));
+  return next;
+}
+
+async function runAssistant(member, from, text, reply) {
+  const key = normalisePhone(from);
+  const admin = isApprover(from);
+  const author = firstName(member.fields[TM.name]) || member.fields[TM.name];
+  const ctx = { member, admin, author, text, undo: [], created: [], done: [], extras: [] };
+  try {
+    const [playbook, team, cards] = [await playbookText(), await teamRows(), await agentCards(member)];
+    const asked = checkinsByPhone.get(key);
+    const questions = asked && asked.date === melbNow().date ? asked.items : [];
+    const system = assistantSystem(ctx, playbook, cards, team, questions);
+    // conversation so far (alternating, starting with the person)
+    const msgs = [];
+    for (const t of chatOf(member)) {
+      const role = t.r === 'alex' ? 'assistant' : 'user';
+      if (!msgs.length && role === 'assistant') continue;
+      if (msgs.length && msgs.at(-1).role === role) msgs.at(-1).content += '\n' + t.t;
+      else msgs.push({ role, content: t.t });
+    }
+    if (msgs.length && msgs.at(-1).role === 'user') msgs.at(-1).content += '\n' + text; else msgs.push({ role: 'user', content: text });
+    let answer = '';
+    for (let step = 0; step < ASSIST_MAX_STEPS; step++) {
+      const r = await assistantCall({ model: process.env.ALEX_ASSISTANT_MODEL || MODEL, max_tokens: 1200, system, tools: ASSIST_TOOLS, messages: msgs });
+      const uses = (r.content || []).filter(b => b.type === 'tool_use');
+      answer = (r.content || []).filter(b => b.type === 'text').map(b => b.text).join('\n').trim();
+      if (r.stop_reason !== 'tool_use' || !uses.length) break;
+      msgs.push({ role: 'assistant', content: r.content });
+      const results = [];
+      for (const u of uses) {
+        let out;
+        try { out = await runTool(u.name, u.input || {}, ctx); } catch (e) { out = 'ERROR: ' + e.message; console.error('Alex leads: tool ' + u.name + ' failed', e.message); }
+        console.log('Alex leads: tool ' + u.name + ' ' + JSON.stringify(u.input).slice(0, 300) + ' → ' + String(out).slice(0, 200).replace(/\n/g, ' / '));
+        results.push({ type: 'tool_result', tool_use_id: u.id, content: String(out).slice(0, 8000) });
+      }
+      msgs.push({ role: 'user', content: results });
+      answer = '';
+    }
+    if (!answer) answer = ctx.done.length ? 'Done: ' + ctx.done.join('; ') : "Sorry, I didn't get that – can you put it another way?";
+    for (const x of ctx.extras) if (/\b[A]\d{1,2}\b/.test(x) && !answer.includes(x.match(/\bA\d{1,2}\b/)[0])) answer += '\n' + x;
+    if (ctx.undo.length || ctx.created.length) {
+      pendingByPhone.set(key, { kind: 'undo', items: ctx.undo, created: ctx.created, summary: ctx.done.join('\n'), at: Date.now() });
+      if (!/undo/i.test(answer)) answer += '\nReply UNDO to reverse.';
+    }
+    await reply(answer.slice(0, 1500));
+    await rememberTurn(member, text, answer + (ctx.done.length ? `\n[done: ${ctx.done.join('; ')}]` : ''));
+  } catch (e) {
+    console.error('Alex leads: assistant failed', e.message);
+    await reply("Sorry, something went wrong on my side – please try again, or update the card in Airtable.");
+  }
+}
 
 // ---------------------------------------------------------------- new enquiries (replaces Pipedrive)
 

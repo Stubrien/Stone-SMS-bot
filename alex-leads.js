@@ -193,9 +193,17 @@ function historyText(history) {
   }).join('\n');
 }
 
-// Soft opt-out added to the end of the first text Alex sends anyone.
+// Soft opt-out added to the end of the first text Alex sends anyone, and to EVERY nurture text (Stu, 27 Oct 2026).
 // Any reply asking to be left alone is treated as an opt-out (see handleVendorSMS).
 const OPT_OUT_LINE = "If it's not the right time or you'd rather be left alone, just let me know.";
+// Plain SMS characters only: one curly quote or long dash switches the whole text to Unicode (70 chars a segment).
+function plainSMS(t) {
+  return String(t || '').replace(/[\u2018\u2019\u201B\u2032]/g, "'").replace(/[\u201C\u201D\u2033]/g, '"')
+    .replace(/\s*[\u2013\u2014\u2015]\s*/g, ' - ').replace(/\u2026/g, '...').replace(/[\u00A0\u2009\u202F]/g, ' ')
+    .replace(/[\u2022\u00B7]/g, '-').replace(/ {2,}/g, ' ').trim();
+}
+// Every nurture text ends with the soft opt-out line (added again at send time in case an edit removed it).
+function withOptOut(t) { t = String(t || '').trim(); return t.includes(OPT_OUT_LINE) ? t : t + ' ' + OPT_OUT_LINE; }
 const OPT_OUT_ACK = "No worries at all, I'll leave it there. Thanks for letting me know. – Alex, Stone Ballarat";
 
 const VOICE = "You write SMS messages as Alex from Stone Ballarat, writing on behalf of one of our sales agents. " +
@@ -254,7 +262,8 @@ async function queueDraft({ lead, ctx, purpose, draft, reasoning, extraLines, co
 async function sendApproved(msgRec) {
   const f = msgRec.fields;
   const leadId = (f[M.lead] || [])[0];
-  const text = f[M.finalText] || f[M.draft];
+  let text = plainSMS(f[M.finalText] || f[M.draft]);
+  if (text && sel(f[M.purpose]) === 'Nurture check-in') text = withOptOut(text);
   // Use the card's current Phone (it may have been fixed after the draft was written); fall back to the number saved on the draft
   const leadNow = leadId ? await getRecord(T.leads, leadId) : null;
   const to = leadNow && isTextableMobile(leadNow.fields[L.phone]) ? normalisePhone(leadNow.fields[L.phone]) : f[M.number];
@@ -303,8 +312,9 @@ async function waitingDrafts() {
   return listAll(T.messages, { filterByFormula: `{${M.status}}='Awaiting approval'` });
 }
 // Drafts that are still in play: waiting for Stu's approval, or nurture texts scheduled / previewed for today
+// ("On hold" = paused by hand in Airtable: not sent, and no fresh text is drafted for that card while it sits there)
 async function activeDrafts() {
-  return listAll(T.messages, { filterByFormula: `OR({${M.status}}='Awaiting approval',{${M.status}}='Scheduled',{${M.status}}='Previewed')` });
+  return listAll(T.messages, { filterByFormula: `OR({${M.status}}='Awaiting approval',{${M.status}}='Scheduled',{${M.status}}='Previewed',{${M.status}}='On hold')` });
 }
 
 // Returns true when the SMS was an approver command (so the normal Alex chat flow is skipped)
@@ -817,7 +827,7 @@ async function eligibleLeads() {
 
 // Fixed opening so every text starts the same way:
 // first text  -> "Hey Sonya, this is Alex from Stone Ballarat on behalf of Stu Brien."
-// later texts -> "Hey Sonya,"
+// later texts -> "Hey Sonya, it's Alex from Stone."
 // Street addresses like "14 Somewhere Street" or "160 Cuthberts Rd"
 const ADDRESS_RE = /\b\d+[A-Za-z]?(?:\/\d+[A-Za-z]?)?\s+(?:[A-Z][\w'-]*\s+){1,3}(?:Street|St|Road|Rd|Drive|Dr|Court|Ct|Crt|Avenue|Ave|Lane|Ln|Place|Pl|Crescent|Cres|Way|Close|Cl|Boulevard|Blvd|Bvd|Terrace|Tce|Highway|Hwy|Parade|Pde|Grove|Gr|Circuit|Cct|Rise|Track)\b/g;
 function addrKey(a) {
@@ -836,7 +846,7 @@ function smsOpening(ctx, firstContact) {
   const n = ctx.card.firstName;
   const usable = n && !/^(\d|lot\b)/i.test(n) && !/\d/.test(ctx.card.contactName.split(',')[0].split(' ')[0]);
   const hey = usable ? `Hey ${n},` : 'Hey there,';
-  if (!firstContact) return hey;
+  if (!firstContact) return `${hey} it's Alex from Stone.`; // every text says who it's from
   const agent = ctx.agent ? ctx.agent.name : 'our sales team';
   return `${hey} this is Alex from Stone Ballarat on behalf of ${agent}.`;
 }
@@ -883,8 +893,8 @@ async function draftOutbound(lead) {
     console.warn('Alex leads: still an unknown address – using the plain fallback text');
     body = plan && plan.fallback ? plan.fallback : body.replace(ADDRESS_RE, 'a nearby home');
   }
-  let draft = opening + ' ' + body;
-  if (firstContact && !draft.includes(OPT_OUT_LINE)) draft += ' ' + OPT_OUT_LINE;
+  let draft = plainSMS(opening + ' ' + body);
+  if ((firstContact || purpose === 'Nurture check-in') && !draft.includes(OPT_OUT_LINE)) draft += ' ' + OPT_OUT_LINE;
   const reasoning = (plan ? `${st.t.label}, text ${st.n + 1}: ${plan.label}. ` : '') + String(out.reasoning || '').trim();
   return { ctx, purpose, draft, reasoning, content: plan ? plan.key : '', trackLabel: st ? st.t.label : '' };
 }
@@ -980,7 +990,7 @@ async function sendMiddayPreviews() {
     const to = agent && isTextableMobile(agent.fields[TM.mobile]) ? normalisePhone(agent.fields[TM.mobile]) : approverMobile();
     const lines = items.map(({ r, lead }) => `${r.fields[M.code]} – ${lead ? lead.fields[L.name] : 'unknown card'}: ${planLabel(r)}`);
     const first = items[0].r.fields[M.code];
-    const text = `Alex – nurture texts going ${sendAt}:\n${lines.join('\n')}\n\nReply SHOW ${first} to see one, CHANGE ${first} [what to change] or CANCEL ${first}. No reply needed otherwise.`;
+    const text = `Alex – nurture texts going ${sendAt}:\n${lines.join('\n')}\n\nReply SHOW ${first} to see one, CHANGE ${first} [what to change] or CANCEL ${first}, or edit them on the Alex's Texts page in Airtable. No reply needed otherwise.`;
     try {
       await sendSMS(to, text);
       for (const { r } of items) await updateRecord(T.messages, r.id, { [M.status]: 'Previewed', [M.approvedAt]: new Date().toISOString(), [M.approvedBy]: 'Midday preview' });
@@ -2116,7 +2126,7 @@ function melbWhen(iso) {
 }
 
 async function findActiveByCode(code) {
-  const recs = await listAll(T.messages, { filterByFormula: `AND(UPPER({${M.code}})='${code}',OR({${M.status}}='Awaiting approval',{${M.status}}='Scheduled',{${M.status}}='Previewed'))` });
+  const recs = await listAll(T.messages, { filterByFormula: `AND(UPPER({${M.code}})='${code}',OR({${M.status}}='Awaiting approval',{${M.status}}='Scheduled',{${M.status}}='Previewed',{${M.status}}='On hold'))` });
   return recs[0] || null;
 }
 
@@ -2151,7 +2161,7 @@ async function handlePreviewCommand({ parsed, rec, member, approver, reply }) {
     return;
   }
   if (cmd === 'EDIT') {
-    await updateRecord(T.messages, rec.id, { [M.finalText]: rest, [M.approverReply]: parsed.raw });
+    await updateRecord(T.messages, rec.id, { [M.draft]: rest, [M.finalText]: null, [M.approverReply]: parsed.raw });
     await reply(`${code} updated – your wording goes ${when}.`);
     return;
   }

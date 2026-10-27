@@ -819,7 +819,7 @@ async function eligibleLeads() {
     if (binnedLeadIds.has(l.id)) return false; // a draft was just binned - wait for the next round
     if (f[L.alexLastContact] && new Date(f[L.alexLastContact]).getTime() > cutoff) return false;
     const stage = sel(f[L.stage]);
-    if (stage === 'Nurture') return !!f[L.followUp] && f[L.followUp] <= today;
+    if (stage === 'Nurture') return !f[L.followUp] || f[L.followUp] <= today; // blank = start now (e.g. a card from the New Lead form)
     if (stage === 'Qualifying') return /^alex\b/i.test(f[L.nextAction] || '') && (!f[L.nextActionDate] || f[L.nextActionDate] <= today);
     return false;
   });

@@ -1281,7 +1281,7 @@ async function handoffToAgent({ lead, ctx, out, text, from }) {
     [L.nextAction]: `Call ${first || name} – ${reason}` + (times ? ` (${times})` : ''),
     [L.nextActionDate]: today
   };
-  if (['Nurture', 'New', ''].includes(stage)) upd[L.stage] = 'Qualifying';
+  if (['Nurture', NEW_SOCIAL, NO_CONTACT, 'New', ''].includes(stage)) upd[L.stage] = 'Qualifying';
   if (appraisal && out.appraisal_type) upd[L.apptType] = out.appraisal_type;
   if (out.key_fact) {
     const stamp = dmy(today) + '/' + today.slice(2, 4);
@@ -1339,7 +1339,7 @@ async function handoffToAgent({ lead, ctx, out, text, from }) {
 // Agreed in the Pipeline Stages & Tasks redesign (20 Oct 2026):
 //  • Business hours (BH) are 8am–7pm Mon–Sat. Agents only get texts in BH (a final 7pm wrap-up at most).
 //  • New lead in BH: Alex texts the agent "Reply CALL or ALEX", reminds hourly, and at the end of the day moves the card
-//    to No Contact – Agent Follow Up. Alex never engages the contact unless the agent says ALEX.
+//    to New – Agent Follow Up. Alex never engages the contact unless the agent says ALEX.
 //  • New lead outside BH: Alex engages straight away (opener, details, qualify, appraisal or call time). If the contact
 //    hasn't replied by 8am next business day, Alex asks the agent: ALEX (two more texts over two days) or CALL.
 //  • No Contact check-ins on business days 1, 3 and 5, and every due task, go in ONE 9:30am check-in text per agent.
@@ -1355,7 +1355,12 @@ const PROP = {
   renos: 'fld2J4SMg3mJbopbb', yearsOwned: 'fldanH1mccCJVTTSW', motivation: 'fldqY7Rt6IsUwtBu1', timing: 'fldnzDA6bVxUWZNKZ', other: 'fld8zF3Exrjgrlltf',
   otherAgents: 'fldtCDVYN6mKcZRWn', buySell: 'fldxQ4FLkBgveovgq', vendorPrice: 'fldBlNocu8vql1N2T', agentGuide: 'fldOcPRELQgH8O4EG', decisionMakers: 'fldZ321WQVLyeb9FV'
 };
-const NO_CONTACT = 'No Contact – Agent Follow Up';
+// Stage names (renamed by Stu 28 Oct 2026): only social-media enquiries from GHL go into NEW_SOCIAL for Alex to engage.
+// Everything else that is new (Summer intake, phone/walk-in, agent form) goes into NO_CONTACT for the agent to follow up,
+// which is also where Alex moves a social lead he couldn't reach.
+const NEW_SOCIAL = 'New (Socials) - Alex to Engage';
+const NO_CONTACT = 'New – Agent Follow Up';
+const isNewStage = s => s === NEW_SOCIAL || s === 'New';
 const NEW_LEAD_MAX_AGE_DAYS = 3;   // older cards sitting in New are not blasted when this goes live
 const CHASE_TEXTS = 2;
 
@@ -1420,11 +1425,11 @@ async function sendChase(lead, agent, n) {
   await logOut(lead, text, 'New lead', sid);
 }
 
-// Move a card to No Contact – Agent Follow Up (the Airtable automation adds the "Call … try a few times" task)
+// Move a card to New – Agent Follow Up (the Airtable automation adds the "Call … try a few times" task)
 async function toNoContact(lead, state, why) {
   state.phase = 'done'; state.ncBase = melbClock().date;
   await setState(lead.id, state, { [L.stage]: NO_CONTACT, [L_ALEX_STATUS]: 'Agent calling' });
-  await logActivity(lead.id, { summary: 'Moved to No Contact – Agent Follow Up', detail: why || '', type: 'General', kind: 'History' });
+  await logActivity(lead.id, { summary: 'Moved to New – Agent Follow Up', detail: why || '', type: 'General', kind: 'History' });
 }
 
 // ---- runs every 2 minutes, day and night
@@ -1433,7 +1438,7 @@ async function newLeadTick() {
   const c = melbClock();
   const agents = await alexActiveAgentIds();
   if (!agents.size) return;
-  const leads = (await listAll(T.leads, { filterByFormula: `AND(OR({${L.stage}}='New',{${L.stage}}='${NO_CONTACT}',{${L.stage}}='Qualifying'),NOT({${L_PARKED}}),NOT({${L.doNotContact}}),NOT({${L.pauseAlex}}))` }))
+  const leads = (await listAll(T.leads, { filterByFormula: `AND(OR({${L.stage}}='${NEW_SOCIAL}',{${L.stage}}='${NO_CONTACT}',{${L.stage}}='Qualifying'),NOT({${L_PARKED}}),NOT({${L.doNotContact}}),NOT({${L.pauseAlex}}))` }))
     .filter(l => (l.fields[L.agent] || []).some(id => agents.has(id)));
   for (const lead of leads) {
     try { await newLeadStep(lead, c); } catch (e) { console.error('Alex leads: new lead step failed for ' + lead.id, e.message); }
@@ -1450,7 +1455,7 @@ async function newLeadStep(lead, c) {
 
   // A brand-new card in New
   if (!state.flow) {
-    if (stage !== 'New') return;
+    if (!isNewStage(stage)) return; // only social-media leads in New (Socials) are Alex's to engage
     const via = sel(f[L.enteredVia]);
     const old = f[L_RECEIVED] && f[L_RECEIVED] < addDays(c.date, -NEW_LEAD_MAX_AGE_DAYS);
     if (['Agent form', 'Agent by text'].includes(via) || f[L_FIRST_CONTACT] || old || !isTextableMobile(f[L.phone])) {
@@ -1471,12 +1476,12 @@ async function newLeadStep(lead, c) {
   if (state.flow !== 'newlead') return;
 
   if (state.phase === 'alerted') {
-    if (stage !== 'New') { state.phase = 'done'; await setState(lead.id, state); return; } // the agent moved the card themselves
+    if (!isNewStage(stage)) { state.phase = 'done'; await setState(lead.id, state); return; } // the agent moved the card themselves
     const alertedOn = new Date(state.alertedAt).toLocaleDateString('en-CA', { timeZone: TZ });
     const finalHour = (state.alertHour || 0) >= 17 ? 19 : 18;
     const wrapUp = alertedOn < c.date ? isBH(c) : c.hour >= finalHour;
     if (wrapUp) {
-      await textAgent(agent, `No reply on ${label} today, so I've moved the card to No Contact – Agent Follow Up with a call task.`);
+      await textAgent(agent, `No reply on ${label} today, so I've moved the card to New – Agent Follow Up with a call task.`);
       await toNoContact(lead, state, 'No CALL / ALEX reply by the end of the day');
     } else if (isBH(c) && minutesSince(state.lastReminderAt) >= 60) {
       await textAgent(agent, `Reminder: new lead ${label}, ${f[L.phone]}. Reply CALL or ALEX.`);
@@ -1508,7 +1513,7 @@ async function newLeadStep(lead, c) {
 
   if (state.phase === 'noreply_asked') {
     if (c.hour >= 18 && isBH(c)) {
-      await textAgent(agent, `No reply on ${label}, so I've moved the card to No Contact – Agent Follow Up with a call task.`);
+      await textAgent(agent, `No reply on ${label}, so I've moved the card to New – Agent Follow Up with a call task.`);
       await toNoContact(lead, state, 'Contact never replied and no ALEX / CALL from the agent');
     }
     return;
@@ -1522,7 +1527,7 @@ async function newLeadStep(lead, c) {
       state.chases = n + 1; state.lastChaseAt = nowIso;
       await setState(lead.id, state);
     } else if (n >= CHASE_TEXTS && minutesSince(state.lastChaseAt) >= 24 * 60 && isBH(c)) {
-      await textAgent(agent, `Still no reply from ${label} after ${CHASE_TEXTS} more texts, so I've moved the card to No Contact – Agent Follow Up with a call task.`);
+      await textAgent(agent, `Still no reply from ${label} after ${CHASE_TEXTS} more texts, so I've moved the card to New – Agent Follow Up with a call task.`);
       await toNoContact(lead, state, 'No reply after Alex followed up');
     }
     return;
@@ -1667,7 +1672,7 @@ async function handleCallAlex(member, from, text, reply) {
   const state = getState(lead);
   if (word === 'CALL') {
     await toNoContact(lead, state, `${member.fields[TM.name]} replied CALL`);
-    await reply(`Thanks – ${leadLabel(lead.fields)} is in No Contact – Agent Follow Up with a call task. I'll check in tomorrow.`);
+    await reply(`Thanks – ${leadLabel(lead.fields)} is in New – Agent Follow Up with a call task. I'll check in tomorrow.`);
   } else if (state.phase === 'alerted') {
     await sendOpener(lead, member);
     await setState(lead.id, Object.assign(state, { phase: 'engaging', openerAt: new Date().toISOString() }), { [L_ALEX_STATUS]: 'Engaging' });
@@ -1734,7 +1739,7 @@ async function checkinTick() {
   // The 9:30 check-in, once a day
   if (lastCheckinDate === c.date || c.hour < 9 || (c.hour === 9 && c.minute < 30)) return;
   lastCheckinDate = c.date;
-  const cards = (await listAll(T.leads, { filterByFormula: `AND(NOT({${L_PARKED}}),{${L.stage}}!='Nurture',{${L.stage}}!='Listed (Won)',{${L.stage}}!='New')` }))
+  const cards = (await listAll(T.leads, { filterByFormula: `AND(NOT({${L_PARKED}}),{${L.stage}}!='Nurture',{${L.stage}}!='Listed (Won)',{${L.stage}}!='${NEW_SOCIAL}')` }))
     .filter(l => (l.fields[L.agent] || []).some(id => agents.has(id)));
   const byAgent = {};
   for (const lead of cards) {
@@ -2034,7 +2039,7 @@ async function handleGhlLead(from, body) {
     const fields = {
       [L.name]: g.name || g.address || g.mobile, [L.phone]: g.mobile ? normalisePhone(g.mobile) : undefined, [L.email]: g.email || undefined,
       [L.address]: g.address || undefined, [L.source]: 'Social Media', [L.sourceDetail]: g.campaign || 'GoHighLevel social media lead',
-      [L.enteredVia]: 'GoHighLevel', [L.stage]: 'New', [L_RECEIVED]: today, [PROP.other]: g.notes || undefined,
+      [L.enteredVia]: 'GoHighLevel', [L.stage]: NEW_SOCIAL, [L_RECEIVED]: today, [PROP.other]: g.notes || undefined,
       [L_STATE]: '{"flow":"newlead","phase":"starting"}' // stops the 2-minute tick double-handling it
     };
     if (ghlAgent) fields[L.agent] = [ghlAgent.id];
@@ -2076,11 +2081,11 @@ async function handleGhlLead(from, body) {
     return true;
   }
   if (['Nurture', 'Lost / Not Progressing', 'Lost', 'Not to Progress'].includes(stage)) {
-    // A fresh enquiry from a nurture / lost contact: back to New and into the new-lead flow
-    upd[L.stage] = 'New';
+    // A fresh enquiry from a nurture / lost contact: back to New (Socials) and into the new-lead flow
+    upd[L.stage] = NEW_SOCIAL;
     await updateRecord(T.leads, existing.id, Object.assign(upd, { [L_STATE]: '{"flow":"newlead","phase":"starting"}' }));
-    const res = await startNewLeadFlow(existing.id, `They were in ${stage}${sel(f[L.nurtureReason]) ? ' (' + sel(f[L.nurtureReason]) + ')' : ''}${agentLine}. The card is back in New.`);
-    if (/opener/.test(res)) await noticeAgent(existing, `${label} (was in ${stage}) responded to a social media ad overnight${agentLine}. I've moved them back to New and texted them – I'll let you know how it goes.`);
+    const res = await startNewLeadFlow(existing.id, `They were in ${stage}${sel(f[L.nurtureReason]) ? ' (' + sel(f[L.nurtureReason]) + ')' : ''}${agentLine}. The card is back in New (Socials).`);
+    if (/opener/.test(res)) await noticeAgent(existing, `${label} (was in ${stage}) responded to a social media ad overnight${agentLine}. I've moved them back to New (Socials) and texted them – I'll let you know how it goes.`);
     return true;
   }
   if (Object.keys(upd).length) await updateRecord(T.leads, existing.id, upd);
@@ -2105,7 +2110,7 @@ const L_APPT_AT = 'flddxWuZLNPYmuiFM';
 const L_MTG_AT = 'fldGLVhG1pa7jXwuB';
 const L_PRIORITY = 'fldtEqiFM1c8rjFG6';
 
-const STAGE_LIST = ['New', 'No Contact – Agent Follow Up', 'Qualifying', 'Appraisal Booked', 'Price Update / Desktop Required',
+const STAGE_LIST = [NEW_SOCIAL, NO_CONTACT, 'Qualifying', 'Appraisal Booked', 'Price Update / Desktop Required',
   'Prepare Listing Presentation', 'Listing Meeting Booked', 'Presentation Sent', 'Decision Pending', 'Delayed / On Hold',
   'Approved / Accepted', 'Authority Sent – Awaiting Signatures', 'Listed (Won)', 'Nurture', 'Lost / Not Progressing'];
 const NURTURE_REASONS = ['Proposal or decision stalled', 'Not quite ready (~3 months)', 'Too early (~6 months)', 'Curious (12 months+)',
@@ -2308,12 +2313,12 @@ async function handleAgentUpdate(member, from, text, reply, pendingCard) {
     '"They want to go ahead / verbal yes" → "Approved / Accepted". "Authority sent" → "Authority Sent – Awaiting Signatures". "Signed up / signed the authority" → "Listed (Won)". ' +
     '"Not ready / next year / later" → "Nurture" with the matching nurture_reason. "On hold / delayed" → "Delayed / On Hold" with next_action_date when to check back. ' +
     '"Listed with another agent" → "Lost / Not Progressing" with lost_reason "Listed with competitor". A lost reason given for a Lost card → lost_reason only. ' +
-    'No Contact answers: "spoke/booked" → the matching stage; "no answer / no luck" → no change (note only); "a" → "Nurture" with nurture_reason "Cold / gone quiet"; "b" or "keep trying" → restart_no_contact true; "c" → read what they said. ' +
+    'New – Agent Follow Up (no contact) answers: "spoke/booked" → the matching stage; "no answer / no luck" → no change (note only); "a" → "Nurture" with nurture_reason "Cold / gone quiet"; "b" or "keep trying" → restart_no_contact true; "c" → read what they said. ' +
     'A task question answered "done/sent/yes" → complete_task true. ' +
     'Options in a question (a/b/c or 1–5) map to the actions written next to them in that question. ' +
     'If a card shows "time options offered" and the agent picks one (by number with the name, by the time, or a bare number when only that card has options), set appraisal_at (or listing_meeting_at) to that time in local "YYYY-MM-DDTHH:MM" and stage "Appraisal Booked" (or "Listing Meeting Booked"); another time they give works the same way. ' +
     '"CALL" / "I\'ll ring them" about a card with time options → next_action "Call <first name> to book the appraisal" due today, and clear_offer true. ' +
-    'A call time agreed with a contact → call_at (and stage "Qualifying" if the card is New or No Contact). "No answer" to an after-call question → no_answer true. ' +
+    'A call time agreed with a contact → call_at (and stage "Qualifying" if the card is in either New stage). "No answer" to an after-call question → no_answer true. ' +
     'NEW CONTACTS: "new contact", "new client", "new lead", "new vendor", or a booking with someone whose name, mobile and address match none of THE AGENT\'S CARDS, is a new contact even if no details are given yet ("Booked an appraisal with a new client Thu 10am") – set new_contact true and fill new_card with whatever is known (empty strings for the rest); never answer "which card?" for a new contact. ' +
     'If the agent is telling Alex about someone who is NOT one of their cards ("New contact: Jo Smith 0412 345 678, 5 High St Sebastopol, met at open home, appraisal Tue 10am"), fill new_card instead of updates: ' +
     'name, mobile and address are required; source = one of SOURCES only if the agent said where the lead came from (else empty; Alex asks after creating the card), source_detail for anything more specific; email if given; stage = "Appraisal Booked" if an appraisal time is given, "Nurture" (+ nurture_reason) if they are not moving for a while, otherwise "Qualifying"; ' +

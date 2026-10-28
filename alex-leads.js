@@ -277,6 +277,10 @@ async function sendApproved(msgRec) {
     await updateRecord(T.messages, msgRec.id, { [M.status]: 'Rejected', [M.error]: 'Not sent – card no longer in Nurture (or paused / parked)' });
     return 'not sent – the card has moved on';
   }
+  if (sel(f[M.purpose]) === 'Appraisal confirmation' && !['Appraisal Booked', 'Listing Meeting Booked'].includes(sel(lead.fields[L.stage]))) {
+    await updateRecord(T.messages, msgRec.id, { [M.status]: 'Rejected', [M.error]: 'Not sent – the appointment is no longer booked on the card' });
+    return 'not sent – the appointment is no longer booked on the card';
+  }
   if (lead.fields[L.doNotContact]) {
     await updateRecord(T.messages, msgRec.id, { [M.status]: 'Rejected', [M.error]: 'Do Not Contact ticked before sending' });
     return 'blocked (Do Not Contact)';
@@ -365,7 +369,7 @@ function parseApproverCommand(text) {
   return { cmd, code, rest };
 }
 
-const QUICK_PURPOSES = ['Appraisal confirmation', 'Thank-you', 'Call confirmation']; // offers the agent approves: sent in business hours (8am–7pm Mon–Sat)
+const QUICK_PURPOSES = ['Appraisal confirmation', 'Thank-you', 'Call confirmation', 'Agent message']; // offers the agent approves: sent in business hours (8am–7pm Mon–Sat)
 // replyTo / byName: an agent approving an offer on their own card (appraisal confirmation, thank-you)
 async function handleApproverSMS(body, replyTo, byName) {
   const text = (body || '').trim();
@@ -2994,7 +2998,13 @@ const ASSIST_TOOLS = [
       next_action: { type: 'string' }, next_action_date: { type: 'string' }, nurture_reason: { type: 'string' },
       details: { type: 'object', properties: { beds: { type: 'number' }, baths: { type: 'number' }, block: { type: 'number' } } },
       motivation: { type: 'string', enum: ['', 'Making a move', 'Just an update', 'Unsure'] }, timing: { type: 'string' }, notes: { type: 'string' },
-      agent: { type: 'string', description: 'Whose card it is, if not the sender\'s (Stu only)' } }, required: ['name'] } }
+      agent: { type: 'string', description: 'Whose card it is, if not the sender\'s (Stu only)' } }, required: ['name'] } },
+  { name: 'text_contact', description: 'Send a text to the contact on a card, on the agent\'s behalf (e.g. "let her know I\'ll call to reschedule", "tell him the appraisal is moved to 3pm"). Write the full SMS in Alex\'s voice: start "Hi <first name>,", plain characters, sign off "– Alex, Stone Ballarat". Without confirmed it drafts the text and gives the agent a YES/EDIT/NO code to approve. Set confirmed=true only when the agent has already approved this exact wording in this conversation. If the request replaces a draft still waiting (OPEN DRAFTS below), pass its code in replaces so the old one is cancelled.',
+    input_schema: { type: 'object', properties: {
+      card_id: { type: 'string' }, message: { type: 'string', description: 'The exact SMS to send the contact' },
+      replaces: { type: 'string', description: 'Code of an open draft this replaces, e.g. A7' }, confirmed: { type: 'boolean' } }, required: ['card_id', 'message'] } },
+  { name: 'cancel_draft', description: 'Cancel a text to a contact that is still waiting for approval (OPEN DRAFTS), e.g. when the agent says not to send it or the plans changed.',
+    input_schema: { type: 'object', properties: { code: { type: 'string' } }, required: ['code'] } }
 ];
 
 const BIG_STAGES = ['Lost / Not Progressing', 'Listed (Won)'];
@@ -3052,6 +3062,37 @@ async function runTool(name, input, ctx) {
     if (input.due) rows.sort((a, b) => d(a) < d(b) ? -1 : 1);
     const n = rows.length;
     return n ? `${n} card${n === 1 ? '' : 's'}${n > (input.limit || 25) ? ' (first ' + (input.limit || 25) + ')' : ''}:\n` + rows.slice(0, input.limit || 25).map(l => briefCard(l, team)).join('\n') : 'No cards match.';
+  }
+  if (name === 'cancel_draft' || (name === 'text_contact' && input.replaces)) {
+    const code = String((name === 'cancel_draft' ? input.code : input.replaces) || '').toUpperCase().trim();
+    const rec = code ? await findActiveByCode(code) : null;
+    if (rec) {
+      const l = await getRecord(T.leads, (rec.fields[M.lead] || [])[0]).catch(() => null);
+      if (l && !canChange(l)) return `${code} is on someone else's card.`;
+      await updateRecord(T.messages, rec.id, { [M.status]: 'Rejected', [M.approverReply]: ctx.text, [M.approvedBy]: ctx.author });
+      ctx.done.push(`${code} cancelled`);
+    }
+    if (name === 'cancel_draft') return rec ? `${code} cancelled – it won't be sent.` : `There's no draft ${code} waiting.`;
+  }
+  if (name === 'text_contact') {
+    let l; try { l = await getRecord(T.leads, input.card_id); } catch (e) { return 'No card with id ' + input.card_id; }
+    if (!canChange(l)) return `REFUSED: that's ${briefCard(l, team).split(' | ')[4]}'s card – only they or Stu can text them.`;
+    if (l.fields[L.doNotContact]) return 'NOT SENT: Do Not Contact is ticked on this card.';
+    if (!isTextableMobile(l.fields[L.phone])) return 'NOT SENT: there is no mobile on this card – ask for one or suggest a call.';
+    const msg = plainSMS(input.message);
+    if (!msg) return 'Write the message first.';
+    if (!input.confirmed) {
+      const o = await offerDraft(l, 'Agent message', msg, `Text for ${l.fields[L.name]}:`);
+      ctx.extras.push(`"${msg}"\nReply YES ${o.code} to send · EDIT ${o.code} [your wording] · NO ${o.code}`);
+      return `DRAFTED ${o.code}. Tell the agent the draft is ready and include the ALSO line exactly. ALSO: "${msg}" Reply YES ${o.code} to send · EDIT ${o.code} [your wording] · NO ${o.code}`;
+    }
+    const o = await offerDraft(l, 'Agent message', msg, `Text for ${l.fields[L.name]} (approved in chat)`);
+    const rec = await findActiveByCode(o.code);
+    await updateRecord(T.messages, rec.id, { [M.status]: 'Approved', [M.approverReply]: ctx.text, [M.approvedBy]: ctx.author, [M.approvedAt]: new Date().toISOString() });
+    if (!isBH()) { ctx.done.push(`text to ${l.fields[L.name]} queued for 8am`); return 'QUEUED: it will go out at 8am (outside business hours).'; }
+    const res = await sendApproved(await getRecord(T.messages, rec.id));
+    ctx.done.push(`texted ${l.fields[L.name]}`);
+    return 'SENT: ' + res;
   }
   if (name === 'add_note') {
     let l; try { l = await getRecord(T.leads, input.card_id); } catch (e) { return 'No card with id ' + input.card_id; }
@@ -3120,12 +3161,14 @@ async function runTool(name, input, ctx) {
   return 'Unknown tool ' + name;
 }
 
-function assistantSystem(ctx, playbook, cards, team, questions) {
+function assistantSystem(ctx, playbook, cards, team, questions, drafts) {
   const c = melbClock();
   return `You are Alex, the sales assistant at Stone Real Estate Ballarat, texting with ${ctx.member.fields[TM.name]}${ctx.admin ? ' (the principal – may change any card)' : ' (a sales agent – may change only their own cards)'}.
 NOW: ${c.weekday} ${c.date} ${String(c.hour).padStart(2, '0')}:${String(c.minute).padStart(2, '0')} Melbourne time.
 
-You keep the team's Airtable sales pipeline up to date from their texts and answer their questions about it. You talk only to the team here – nothing you do sends a text to a contact (except the confirmations the tools offer, which the agent approves with a code).
+You keep the team's Airtable sales pipeline up to date from their texts and answer their questions about it. You CAN text a contact on the agent's behalf with text_contact: you draft it, the agent approves it with a code (or has already approved the exact wording), then it goes from this number. Never say you can't text contacts, and never mention GHL or other systems.
+If the agent replies to a draft that's waiting (OPEN DRAFTS) with an instruction instead of YES/EDIT/NO – e.g. "let her know I'll call to reschedule" – cancel or replace that draft (text_contact with replaces) and draft the text they asked for. Don't ask "did you want me to text them?" when they've said "let her know / tell him / text her"; draft it.
+If they answer "yes" / "send it" to a draft you just showed them, call text_contact again with the same card and the same message, replaces=<that draft's code> and confirmed=true.
 
 HOW TO WORK
 - When a person or property is mentioned, use search_cards (or the list below) to find the card. Never guess an id.
@@ -3146,8 +3189,20 @@ Sources: ${SOURCE_LIST.join('; ')}
 PLAYBOOK (how we work – follow it)
 ${playbook || '(empty)'}
 ${questions.length ? `\nQUESTIONS ALEX ASKED ${firstName(ctx.member.fields[TM.name]).toUpperCase()} TODAY (they may answer by number, e.g. "1 booked Thu 2pm, 2 sent, 3b"; options in a question map to the actions written beside them):\n${questions.map(q => `${q.n ? q.n + ' – ' : ''}[${q.leadId}] ${q.question}`).join('\n')}\n` : ''}
-${firstName(ctx.member.fields[TM.name]).toUpperCase()}'S ACTIVE CARDS (id | name | address | phone | agent | stage | …):
+${drafts && drafts.length ? `OPEN DRAFTS – texts to contacts waiting for ${firstName(ctx.member.fields[TM.name])}'s YES (code | card id | contact | text):\n${drafts.join('\n')}\n\n` : ''}${firstName(ctx.member.fields[TM.name]).toUpperCase()}'S ACTIVE CARDS (id | name | address | phone | agent | stage | …):
 ${cards.slice(0, 60).map(l => briefCard(l, team)).join('\n') || '(none)'}${cards.length > 60 ? `\n…and ${cards.length - 60} more – use search_cards / list_cards` : ''}`;
+}
+
+// Texts to contacts on this person's cards still waiting for their YES (Stu sees all of them)
+async function openDraftsFor(member, admin) {
+  try {
+    const recs = await listAll(T.messages, { filterByFormula: `AND({${M.status}}='Awaiting approval',{${M.direction}}='To vendor')` });
+    const leads = await leadsByIds(recs.map(r => (r.fields[M.lead] || [])[0]));
+    const byId = Object.fromEntries(leads.map(l => [l.id, l]));
+    return recs.map(r => ({ r, l: byId[(r.fields[M.lead] || [])[0]] }))
+      .filter(x => x.l && (admin || (x.l.fields[L.agent] || []).includes(member.id)))
+      .slice(-8).map(x => `${x.r.fields[M.code]} | ${x.l.id} | ${x.l.fields[L.name]} | "${String(x.r.fields[M.finalText] || x.r.fields[M.draft] || '').slice(0, 220)}"`);
+  } catch (e) { return []; }
 }
 
 const assistantQueues = new Map(); // phone -> promise, so one person's texts are handled in order
@@ -3167,7 +3222,8 @@ async function runAssistant(member, from, text, reply) {
     const [playbook, team, cards] = [await playbookText(), await teamRows(), await agentCards(member)];
     const asked = checkinsByPhone.get(key);
     const questions = asked && asked.date === melbNow().date ? asked.items : [];
-    const system = assistantSystem(ctx, playbook, cards, team, questions);
+    const drafts = await openDraftsFor(member, admin);
+    const system = assistantSystem(ctx, playbook, cards, team, questions, drafts);
     // conversation so far (alternating, starting with the person)
     const msgs = [];
     for (const t of chatOf(member)) {

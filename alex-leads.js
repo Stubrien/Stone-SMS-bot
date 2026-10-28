@@ -1723,6 +1723,9 @@ async function checkinTick() {
   const pu = (await listAll(T.leads, { filterByFormula: `AND({${L.stage}}='Price Update / Desktop Required',NOT({${L_PARKED}}),{${L.nextAction}}='')` }))
     .filter(l => (l.fields[L.agent] || []).some(id => agents.has(id)));
   for (const lead of pu) {
+    // re-check just before writing: the agent may have moved the card on (e.g. to Nurture) in the last minute
+    const now = await getRecord(T.leads, lead.id).catch(() => null);
+    if (!now || sel(now.fields[L.stage]) !== 'Price Update / Desktop Required' || now.fields[L.nextAction]) continue;
     let d = c.date; for (let n = 0; n < 3;) { d = addDays(d, 1); if (isBizDay(d)) n++; }
     await updateRecord(T.leads, lead.id, { [L.nextAction]: `Any reaction from ${firstName(lead.fields[L.name]) || lead.fields[L.name]} to the price update?`, [L.nextActionDate]: d });
   }

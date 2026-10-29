@@ -61,7 +61,7 @@ const B = {
   through: 'fldP9mhab6VSd6Siu', notes: 'fldlTAcdUHJHjkQBK', created: 'fld1qKffhUxl7GmNX', matches: 'fld8rUrS7lDIAF0yH',
   state: 'fldgzAfAQQG4ogPu1', campaign: 'fldU9bnkjKJ5shc58', cStage: 'fldpydUaJkdGDTU0u', cOutcome: 'fldINgRo4UhHJZfOZ',
   approve: 'fldYwKAzSafqHRlzP', batch: 'fldIrX6E3Qp9fNCHz', following: 'fldVan9kErtWqqXqF',
-  firstContact: 'fldQqrjTFxWBI7ew5'
+  firstContact: 'fldQqrjTFxWBI7ew5', near: 'fldEHyLCKWqNKVnKa', radius: 'fld8QdDAgP7J5pILm'
 };
 const C = {
   name: 'fld5hDJRpN92YZnFx', mobile: 'fld0EA8biRz66il05', email: 'fldZW60VKGeM5Pc2u', agent: 'fldHsGhaiVWBnYX23',
@@ -499,6 +499,7 @@ function kindFromSource(src) {
   return 'agent';
 }
 function areaOf(brief, contact) {
+  if (brief.fields[B.near]) return brief.fields[B.near] === 'Ballarat Central' ? 'Ballarat' : brief.fields[B.near];
   const subs = sels(brief.fields[B.suburbs]).filter(s => s !== 'Anywhere in Ballarat');
   if (subs.length) return subs.slice(0, 2).join(' or ');
   return (contact && contact.fields[C.suburb]) || '';
@@ -700,7 +701,7 @@ async function handleHold(member, text) {
 
 async function newBriefTick() {
   const goLive = goLiveDate();
-  const formula = `AND({${B.status}}='Active',{${B.state}}='',{${B.campaign}}='',IS_AFTER({${B.created}},'${goLive}'))`;
+  const formula = `AND({${B.status}}='Active',{${B.state}}='',{${B.campaign}}='',IS_AFTER({${B.created}},'${melbToISO(goLive, 0, 0)}'))`;
   const briefs = await listAll(T.briefs, { filterByFormula: formula });
   const c = clock();
   for (const brief of briefs) {
@@ -826,10 +827,10 @@ const QUESTIONS = [
   // Agentbox imports are all assigned to Stu; check whether they already have a relationship with another agent (Stu, 29 Oct)
   { key: 'agent', max: 1, done: (f, st) => sel(f[B.campaign]) !== 'Import outreach' || !!(st && st.agentChecked),
     text: "Have you already been dealing with one of the other agents in our office? If so, I'll make sure you stay with them." },
-  { key: 'area', max: 2, done: f => sels(f[B.suburbs]).length || sels(f[B.types]).length, text: 'What sort of place are you after, and which areas?' },
+  { key: 'area', max: 2, done: f => sels(f[B.suburbs]).length || !!f[B.near] || sels(f[B.types]).length, text: 'What sort of place are you after, and which areas?' },
   { key: 'beds', max: 2, done: f => f[B.beds] || sels(f[B.must]).length, text: "How many bedrooms do you need, and anything you can't do without? (garage, single level, a shed...)" },
-  { key: 'timeframe', max: 2, done: f => sel(f[B.timeframe]) && sel(f[B.timeframe]) !== 'Unknown', text: 'When are you hoping to be in? Next few months, or more down the track?' },
-  { key: 'saleDep', max: 2, done: f => sel(f[B.saleDep]) && sel(f[B.saleDep]) !== 'Unknown', text: 'Do you have a place to sell first?' },
+  { key: 'timeframe', max: 1, done: f => sel(f[B.timeframe]) && sel(f[B.timeframe]) !== 'Unknown', text: 'When are you hoping to be in? Next few months, or more down the track?' },
+  { key: 'saleDep', max: 1, done: f => sel(f[B.saleDep]) && sel(f[B.saleDep]) !== 'Unknown', text: 'Do you have a place to sell first?' },
   { key: 'finance', max: 1, done: f => sel(f[B.finance]) && sel(f[B.finance]) !== 'Unknown', text: 'Is finance sorted, or still in the works?' },
   // Always last (Stu, 29 Oct)
   { key: 'price', max: 1, done: f => f[B.pmin] || f[B.pmax], text: "We want to make sure we're not sending properties outside your budget. Are you comfortable sharing a price range we should keep in mind for you?" }
@@ -840,6 +841,7 @@ function nextQuestion(brief, st) {
     if (q.done(brief.fields, st)) continue;
     if (q.key === 'price' && st.declinedPrice) continue;
     if ((asked[q.key] || 0) >= q.max) continue;
+    if (q.key === st.lastQ) continue; // never the same question twice in a row (Stu, 30 Oct)
     return q;
   }
   return null;
@@ -849,6 +851,7 @@ function listReady(f) { return (sels(f[B.suburbs]).length || sels(f[B.types]).le
 
 function briefSummary(f) {
   const parts = [];
+  if (f[B.near]) parts.push('search area: within ' + (f[B.radius] || 8) + ' km of ' + f[B.near]);
   const subs = sels(f[B.suburbs]); if (subs.length) parts.push('areas: ' + subs.join(', '));
   const types = sels(f[B.types]); if (types.length) parts.push('type: ' + types.join(', '));
   if (f[B.beds]) parts.push(f[B.beds] + '+ beds');
@@ -878,7 +881,7 @@ const INTENTS = ['still_looking', 'answer', 'liked_property', 'wants_inspection'
 const READ_SYSTEM = `You read SMS replies from property BUYERS to Alex, the assistant at Stone Real Estate Ballarat, and return JSON only.
 Return: {"intent": one of ${JSON.stringify(INTENTS)},
  "reply": "Alex's reply text, see rules",
- "updates": {"suburbs":[],"types":[],"beds":null,"baths":null,"car":null,"land":null,"pmin":null,"pmax":null,"must":[],"breakers":"","other":"","reason":"","finance":"","saleDep":"","timeframe":"","email":""},
+ "updates": {"suburbs":[],"types":[],"beds":null,"baths":null,"car":null,"land":null,"pmin":null,"pmax":null,"must":[],"breakers":"","other":"","reason":"","finance":"","saleDep":"","timeframe":"","email":"","near":"","radius_km":null},
  "declined_price": false,
  "property": "address of the listing they are talking about, copied from KNOWN LISTINGS, or empty",
  "feedback": "short note of what they said about that property, or empty",
@@ -888,6 +891,7 @@ Return: {"intent": one of ${JSON.stringify(INTENTS)},
 Only fill update keys the buyer actually stated in THIS message (leave others empty/null). Allowed values:
  suburbs ${JSON.stringify(OPT.suburbs)}; types ${JSON.stringify(OPT.types)}; must ${JSON.stringify(OPT.must)};
  reason ${JSON.stringify(OPT.reason)}; finance ${JSON.stringify(OPT.finance)}; saleDep ${JSON.stringify(OPT.saleDep)}; timeframe ${JSON.stringify(OPT.timeframe)}.
+ Areas: a list of named suburbs → suburbs. "Near / around / close to X" or "within N km of X" → near = X (a suburb name, or Ballarat) and radius_km = N (null if no distance given); you can set both near and suburbs.
  Prices are whole dollars: "around 600" → pmin 570000, pmax 630000; "up to 700" → pmax 700000 only; "600 to 650k" → 600000 / 650000.
  Timeframe "ASAP"/"next couple of months" → "0–3 months"; "this year"/"6 months" → "3–6 months"; "next year" → "6–12 months" or "12+ months" as fits.
  "Pre-approved"/"approval done" → "Pre-approved"; "cash" → "Cash buyer"; "talking to the bank/broker" → "Talking to lender".
@@ -957,6 +961,8 @@ function cleanUpdates(u, f) {
   for (const [key, fld, list] of [['reason', B.reason, OPT.reason], ['finance', B.finance, OPT.finance], ['saleDep', B.saleDep, OPT.saleDep], ['timeframe', B.timeframe, OPT.timeframe]]) {
     const v = pick(list, u[key]); if (v) out[fld] = v;
   }
+  if (u.near && String(u.near).trim()) out[B.near] = String(u.near).trim().replace(/^(near|around|close to)\s+/i, '');
+  { const r = Number(u.radius_km); if (u.radius_km && isFinite(r) && r > 0 && r <= 100) out[B.radius] = Math.round(r); }
   if (u.breakers) out[B.breakers] = ((f[B.breakers] ? f[B.breakers] + '; ' : '') + u.breakers).slice(0, 2000);
   if (u.other) out[B.other] = ((f[B.other] ? f[B.other] + '; ' : '') + u.other).slice(0, 2000);
   return out;
@@ -1067,7 +1073,8 @@ async function addBuyerFromAgent({ agent, input }) {
     suburbs: i.suburbs || [], types: i.property_types || [], must: i.must_haves || [],
     beds: i.beds, baths: i.baths, car: i.car_spaces, land: i.land_m2, pmin: i.price_min, pmax: i.price_max,
     finance: i.finance, saleDep: i.sale_dependency, timeframe: i.timeframe, reason: i.reason,
-    breakers: i.deal_breakers || '', other: i.other_requirements || ''
+    breakers: i.deal_breakers || '', other: i.other_requirements || '',
+    near: i.near_suburb || '', radius_km: i.radius_km
   };
   let contact = await contactByPhone(mobile);
   const types = c => sels(c.fields[C.types]);
@@ -1098,11 +1105,25 @@ async function addBuyerFromAgent({ agent, input }) {
   if (agent) fields[B.agent] = [agent.id];
   if (i.notes) fields[B.know] = String(i.notes).trim();
   if (i.agent_following_up) fields[B.following] = true;
-  const brief = await createRecord(T.briefs, fields);
+  // Create the brief bare, then add the criteria as an update: the brief automation (tier, cadence, matches)
+  // only fires on updates, so a brief created with everything filled in would never get a tier.
+  const base = {};
+  for (const k of [B.name, B.buyers, B.status, B.source, B.agent, B.following]) if (k in fields) { base[k] = fields[k]; delete fields[k]; }
+  const brief = await createRecord(T.briefs, base);
+  if (Object.keys(fields).length) await updateRecord(T.briefs, brief.id, fields);
+  Object.assign(brief.fields, fields);
   const when = i.agent_following_up
     ? 'Alex won\'t text them until you untick Agent Following Up on the brief.'
     : (optedOut(contact) ? 'They have opted out of texts, so Alex won\'t text them.' : 'Alex will text them to introduce himself at the next send window (Mon–Sat 9–6).');
-  return `ADDED: buyer brief for ${name}. ${when} Brief: ${recordLink(BRIEF_PAGE, brief.id)}`;
+  const missing = [];
+  if (!fields[B.suburbs] && !fields[B.near]) missing.push('areas');
+  if (!fields[B.types]) missing.push('property type');
+  if (!fields[B.beds]) missing.push('bedrooms');
+  if (!fields[B.pmin] && !fields[B.pmax]) missing.push('budget');
+  if (!fields[B.timeframe]) missing.push('timing');
+  if (!fields[B.finance]) missing.push('finance');
+  if (!fields[B.saleDep]) missing.push('whether they need to sell first');
+  return `ADDED: buyer brief for ${name}. ${when}` + (missing.length ? ` Still missing: ${missing.join(', ')}${i.agent_following_up ? '' : ' – Alex will ask the buyer for these'}.` : '') + ` Brief: ${recordLink(BRIEF_PAGE, brief.id)}`;
 }
 
 // Returns true when handled (a buyer Alex is looking after); false to let the other handlers run
@@ -1344,7 +1365,9 @@ async function handleBuyerSMS(from, body) {
   const merged = { fields: Object.assign({}, brief.fields, upd) };
   if (addQuestion && ['qualifying', 'nurture'].includes(st.phase || 'qualifying')) {
     const q = nextQuestion(merged, st);
-    if (q && (st.qRow || 0) < 3) {
+    if (q && /\?/.test(out || '')) {
+      // Alex's reply already asks them something: don't stack a second question on top (Stu, 30 Oct)
+    } else if (q && (st.qRow || 0) < 3) {
       out = (out ? out + ' ' : '') + q.text;
       st.asked = st.asked || {}; st.asked[q.key] = (st.asked[q.key] || 0) + 1; st.lastQ = q.key; st.qRow = (st.qRow || 0) + 1;
     } else if (q) {
@@ -1511,14 +1534,9 @@ async function nurtureOne(brief, c) {
       text = `Hi ${first}, quick check: still looking for a ${shortSummary(f)}? Anything changed with timing or budget?`;
       purpose = 'Brief re-check';
       after[B.checkedOn] = c.date;
-    } else if (!listReady(f)) {
-      const q = nextQuestion(brief, st);
-      if (q) {
-        text = `Hi ${first}, Alex here from Stone. Still keen to help you find the right place. ${q.text}`;
-        purpose = 'Qualifying question';
-        st.asked = st.asked || {}; st.asked[q.key] = (st.asked[q.key] || 0) + 1; st.lastQ = q.key; st.phase = 'qualifying';
-      }
     }
+    // Qualifying questions are only asked when the buyer engages (replies), never cold in a scheduled send (Stu, 30 Oct).
+    // Any remaining questions (another agent, sell first, finance...) are picked up the next time they reply.
     if (!text && listReady(f)) {
       const matches = (await getMany(T.matches, ids(f[B.matches]))).filter(m => sel(m.fields[MT.status]) === 'New' && (m.fields[MT.score] || 0) >= 40);
       const ls = await getMany(T.listings, matches.map(m => linkId(m.fields[MT.listing])));

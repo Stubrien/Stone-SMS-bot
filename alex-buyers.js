@@ -60,7 +60,8 @@ const B = {
   know: 'fldoO7YeFwZo0judE', source: 'fldn4d0wQDjxpmGhS', boughtAddr: 'fld5agQondpSuO1T5', settle: 'fldTu4kZHStcZC87c',
   through: 'fldP9mhab6VSd6Siu', notes: 'fldlTAcdUHJHjkQBK', created: 'fld1qKffhUxl7GmNX', matches: 'fld8rUrS7lDIAF0yH',
   state: 'fldgzAfAQQG4ogPu1', campaign: 'fldU9bnkjKJ5shc58', cStage: 'fldpydUaJkdGDTU0u', cOutcome: 'fldINgRo4UhHJZfOZ',
-  approve: 'fldYwKAzSafqHRlzP', batch: 'fldIrX6E3Qp9fNCHz', following: 'fldVan9kErtWqqXqF'
+  approve: 'fldYwKAzSafqHRlzP', batch: 'fldIrX6E3Qp9fNCHz', following: 'fldVan9kErtWqqXqF',
+  firstContact: 'fldQqrjTFxWBI7ew5'
 };
 const C = {
   name: 'fld5hDJRpN92YZnFx', mobile: 'fld0EA8biRz66il05', email: 'fldZW60VKGeM5Pc2u', agent: 'fldHsGhaiVWBnYX23',
@@ -445,7 +446,13 @@ async function createTask({ brief, contact, agent, task, due, notes }) {
 // ---------------------------------------------------------------- first texts (playbook section 2 / 7a)
 
 function optOutFor(contact) { return dncFlag(contact) ? OPT_OUT_CLEAR : OPT_OUT_LINE; }
-function firstTextFor(kind, { first, agentName, short, area, contact, when }) {
+function monthsSince(dateStr, today) {
+  if (!dateStr) return null;
+  const d = String(dateStr).slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) return null;
+  return daysBetween(d, today || clock().date) / 30.44;
+}
+function firstTextFor(kind, { first, agentName, short, area, contact, when, ageMonths = null }) {
   const hi = `Hey ${first || 'there'}, this is Alex from Stone Ballarat on behalf of ${agentName}.`;
   const oo = ' ' + optOutFor(contact);
   switch (kind) {
@@ -459,16 +466,23 @@ function firstTextFor(kind, { first, agentName, short, area, contact, when }) {
         : `${hi} Thanks for your enquiry. What sort of place are you looking for, and which areas?` + oo;
     case 'coming_soon':
       return `Hey ${first || 'there'}, Alex from Stone Ballarat on behalf of ${agentName}. Thanks for registering for ${short || 'our upcoming listing'}. I'll send the details and first open time as soon as they're locked in. Are you looking in that area generally?` + oo;
-    case 'import':
-      return short
-        ? `Hey ${first || 'there'}, this is Alex, ${agentName}'s assistant at Stone Ballarat. You enquired with us about ${short} a while back. Are you still looking to buy? I'd love to help with your search.` + oo
-        : `Hey ${first || 'there'}, this is Alex, ${agentName}'s assistant at Stone Ballarat. I'm here to help with your property buying journey and make sure you hear about the right homes first. Are you still looking to buy${area ? ' around ' + area : ''}?` + oo;
+    case 'import': {
+      // Stu's consent message, worded by how long ago they first came into Agentbox (First Contact Date)
+      const who = agentName ? `our office or ${agentName}` : 'our office';
+      const tail = ` We're trialling this texting system to help keep you up to date on new buying opportunities coming up.`;
+      const end = ` Reply Y or Yes if you are, or drop a question here. Reply STOP to opt out.`;
+      if (ageMonths === null || ageMonths < 6)
+        return `Hey ${first || 'there'}, it's Alex from Stone Ballarat. In recent months you've had some contact with ${who} about buying a property.` + tail + ` Are you happy to be involved?` + end;
+      if (ageMonths < 12)
+        return `Hey ${first || 'there'}, it's Alex from Stone Ballarat. Over the past year you've been in touch with ${who} about buying a property.` + tail + ` If you're still looking, are you happy to be involved?` + end;
+      return `Hey ${first || 'there'}, it's Alex from Stone Ballarat. A while back you were in touch with ${who} about buying a property.` + tail + ` If you're still in the market, are you happy to be involved? Reply Y or Yes if you are, or let me know if you've already bought or your plans have changed. Reply STOP to opt out.`;
+    }
     default: // agent-added / phone enquiry
       return `${hi} ${agentName} mentioned you're looking to buy around ${area || 'Ballarat'}. I'll keep an eye out and send you anything that fits. Can I ask a couple of quick questions so I only send you the right ones?` + oo;
   }
 }
 function nudgeTextFor(kind, { first, short }) {
-  if (kind === 'import') return `Hi ${first || 'there'}, Alex from Stone again. Just checking whether you're still on the hunt for a property? A quick yes or no is perfect, and I'll only send you what's relevant.`;
+  if (kind === 'import') return `Hi ${first || 'there'}, Alex from Stone Ballarat again. Just checking you saw my last message. If you'd like to hear about new buying opportunities, reply Y. If you've bought or your plans have changed, just let me know. Reply STOP to opt out.`;
   if (short && ['open', 'private', 'enquiry'].includes(kind)) return `Hi ${first || 'there'}, just following up on ${short}. Happy to send through the details or line up a time to see it. Anything I can help with?`;
   return `Hi ${first || 'there'}, Alex from Stone again. Just checking in, are you still looking to buy? A quick yes or no is perfect.`;
 }
@@ -501,7 +515,7 @@ async function createBrief({ contact, agent, source, state, extra }) {
 // Sends the first text for a brief. Caller has checked timing. Returns the send result.
 async function sendFirstText({ brief, contact, agent, kind, short, listing, reasoningNote, when }) {
   const st = getState(brief);
-  const text = firstTextFor(kind, { first: firstName(contact.fields[C.name]), agentName: agentFirst(agent), short, area: areaOf(brief, contact), contact, when });
+  const text = firstTextFor(kind, { first: firstName(contact.fields[C.name]), agentName: agentFirst(agent), short, area: areaOf(brief, contact), contact, when, ageMonths: monthsSince(brief.fields[B.firstContact]) });
   const purpose = kind === 'import' ? 'Import outreach' : (['open', 'private'].includes(kind) ? 'Inspection follow-up' : 'Enquiry reply');
   const res = await sendToBuyer({ brief, contact, text, purpose, kind: 'initiated', allowedPrices: [], reasoning: reasoningNote || ('First text: ' + kind) });
   if (!res.ok) return res;
@@ -511,6 +525,7 @@ async function sendFirstText({ brief, contact, agent, kind, short, listing, reas
   st.firstKind = kind;
   st.firstSentAt = new Date().toISOString();
   st.nudged = false;
+  if (kind === 'import') st.pending = 'import_consent';
   st.nudgeDue = kind === 'import' ? melbToISO(addDays(c.date, 3), 10, 0) : (outOfHours ? next8amISO(c) : new Date(Date.now() + 24 * 3600000).toISOString());
   if (short) st.property = { short, listingId: listing ? listing.id : null };
   st.lastOutAt = st.firstSentAt;
@@ -770,7 +785,7 @@ async function importTick() {
       if (stage === 'First sent' && days >= 3 && inScheduledWindow(c)) {
         const res = await sendToBuyer({ brief, contact, text: nudgeTextFor('import', { first: firstName(contact.fields[C.name]) }), purpose: 'Follow-up nudge', kind: 'initiated' });
         if (res.ok) {
-          st.nudged = true; st.lastOutAt = new Date().toISOString(); remember(st, 'out', res.text);
+          st.nudged = true; st.pending = 'import_consent'; st.lastOutAt = new Date().toISOString(); remember(st, 'out', res.text);
           await saveState(brief, st, { [B.cStage]: 'Nudged', [B.lastSent]: new Date().toISOString(), [B.unanswered]: (brief.fields[B.unanswered] || 0) + 1 });
         }
       } else if (stage === 'Nudged' && days >= 7) {
@@ -878,6 +893,7 @@ Intent guide: liked_property = liked the inspected home / wants another look →
  unknown_question = asks something not in the facts (building report, rates, body corp, offers received, why selling, open times unless listed);
  not_for_them = a property didn't suit; not_interested_unclear = "not interested" and it's unclear if they mean the property or the texts
  (if PENDING is "clarify" and they now say the texts → stop; the property → not_for_them);
+ (if PENDING is "import_consent", Alex has just asked whether they are happy to get buying updates: a yes → still_looking; "no", "no thanks" or "not anymore" → check_in_later_no; "already bought" → bought; "not right now / maybe later" → not_looking_now; a question → answer it);
  not_looking_now = not looking at the moment / just browsing / on hold; check_in_later_yes/no = answering "want me to check in every few months?" (PENDING "later");
  bought = they have bought (anywhere) or are answering the bought questions (PENDING "bought"); must_sell = they need to sell first or ask what theirs is worth because they'll sell;
  value_question = asks what their own home is worth without needing to sell first; neighbour = says they live near the listing; neighbour_yes = says yes to an appraisal chat after the neighbour offer;
@@ -941,6 +957,7 @@ function cleanUpdates(u, f) {
 
 // ---------------------------------------------------------------- buyer replies (section 5)
 
+const CONSENT_YES = /^\s*(y|ya|yes|yep|yeah|yup|sure|ok|okay|yes please|please|sounds good|happy to|go for it|absolutely|definitely|for sure)\s*[.!👍]*\s*$/iu;
 const STOP_WORDS = /^\s*(stop|stopall|unsubscribe|unsub|cancel|end|quit|opt ?out|remove me)\s*[.!]*\s*$/i;
 
 async function findBuyerByPhone(from) {
@@ -1039,6 +1056,9 @@ async function handleBuyerSMS(from, body) {
   // 3. Understand it
   const { listings, matches } = await knownListings(brief, st);
   let r;
+  if (st.pending === 'import_consent' && CONSENT_YES.test(text)) {
+    r = { intent: 'still_looking', reply: `Great, thanks ${first}! A couple of quick questions so I only send you what suits.`, updates: {} };
+  } else
   try { r = await readReply({ brief, contact, agent, st, text, listings }); }
   catch (e) {
     console.error('Alex buyers: read failed', e.message);
@@ -1305,10 +1325,16 @@ async function boughtFlow({ brief, contact, agent, st, upd, r, prevPending, repl
   // No address / settlement given: first follow-up 12 months from today (Stu, 29 Oct).
   Object.assign(upd, {
     [B.status]: 'Bought', [B.pause]: true,
-    [B.boughtAddr]: st.bought.address || 'Address not given',
     [B.settle]: st.bought.settlement || null,
     [B.through]: st.bought.through || 'Unknown'
   });
+  if (st.bought.address) upd[B.boughtAddr] = st.bought.address;
+  else {
+    // No address: the brief automation can't create the Sales Nurturing card, so the first follow-up is a task 12 months out
+    upd[B.notes] = ((brief.fields[B.notes] || '') + `\n${clock().date}: told Alex they bought (address not given).`).trim();
+    upd['fldnV1BXQxVwYQbm8'] = true; // Bought Processed – stops the automation looking for an address
+    await createTask({ brief, contact, agent, task: `Anniversary check-in: ${contact.fields[C.name]} bought a home (address not given)`, due: addDays(clock().date, 365), notes: 'Bought around ' + clock().date + (st.bought.through ? ' through ' + st.bought.through : '') + '. Ask where they bought and add them to Sales Nurturing.' });
+  }
   if (sel(brief.fields[B.campaign]) === 'Import outreach') { upd[B.cStage] = 'Complete'; upd[B.cOutcome] = 'Bought'; }
   st.phase = 'bought'; st.pending = null;
   await reply(`Wonderful, all the best with the move. I'll take you off the property alerts.`, 'Bought congratulations');

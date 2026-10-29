@@ -1,6 +1,7 @@
 const Anthropic = require('@anthropic-ai/sdk');
 const twilio = require('twilio');
 const alexLeads = require('./alex-leads');
+const alexBuyers = require('./alex-buyers');
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
@@ -372,6 +373,7 @@ async function sendOptOutEmail(fromNumber) {
 module.exports = function(app) {
 
   alexLeads.start();
+  alexBuyers.start();
 
   app.post('/campaign', async function(req, res) {
     const From = req.body.From;
@@ -380,6 +382,15 @@ module.exports = function(app) {
 
     // Airtable Sales Leads pilot: approver commands (YES A7 / EDIT A7 ... / NO A7 / KEEP A7 / LIST)
     // and replies from vendors on pilot agents' leads are handled by alex-leads.js
+    // Buyer side (alex-buyers.js): agent HOLD / PAUSE BUYERS / RESUME BUYERS commands
+    try {
+      if (await alexBuyers.handleAgentCommand(From, Body)) {
+        return res.type('text/xml').send('<Response></Response>');
+      }
+    } catch (e) {
+      console.error('Alex buyers command error: ' + e.message);
+    }
+
     if (alexLeads.enabled()) {
       try {
         // Texts from Stu or an agent on the Team table: preview commands, approvals and card updates
@@ -392,6 +403,15 @@ module.exports = function(app) {
       } catch (e) {
         console.error('Alex leads handler error: ' + e.message);
       }
+    }
+
+    // Replies from buyers Alex is looking after (Buyer Briefs)
+    try {
+      if (!alexLeads.isApprover(From) && await alexBuyers.handleBuyerSMS(From, Body)) {
+        return res.type('text/xml').send('<Response></Response>');
+      }
+    } catch (e) {
+      console.error('Alex buyers handler error: ' + e.message);
     }
 
     if (Body.trim().toUpperCase() === 'RESET') {

@@ -3007,7 +3007,28 @@ const ASSIST_TOOLS = [
       card_id: { type: 'string' }, message: { type: 'string', description: 'The exact SMS to send the contact' },
       replaces: { type: 'string', description: 'Code of an open draft this replaces, e.g. A7' }, confirmed: { type: 'boolean' } }, required: ['card_id', 'message'] } },
   { name: 'cancel_draft', description: 'Cancel a text to a contact that is still waiting for approval (OPEN DRAFTS), e.g. when the agent says not to send it or the plans changed.',
-    input_schema: { type: 'object', properties: { code: { type: 'string' } }, required: ['code'] } }
+    input_schema: { type: 'object', properties: { code: { type: 'string' } }, required: ['code'] } },
+  { name: 'add_buyer', description: 'Add a BUYER (someone looking to buy) to Buyer Management: creates or matches the contact and creates a buyer brief with what they want. Use this – never create_card – for buyers. Needs name and mobile; everything else is optional. Alex then texts the buyer to introduce himself at the next send window unless agent_following_up is true.',
+    input_schema: { type: 'object', properties: {
+      name: { type: 'string' }, mobile: { type: 'string' }, email: { type: 'string' },
+      lives_in: { type: 'string', description: 'Suburb they live in now' },
+      suburbs: { type: 'array', items: { type: 'string' }, description: 'Specific Ballarat suburbs they named, e.g. Buninyong, Mount Helen; "Anywhere in Ballarat" if open' },
+      near_suburb: { type: 'string', description: 'For "near / around / close to X" or "within N km of X": the centre suburb X (or Ballarat). Every suburb within radius_km is then included automatically.' },
+      radius_km: { type: 'number', description: 'Distance from near_suburb in km if they gave one (e.g. "within 5km" → 5). Leave out for "near/around" (defaults to 8 km).' },
+      property_types: { type: 'array', items: { type: 'string', enum: ['House', 'Unit / Townhouse', 'Land', 'Lifestyle / Acreage', 'Rural', 'Investment'] } },
+      beds: { type: 'number' }, baths: { type: 'number' }, car_spaces: { type: 'number' }, land_m2: { type: 'number', description: 'Minimum land in square metres (1 acre = 4047, 1 ha = 10000)' },
+      price_min: { type: 'number' }, price_max: { type: 'number' },
+      must_haves: { type: 'array', items: { type: 'string', enum: ['Single level', 'Shed / workshop', 'Study', '2 living areas', 'Garage', 'Low maintenance', 'Large block', 'Character / period', 'New / near new', 'Pool', 'Ensuite', 'Walk to schools', 'Walk to CBD', 'Rural outlook', 'Dual living / granny flat', 'Room for a pool'] } },
+      other_requirements: { type: 'string', description: 'Anything else they want that does not fit the fields (e.g. NBN, either land to build on or a house)' },
+      deal_breakers: { type: 'string' },
+      timeframe: { type: 'string', enum: ['', '0–3 months', '3–6 months', '6–12 months', '12+ months', 'Unknown'] },
+      finance: { type: 'string', enum: ['', 'Cash buyer', 'Pre-approved', 'Talking to lender', 'Not started', 'Unknown'] },
+      sale_dependency: { type: 'string', enum: ['', 'Nothing to sell', 'Sold / under contract', 'Must sell first', 'Might sell', 'Unknown'] },
+      reason: { type: 'string', enum: ['', 'First home', 'Upsizing', 'Downsizing', 'Investor', 'Relocating to Ballarat', 'Lifestyle change', 'Other'] },
+      source_detail: { type: 'string', description: 'Where the buyer came from, e.g. "Referral – friend of Stu"' },
+      notes: { type: 'string', description: 'What Alex should know about them' },
+      agent_following_up: { type: 'boolean', description: 'true if the agent will call/contact them themselves and Alex should not text yet' },
+      agent: { type: 'string', description: 'Whose buyer it is, if not the sender\'s (Stu only)' } }, required: ['name', 'mobile'] } }
 ];
 
 const BIG_STAGES = ['Lost / Not Progressing', 'Listed (Won)'];
@@ -3146,6 +3167,16 @@ async function runTool(name, input, ctx) {
     if (extra) ctx.extras.push(extra);
     return 'DONE: ' + said + (extra ? '\nALSO (tell the person, word for word if it is a question with a code): ' + extra : '');
   }
+  if (name === 'add_buyer') {
+    let owner = ctx.member;
+    if (input.agent) { if (!ctx.admin) return 'NOT ADDED: only Stu can add a buyer for another agent'; const a = await matchAgent(input.agent); if (!a) return `NOT ADDED: no team member called "${input.agent}"`; owner = a; }
+    let buyers;
+    try { buyers = require('./alex-buyers'); } catch (e) { return 'NOT ADDED: the buyer module is not installed'; }
+    if (!buyers.addBuyerFromAgent) return 'NOT ADDED: the buyer module needs updating';
+    const out = await buyers.addBuyerFromAgent({ agent: owner, input });
+    if (/^(ADDED|UPDATED)/.test(out)) ctx.done.push(`buyer ${input.name}`);
+    return out;
+  }
   if (name === 'create_card') {
     const nc = Object.assign({}, input);
     const missing = ['name', 'mobile', 'address'].filter(k => k === 'mobile' ? !isTextableMobile(normalisePhone(nc.mobile || '') || '') : !String(nc[k] || '').trim());
@@ -3175,6 +3206,10 @@ If they answer "yes" / "send it" to a draft you just showed them, call text_cont
 
 HOW TO WORK
 - When a person or property is mentioned, use search_cards (or the list below) to find the card. Never guess an id.
+- NEW PERSON: when the agent sends you someone's details, first work out whether they are a BUYER (looking to buy) or a SELLER (vendor / possible vendor). If it isn't clear from the text, ask ONE short question before adding anything: "Is Jane a buyer or a seller (or both)?".
+- SELLERS go on a card (create_card). BUYERS go in Buyer Management with add_buyer – never create_card for a buyer. BOTH: add_buyer, then ask whether to also add a seller card for the home they'll sell.
+- For a buyer, add_buyer needs a name and mobile – ask for whichever is missing. Put each detail in its field and anything that doesn't fit in other_requirements. Areas: named suburbs go in suburbs; "near / around / close to X" or "within 5km of X" go in near_suburb (+ radius_km if a distance was given) so the search covers the surrounding suburbs.
+- After add_buyer, reply in one or two lines: who was added, that Alex will text them to introduce himself and ask for whatever is still missing (the tool lists it), unless the agent said they'd call the buyer themselves (then set agent_following_up=true). Don't quiz the agent for every missing detail – Alex asks the buyer – but include anything the agent volunteers.
 - Work out what they mean using the PLAYBOOK. If it's clear, do it with the tools, then reply with what you did in one or two short lines.
 - If it isn't clear (two possible cards, an unknown phrase, a missing detail, a rule in the playbook says to check), ask ONE short question instead of acting. Offer the likely options, e.g. "Did you mean Track 5 · Cold (every 3 months)?".
 - Big changes need a yes first: the tools will tell you. When the person replies "yes" to your question, do exactly what you proposed.

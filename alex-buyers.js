@@ -257,7 +257,9 @@ function teamChanged() { teamCache.at = 0; }
 async function teamById(id) { return (await teamRows()).find(t => t.id === id) || null; }
 async function teamByPhone(from) { return (await teamRows()).find(t => samePhone(t.fields[TM.mobile], from)) || null; }
 function agentFirst(agent) { return agent ? (agent.fields[TM.first] || firstName(agent.fields[TM.name])) : 'the team'; }
-function agentLive(agent) { return !!agent && !!agent.fields[TM.buyersActive]; }          // pilot gate
+// Pilot gate. A brief Alex moved to another agent (buyer said they'd been dealing with them) keeps going
+// even if that agent isn't on the pilot yet (st.keepAlex).
+function agentLive(agent, brief) { return !!agent && (!!agent.fields[TM.buyersActive] || !!(brief && getState(brief).keepAlex)); }
 function agentPaused(agent) { return !!agent && !!agent.fields[TM.pauseBuyers]; }
 function approverMobile() { return normalisePhone(process.env.APPROVER_MOBILE); }
 function isApprover(from) { return !!approverMobile() && samePhone(from, approverMobile()); }
@@ -707,7 +709,7 @@ async function newBriefTick() {
       const contact = await primaryContact(brief);
       if (!contact) continue;
       const agent = await briefAgent(brief, contact);
-      if (!agentLive(agent)) continue;
+      if (!agentLive(agent, brief)) continue;
       const kind = kindFromSource(brief.fields[B.source]);
       if (['open', 'private'].includes(kind)) { await saveState(brief, { phase: 'awaiting_reply', note: 'from inspection, first text handled by check-in' }); continue; }
       const instant = ['enquiry', 'coming_soon'].includes(kind);
@@ -735,7 +737,7 @@ async function nudgeTick() {
       if (st.lastInAt && st.lastInAt > (st.firstSentAt || '')) { st.phase = 'qualifying'; await saveState(brief, st); continue; }
       const contact = await primaryContact(brief);
       const agent = await briefAgent(brief, contact);
-      if (!agentLive(agent) || agentPaused(agent)) continue;
+      if (!agentLive(agent, brief) || agentPaused(agent)) continue;
       if (st.nudged) { st.phase = 'nurture'; await saveState(brief, st); continue; }
       const text = nudgeTextFor(st.firstKind, { first: firstName(contact.fields[C.name]), short: (st.property || {}).short });
       const res = await sendToBuyer({ brief, contact, text, purpose: 'Follow-up nudge', kind: 'initiated' });
@@ -764,7 +766,7 @@ async function importTick() {
       }
       const contact = await primaryContact(brief);
       const agent = await briefAgent(brief, contact);
-      if (!contact || !agentLive(agent) || agentPaused(agent)) continue;
+      if (!contact || !agentLive(agent, brief) || agentPaused(agent)) continue;
       if (stage === 'Queued') {
         if (!brief.fields[B.approve] || !inScheduledWindow(c)) continue;
         if (sentToday === null) sentToday = (await sentCounts('none')).importToday;
@@ -821,6 +823,9 @@ const summarisedBatches = new Set();
 // ---------------------------------------------------------------- qualification (section 4)
 
 const QUESTIONS = [
+  // Agentbox imports are all assigned to Stu; check whether they already have a relationship with another agent (Stu, 29 Oct)
+  { key: 'agent', max: 1, done: (f, st) => sel(f[B.campaign]) !== 'Import outreach' || !!(st && st.agentChecked),
+    text: "Have you already been dealing with one of the other agents in our office? If so, I'll make sure you stay with them." },
   { key: 'area', max: 2, done: f => sels(f[B.suburbs]).length || sels(f[B.types]).length, text: 'What sort of place are you after, and which areas?' },
   { key: 'beds', max: 2, done: f => f[B.beds] || sels(f[B.must]).length, text: "How many bedrooms do you need, and anything you can't do without? (garage, single level, a shed...)" },
   { key: 'timeframe', max: 2, done: f => sel(f[B.timeframe]) && sel(f[B.timeframe]) !== 'Unknown', text: 'When are you hoping to be in? Next few months, or more down the track?' },
@@ -832,14 +837,14 @@ const QUESTIONS = [
 function nextQuestion(brief, st) {
   const asked = st.asked || {};
   for (const q of QUESTIONS) {
-    if (q.done(brief.fields)) continue;
+    if (q.done(brief.fields, st)) continue;
     if (q.key === 'price' && st.declinedPrice) continue;
     if ((asked[q.key] || 0) >= q.max) continue;
     return q;
   }
   return null;
 }
-function qualified(brief) { return QUESTIONS.every(q => q.done(brief.fields) || (q.key === 'finance') || (q.key === 'price' && getState(brief).declinedPrice)); }
+function qualified(brief) { return QUESTIONS.every(q => q.done(brief.fields, getState(brief)) || q.key === 'agent' || (q.key === 'finance') || (q.key === 'price' && getState(brief).declinedPrice)); }
 function listReady(f) { return (sels(f[B.suburbs]).length || sels(f[B.types]).length) && (f[B.beds] || f[B.pmax] || f[B.pmin]); }
 
 function briefSummary(f) {
@@ -878,7 +883,8 @@ Return: {"intent": one of ${JSON.stringify(INTENTS)},
  "property": "address of the listing they are talking about, copied from KNOWN LISTINGS, or empty",
  "feedback": "short note of what they said about that property, or empty",
  "bought": {"address":"","settlement":"YYYY-MM-DD or empty","through":"Stone Ballarat|Another agent|Private sale|Unknown"},
- "agent_note": "one line for the agent summarising what they want, or empty"}
+ "agent_note": "one line for the agent summarising what they want, or empty",
+ "other_agent": "if they say they have been dealing with a Stone agent: that agent's name as they wrote it; \"none\" if they say no / nobody / just Stu; otherwise empty"}
 Only fill update keys the buyer actually stated in THIS message (leave others empty/null). Allowed values:
  suburbs ${JSON.stringify(OPT.suburbs)}; types ${JSON.stringify(OPT.types)}; must ${JSON.stringify(OPT.must)};
  reason ${JSON.stringify(OPT.reason)}; finance ${JSON.stringify(OPT.finance)}; saleDep ${JSON.stringify(OPT.saleDep)}; timeframe ${JSON.stringify(OPT.timeframe)}.
@@ -893,6 +899,7 @@ Intent guide: liked_property = liked the inspected home / wants another look →
  unknown_question = asks something not in the facts (building report, rates, body corp, offers received, why selling, open times unless listed);
  not_for_them = a property didn't suit; not_interested_unclear = "not interested" and it's unclear if they mean the property or the texts
  (if PENDING is "clarify" and they now say the texts → stop; the property → not_for_them);
+ (if the last qualifying question asked is "agent", Alex asked whether they have been dealing with another agent in our office: "no"/"nope"/"just you" → intent answer, other_agent "none"; a name → intent answer, other_agent that name; "yes" with no name → other_agent "unknown");
  (if PENDING is "import_consent", Alex has just asked whether they are happy to get buying updates: a yes → still_looking; "no", "no thanks" or "not anymore" → check_in_later_no; "already bought" → bought; "not right now / maybe later" → not_looking_now; a question → answer it);
  not_looking_now = not looking at the moment / just browsing / on hold; check_in_later_yes/no = answering "want me to check in every few months?" (PENDING "later");
  bought = they have bought (anywhere) or are answering the bought questions (PENDING "bought"); must_sell = they need to sell first or ask what theirs is worth because they'll sell;
@@ -968,7 +975,7 @@ async function findBuyerByPhone(from) {
     || briefs.find(b => sel(b.fields[B.status]) === 'Bought' && minutesSince(b.fields[B.lastReply] || b.fields[B.lastSent]) < 14 * 1440);
   if (!brief) return null;
   const agent = await briefAgent(brief, contact);
-  if (!agentLive(agent)) return null;
+  if (!agentLive(agent, brief)) return null;
   // Only take over if Alex has actually texted this buyer (otherwise it's someone else's conversation)
   const st = getState(brief);
   if (!st.firstSentAt && !st.lastOutAt) return null;
@@ -1013,6 +1020,89 @@ async function handoff({ brief, contact, agent, st, priority, task, alertText, e
     (st.urgent = st.urgent || []).push({ taskId: t.id, at: new Date().toISOString(), after: escalateAfter, what: alertText, chased: false });
   }
   return t;
+}
+
+// Buyer answered "have you been dealing with another agent?". Match the name to the Team table and move the
+// brief + contact to that agent, tell them and Stu. Returns { newAgent } when swapped.
+function nameMatches(t, said) {
+  const s = said.toLowerCase().replace(/[^a-z ]/g, ' ').split(/\s+/).filter(Boolean);
+  const full = String(t.fields[TM.name] || '').toLowerCase();
+  const first = String(t.fields[TM.first] || firstName(t.fields[TM.name]) || '').toLowerCase();
+  return s.some(w => w.length > 2 && (w === first || full.split(/\s+/).includes(w)));
+}
+async function agentFromReply({ brief, contact, agent, st, said }) {
+  said = String(said || '').trim();
+  if (!said) { if (st.lastQ === 'agent') st.agentChecked = true; return null; }
+  st.agentChecked = true;
+  if (/^(none|no|nobody|n\/a)$/i.test(said)) return null;
+  const sales = String(process.env.BUYER_SALES_AGENTS || 'Stu Brien,Leanne Madigan,Leigh Hutchinson,Rob Cunningham,Jarrod Kemp,Jamie Gepp').split(',').map(x => x.trim().toLowerCase());
+  const team = (await teamRows()).filter(t => t.fields[TM.active] && sales.includes(String(t.fields[TM.name] || '').trim().toLowerCase()));
+  const hits = team.filter(t => nameMatches(t, said));
+  const newAgent = hits.length === 1 ? hits[0] : null;
+  if (!newAgent) {
+    await handoff({ brief, contact, agent, st, priority: 'normal', task: `Check agent for ${contact.fields[C.name]} – said "${said.slice(0, 60)}"`, alertText: `${contact.fields[C.name]} says they've been dealing with "${said.slice(0, 60)}" but I couldn't match that to one of our agents. Please re-assign the brief if needed.` });
+    return null;
+  }
+  if (agent && newAgent.id === agent.id) return null;
+  st.keepAlex = true;
+  st.agentSwap = { from: agent ? agent.id : null, to: newAgent.id, at: new Date().toISOString() };
+  try { await updateRecord(T.contacts, contact.id, { [C.agent]: [newAgent.id] }); } catch (e) { console.error('Alex buyers: contact agent swap', e.message); }
+  await createTask({ brief, contact, agent: newAgent, task: `${contact.fields[C.name]} is now yours – said they've been dealing with you`, due: clock().date,
+    notes: `Agentbox import buyer. Alex asked if they'd been dealing with another agent and they said ${agentFirst(newAgent)}. Brief moved from ${agentFirst(agent)}. Alex keeps the conversation and qualifying going; you'll get the usual alerts.` });
+  await textAgent(newAgent, `Alex: ${contact.fields[C.name]} (${contact.fields[C.mobile]}) says they've been dealing with you, so I've moved their buyer brief to you. I'll keep qualifying them and pass on anything important. Brief: ${recordLink(BRIEF_PAGE, brief.id)}`, brief, contact);
+  await alertStu(`Alex (buyers): moved ${contact.fields[C.name]} from ${agentFirst(agent)} to ${agentFirst(newAgent)} – they said they've been dealing with ${agentFirst(newAgent)}.`);
+  return { newAgent };
+}
+
+// Agent texts Alex a new buyer (called from the team assistant in alex-leads.js, tool add_buyer).
+// Creates or matches the contact (adds type Buyer) and creates a Buyer Brief with what they're after.
+// The brief's first text then goes out at the next send window unless the agent is following up themselves.
+async function addBuyerFromAgent({ agent, input }) {
+  const i = input || {};
+  const name = String(i.name || '').trim();
+  const mobile = normalisePhone(i.mobile || '');
+  if (!name) return 'NOT ADDED: need the buyer\'s name.';
+  if (!isTextableMobile(mobile)) return 'NOT ADDED: need a mobile number (04…) for the buyer.';
+  const updates = {
+    suburbs: i.suburbs || [], types: i.property_types || [], must: i.must_haves || [],
+    beds: i.beds, baths: i.baths, car: i.car_spaces, land: i.land_m2, pmin: i.price_min, pmax: i.price_max,
+    finance: i.finance, saleDep: i.sale_dependency, timeframe: i.timeframe, reason: i.reason,
+    breakers: i.deal_breakers || '', other: i.other_requirements || ''
+  };
+  let contact = await contactByPhone(mobile);
+  const types = c => sels(c.fields[C.types]);
+  if (contact) {
+    const upd = {};
+    if (!types(contact).includes('Buyer')) upd[C.types] = types(contact).concat(['Buyer']);
+    if (!contact.fields[C.email] && i.email) upd[C.email] = String(i.email).trim();
+    if (!contact.fields[C.suburb] && i.lives_in) upd[C.suburb] = String(i.lives_in).trim();
+    if (Object.keys(upd).length) await updateRecord(T.contacts, contact.id, upd);
+    const active = (await briefsOfContact(contact)).find(b => sel(b.fields[B.status]) === 'Active');
+    if (active) {
+      const fieldsUpd = cleanUpdates(updates, active.fields);
+      if (i.notes) fieldsUpd[B.know] = ((active.fields[B.know] || '') + '\n' + i.notes).trim();
+      if (Object.keys(fieldsUpd).length) await updateRecord(T.briefs, active.id, fieldsUpd);
+      return `UPDATED: ${name} already had an active buyer brief, so I added the new details to it. Brief: ${recordLink(BRIEF_PAGE, active.id)}`;
+    }
+  } else {
+    const f = { [C.name]: name, [C.mobile]: mobile, [C.types]: ['Buyer'] };
+    if (i.email) f[C.email] = String(i.email).trim();
+    if (i.lives_in) f[C.suburb] = String(i.lives_in).trim();
+    if (agent) f[C.agent] = [agent.id];
+    contact = await createRecord(T.contacts, f);
+  }
+  const fields = Object.assign(cleanUpdates(updates, {}), {
+    [B.name]: name, [B.buyers]: [contact.id], [B.status]: 'Active',
+    [B.source]: 'Agent by text' + (i.source_detail ? ' – ' + String(i.source_detail).trim() : '')
+  });
+  if (agent) fields[B.agent] = [agent.id];
+  if (i.notes) fields[B.know] = String(i.notes).trim();
+  if (i.agent_following_up) fields[B.following] = true;
+  const brief = await createRecord(T.briefs, fields);
+  const when = i.agent_following_up
+    ? 'Alex won\'t text them until you untick Agent Following Up on the brief.'
+    : (optedOut(contact) ? 'They have opted out of texts, so Alex won\'t text them.' : 'Alex will text them to introduce himself at the next send window (Mon–Sat 9–6).');
+  return `ADDED: buyer brief for ${name}. ${when} Brief: ${recordLink(BRIEF_PAGE, brief.id)}`;
 }
 
 // Returns true when handled (a buyer Alex is looking after); false to let the other handlers run
@@ -1067,6 +1157,14 @@ async function handleBuyerSMS(from, body) {
     return finish();
   }
   const fieldsUpd = cleanUpdates(r.updates, brief.fields);
+  let swapNote = '';
+  if (r.other_agent || st.lastQ === 'agent') {
+    const res = await agentFromReply({ brief, contact, agent, st, said: r.other_agent || '' });
+    if (res && res.newAgent) {
+      upd[B.agent] = [res.newAgent.id];
+      swapNote = `No worries, I'll make sure ${agentFirst(res.newAgent)} looks after you.`;
+    }
+  }
   Object.assign(upd, fieldsUpd);
   if (r.updates && r.updates.email && /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(r.updates.email.trim()) && !contact.fields[C.email]) {
     await updateRecord(T.contacts, contact.id, { [C.email]: r.updates.email.trim() });
@@ -1264,6 +1362,7 @@ async function handleBuyerSMS(from, body) {
       }
     }
   } else if (!addQuestion) { st.qRow = 0; }
+  if (swapNote) out = swapNote + (out ? ' ' + out.replace(/^(No worries|Great|Thanks)[^.!?]*[.!?]\s*/i, '') : '');
   if (out) {
     const safe = priceSafe(out, allowedPrices);
     if (!safe) {
@@ -1385,7 +1484,7 @@ async function nurtureOne(brief, c) {
   const contact = await primaryContact(brief);
   if (!contact || optedOut(contact)) return;
   const agent = await briefAgent(brief, contact);
-  if (!agentLive(agent) || agentPaused(agent)) return;
+  if (!agentLive(agent, brief) || agentPaused(agent)) return;
   const first = firstName(contact.fields[C.name]);
   const tier = sel(f[B.tier]) || 'Nurture';
   const after = { [B.lastSent]: new Date().toISOString(), [B.unanswered]: (f[B.unanswered] || 0) + 1 };
@@ -1484,7 +1583,7 @@ async function eventTick() {
       const { m, l } = cand[0];
       const contact = await primaryContact(brief);
       const agent = await briefAgent(brief, contact);
-      if (!contact || !agentLive(agent) || agentPaused(agent)) continue;
+      if (!contact || !agentLive(agent, brief) || agentPaused(agent)) continue;
       const first = firstName(contact.fields[C.name]);
       const listAgent = agentFirst(agent);
       const text = l.status === 'Coming soon'
@@ -1530,7 +1629,7 @@ async function eventTick() {
         if (text) {
           const contact = await primaryContact(brief);
           const agent = await briefAgent(brief, contact);
-          if (!contact || !agentLive(agent) || agentPaused(agent)) continue;
+          if (!contact || !agentLive(agent, brief) || agentPaused(agent)) continue;
           const res = await sendToBuyer({ brief, contact, text, purpose, kind: 'initiated', allowedPrices: [l.price].filter(Boolean), match: m });
           if (!res.ok) continue; // try again next tick (watch not updated)
           st.lastOutAt = new Date().toISOString(); remember(st, 'out', res.text);
@@ -1673,7 +1772,7 @@ function start() {
 }
 
 module.exports = {
-  start, enabled, handleBuyerSMS, handleAgentCommand,
+  start, enabled, handleBuyerSMS, handleAgentCommand, addBuyerFromAgent,
   // exposed for testing
   _t: { checkinTick, newBriefTick, nudgeTick, importTick, nurtureTick, eventTick, escalateTick, summaryTick, nextQuestion, cleanUpdates, priceSafe, firstTextFor, computeTier, listLine, inScheduledWindow, inspectionFollowUpOK, melbToISO, clock }
 };

@@ -414,7 +414,7 @@ async function sendToBuyer({ brief, contact, match, text, purpose, kind, allowed
   } catch (e) {
     await logMsg({ brief, contact, match, direction: 'To buyer', purpose, status: 'Failed', text, number, error: e.message, reasoning });
     try { await updateRecord(T.contacts, contact.id, { [C.check]: 'Alex could not text this mobile: ' + e.message.slice(0, 120) }); } catch (x) { }
-    await alertStu(`Alex (buyers): text to ${contact.fields[C.name]} failed – ${e.message.slice(0, 140)}. Mobile flagged on the contact.`);
+    dayNotes.failed.push(contact.fields[C.name]); // in the 5pm summary, not a text each time (Stu, 30 Oct)
     return { ok: false, reason: 'send failed' };
   }
 }
@@ -1056,7 +1056,7 @@ async function agentFromReply({ brief, contact, agent, st, said }) {
   await createTask({ brief, contact, agent: newAgent, task: `${contact.fields[C.name]} is now yours – said they've been dealing with you`, due: clock().date,
     notes: `Agentbox import buyer. Alex asked if they'd been dealing with another agent and they said ${agentFirst(newAgent)}. Brief moved from ${agentFirst(agent)}. Alex keeps the conversation and qualifying going; you'll get the usual alerts.` });
   await textAgent(newAgent, `Alex: ${contact.fields[C.name]} (${contact.fields[C.mobile]}) says they've been dealing with you, so I've moved their buyer brief to you. I'll keep qualifying them and pass on anything important. Brief: ${recordLink(BRIEF_PAGE, brief.id)}`, brief, contact);
-  await alertStu(`Alex (buyers): moved ${contact.fields[C.name]} from ${agentFirst(agent)} to ${agentFirst(newAgent)} – they said they've been dealing with ${agentFirst(newAgent)}.`);
+  dayNotes.swaps.push(`${contact.fields[C.name]} (${agentFirst(agent)} → ${agentFirst(newAgent)})`);
   return { newAgent };
 }
 
@@ -1247,7 +1247,7 @@ async function handleBuyerSMS(from, body) {
       upd[B.pause] = true;
       await reply(`Sorry about that ${first}, I'll get ${agentName} to give you a call.`);
       await handoff({ brief, contact, agent, st, priority: 'urgent', task: `Call ${contact.fields[C.name]} – unhappy / needs a call`, alertText: `${contact.fields[C.name]} (${contact.fields[C.mobile]}) is unhappy or asked for advice: "${text.slice(0, 200)}". I've paused Alex for them. Please call.`, escalateAfter: RESPONSE_MINUTES.complaint });
-      await alertStu(`Alex (buyers): complaint from ${contact.fields[C.name]} (${agentName}'s buyer): "${text.slice(0, 200)}". Alex paused for them; ${agentName} has an urgent task.`);
+      if (!agent || !samePhone(agent.fields[TM.mobile] || '', approverMobile() || '')) await alertStu(`Alex (buyers): complaint from ${contact.fields[C.name]} (${agentName}'s buyer): "${text.slice(0, 200)}". Alex paused for them; ${agentName} has an urgent task.`);
       await noteComplaint();
       return finish();
 
@@ -1379,12 +1379,14 @@ async function handleBuyerSMS(from, body) {
         st.phase = 'nurture';
         if (!/keep an eye out/i.test(out)) out = (out ? out + ' ' : '') + "That's really helpful. I'll keep an eye out and send you anything that fits.";
         if (sel(brief.fields[B.campaign]) === 'Import outreach' && sel(brief.fields[B.cStage]) !== 'Complete') { upd[B.cStage] = 'Complete'; upd[B.cOutcome] = 'Qualified'; }
-        if (sel(merged.fields[B.tier]) === 'Hot' || computeTier(merged.fields) === 'Hot') {
-          await handoff({ brief, contact, agent, st, priority: 'normal', task: `Hot buyer: ${contact.fields[C.name]} – ${shortSummary(merged.fields)}`, alertText: `FYI ${contact.fields[C.name]} is a Hot buyer: ${briefSummary(merged.fields)}.` });
-        }
       }
     }
   } else if (!addQuestion) { st.qRow = 0; }
+  // The opportunity improved: text + task for the agent the first time a buyer becomes Hot (Stu, 30 Oct)
+  if (!st.hotAlerted && sel(brief.fields[B.tier]) !== 'Hot' && sel(brief.fields[B.status]) === 'Active' && computeTier(merged.fields) === 'Hot') {
+    st.hotAlerted = true;
+    await handoff({ brief, contact, agent, st, priority: 'high', task: `Hot buyer: ${contact.fields[C.name]} – ${shortSummary(merged.fields)}`, alertText: `${contact.fields[C.name]} (${contact.fields[C.mobile]}) is now a Hot buyer: ${briefSummary(merged.fields)}.` });
+  }
   if (swapNote) out = swapNote + (out ? ' ' + out.replace(/^(No worries|Great|Thanks)[^.!?]*[.!?]\s*/i, '') : '');
   if (out) {
     const safe = priceSafe(out, allowedPrices);
@@ -1419,7 +1421,7 @@ async function optOut({ brief, contact, agent, st, upd, text, quietTwilio }) {
     await logMsg({ brief, contact, direction: 'To buyer', purpose: 'Opt-out confirmation', status: 'Sent', text: ack, number: contact.fields[C.mobile], sid });
   } catch (e) { if (!quietTwilio) console.error('Alex buyers: opt-out ack failed', e.message); }
   await saveState(brief, st, upd);
-  await alertStu(`Alex (buyers): ${contact.fields[C.name]} (${agentFirst(agent)}'s buyer) opted out – "${String(text).slice(0, 100)}".`);
+  dayNotes.optOuts.push(`${contact.fields[C.name]} (${agentFirst(agent)})`); // in the 5pm summary, no text each time (Stu, 30 Oct)
   await checkOptOutRate();
   return true;
 }
@@ -1574,6 +1576,10 @@ async function nurtureOne(brief, c) {
   await saveState(brief, st, after);
 }
 const quietPaused = [];
+// Low-priority events Stu sees once a day in the 5pm summary instead of a text each time (Stu, 30 Oct)
+const dayNotes = { optOuts: [], swaps: [], failed: [] };
+// Seller and property-guide opt-outs are added here too, so all opt-outs arrive in one daily summary (Stu, 30 Oct)
+function noteOptOut(label) { if (label) dayNotes.optOuts.push(String(label).slice(0, 80)); }
 
 // ---------------------------------------------------------------- events (section 7)
 
@@ -1703,7 +1709,10 @@ async function summaryTick() {
   const optouts = n(m => sel(m.fields[M.purpose]) === 'Opt-out confirmation');
   const alerts = n(m => sel(m.fields[M.direction]) === 'To agent');
   const tasks = await listAll(T.tasks, { filterByFormula: `AND({${TK.source}}='Alex',{${TK.brief}}!='',IS_AFTER(CREATED_TIME(),'${since}'))`, 'fields[]': [TK.task] });
-  const text = `Alex buyers today: ${sent} texts sent, ${replies} replies, ${tasks.length} agent tasks, ${alerts} agent alerts, ${optouts} opt-outs${failed ? ', ' + failed + ' failed' : ''}.` +
+  const text = `Alex today (buyers): ${sent} texts sent, ${replies} replies, ${tasks.length} agent tasks, ${alerts} agent alerts, ${optouts} opt-outs${failed ? ', ' + failed + ' failed' : ''}.` +
+    (dayNotes.optOuts.length ? ` Opted out: ${dayNotes.optOuts.splice(0).join(', ')}.` : '') +
+    (dayNotes.swaps.length ? ` Moved to another agent: ${dayNotes.swaps.splice(0).join(', ')}.` : '') +
+    (dayNotes.failed.length ? ` Couldn't text (mobile flagged): ${dayNotes.failed.splice(0).join(', ')}.` : '') +
     (quietPaused.length ? ` Paused (Long-term, no replies): ${quietPaused.splice(0).join(', ')}.` : '') +
     ` Review: ${recordLink(REVIEW_PAGE, '').replace(/\/$/, '')}`;
   await alertStu(text);
@@ -1790,7 +1799,7 @@ function start() {
 }
 
 module.exports = {
-  start, enabled, handleBuyerSMS, handleAgentCommand, addBuyerFromAgent,
+  start, enabled, handleBuyerSMS, handleAgentCommand, addBuyerFromAgent, noteOptOut,
   // exposed for testing
   _t: { checkinTick, newBriefTick, nudgeTick, importTick, nurtureTick, eventTick, escalateTick, summaryTick, nextQuestion, cleanUpdates, priceSafe, firstTextFor, computeTier, listLine, inScheduledWindow, inspectionFollowUpOK, melbToISO, clock }
 };

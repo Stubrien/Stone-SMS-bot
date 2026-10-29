@@ -239,6 +239,8 @@ async function sendSMS(to, body) {
   return msg.sid;
 }
 
+// Opt-outs go into the 5pm Alex summary (built in alex-buyers.js) instead of a text each time (Stu, 30 Oct)
+function noteOptOutForSummary(label) { try { require('./alex-buyers').noteOptOut(label); } catch (e) { console.log('Alex opt-out (not in summary): ' + label); } }
 function approverMobile() { return normalisePhone(process.env.APPROVER_MOBILE); }
 function isApprover(from) { return !!approverMobile() && samePhone(from, approverMobile()); }
 
@@ -1152,7 +1154,7 @@ async function handleVendorSMS(from, body) {
     await updateRecord(T.leads, lead.id, { [L.doNotContact]: true });
     await logActivity(lead.id, { summary: 'Vendor opted out by SMS – Do Not Contact ticked', type: 'General', kind: 'History' });
     await sendSMS(from, OPT_OUT_ACK);
-    await sendSMS(approverMobile(), `${f[L.name]} replied STOP – Do Not Contact is now ticked.`);
+    noteOptOutForSummary(`${f[L.name]} (seller, STOP)`); // daily summary, not a text each time (Stu, 30 Oct)
     return true;
   }
   if (f[L.doNotContact]) return true; // log only, never reply
@@ -1193,7 +1195,7 @@ async function handleVendorSMS(from, body) {
     await updateRecord(T.leads, lead.id, { [L.doNotContact]: true });
     await logActivity(lead.id, { summary: 'Vendor asked to be left alone – Do Not Contact ticked by Alex', detail: text, type: 'General', kind: 'History' });
     await sendSMS(from, OPT_OUT_ACK);
-    await sendSMS(approverMobile(), `${f[L.name]} asked to be left alone: "${text.slice(0, 200)}"\nDo Not Contact is now ticked and Alex replied: "${OPT_OUT_ACK}"\nIf Alex misread this, untick Do Not Contact on the card.`);
+    noteOptOutForSummary(`${f[L.name]} (seller, said "${text.slice(0, 40)}")`); // daily summary; the card's activity log has the full reply (Stu, 30 Oct)
     return true;
   }
 

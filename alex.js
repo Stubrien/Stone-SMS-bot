@@ -425,7 +425,7 @@ module.exports = function(app) {
       optedOut[From] = true;
       delete conversations[From];
       delete leadDetected[From];
-      await sendOptOutEmail(From);
+      try { alexBuyers.noteOptOut('Property guide bot: ' + From); } catch (e) { } // daily summary instead of an email each time (Stu, 30 Oct)
       console.log('Alex opt out received from ' + From);
       return res.type('text/xml').send('<Response></Response>');
     }

@@ -386,6 +386,23 @@ async function rawSMS(to, body) {
 // Sends a text to a buyer with every safeguard. kind: 'reply' (buyer texted first – no caps, any hour) or
 // 'initiated' (counts towards caps; caller has already checked the time window).
 // Returns { ok, reason, sid }
+// "What Alex Should Know" on the brief and the contact: background and instructions from the team (Stu, 30 Oct)
+function alexNotes(brief, contact) {
+  const parts = [brief && brief.fields[B.know], contact && contact.fields[C.know]].map(x => String(x || '').trim()).filter(Boolean);
+  return [...new Set(parts)].join('\n').slice(0, 1500);
+}
+// Plain instructions in those notes that scheduled texts must respect: "don't text", "no texts before 5pm", "only after 4pm"
+function notesRules(notes) {
+  const n = String(notes || '').toLowerCase();
+  const hr = (h, ap) => { h = +h; if (ap === 'pm' && h < 12) h += 12; if (ap === 'am' && h === 12) h = 0; return h; };
+  const rules = {};
+  if (/\b(don'?t|do not|no|stop)\s+(text|sms|messag|contact)/.test(n) && !/\b(before|after|until)\b/.test(n)) rules.noTexts = true;
+  let m = n.match(/(?:not|no\s+\w+|don'?t\s+\w+)\s+(?:\w+\s+)?before\s+(\d{1,2})\s*(am|pm)?/) || n.match(/only\s+(?:\w+\s+)?after\s+(\d{1,2})\s*(am|pm)?/);
+  if (m) rules.notBefore = hr(m[1], m[2] || (+m[1] < 8 ? 'pm' : ''));
+  m = n.match(/(?:not|no\s+\w+|don'?t\s+\w+)\s+(?:\w+\s+)?after\s+(\d{1,2})\s*(am|pm)?/) || n.match(/only\s+(?:\w+\s+)?before\s+(\d{1,2})\s*(am|pm)?/);
+  if (m) rules.notAfter = hr(m[1], m[2] || (+m[1] < 8 ? 'pm' : ''));
+  return rules;
+}
 async function sendToBuyer({ brief, contact, match, text, purpose, kind, allowedPrices, reasoning, skipDuplicateCheck }) {
   const number = contact && contact.fields[C.mobile];
   text = plainSMS(text);
@@ -395,6 +412,10 @@ async function sendToBuyer({ brief, contact, match, text, purpose, kind, allowed
   if (kind !== 'reply') {
     if (brief.fields[B.pause] || brief.fields[B.following]) return fail('paused / agent following up');
     if (!['Active'].includes(sel(brief.fields[B.status]))) return fail('brief not active');
+    const rules = notesRules(alexNotes(brief, contact)), hour = clock().hour;
+    if (rules.noTexts) return fail('notes say no texts');
+    if (rules.notBefore !== undefined && hour < rules.notBefore) return fail('notes: not before ' + rules.notBefore + ':00');
+    if (rules.notAfter !== undefined && hour >= rules.notAfter) return fail('notes: not after ' + rules.notAfter + ':00');
     const counts = await sentCounts(contact.id);
     if (counts.totalToday >= DAILY_CAP) return fail('daily cap');
     if (counts.buyerToday >= 1) return fail('already texted today');
@@ -656,7 +677,7 @@ async function processWaitingCheckin(ci, c) {
   const when = ciDate === c.date ? 'today' : (ciDate === addDays(c.date, -1) ? 'yesterday' : 'on ' + ({ Mon: 'Monday', Tue: 'Tuesday', Wed: 'Wednesday', Thu: 'Thursday', Fri: 'Friday', Sat: 'Saturday', Sun: 'Sunday' })[weekdayOf(ciDate)]);
   const res = await sendFirstText({ brief, contact, agent, kind, short, listing, when });
   if (res.ok) return updateRecord(T.checkins, ci.id, { [CI.alexStatus]: 'Texted', [CI.alexNote]: '' });
-  if (['already texted today', '2 this week', 'daily cap'].includes(res.reason)) return; // try again later
+  if (['already texted today', '2 this week', 'daily cap'].includes(res.reason) || /^notes: not/.test(res.reason || '')) return; // try again later
   return skip('Not sent: ' + res.reason);
 }
 
@@ -719,7 +740,7 @@ async function newBriefTick() {
       if (optedOut(contact) || !isTextableMobile(contact.fields[C.mobile])) { await saveState(brief, { phase: 'nurture', note: 'no first text – opted out or no mobile' }); continue; }
       const short = (String(brief.fields[B.source] || '').split(' – ')[1] || '').trim();
       const res = await sendFirstText({ brief, contact, agent, kind, short });
-      if (!res.ok && !['already texted today', '2 this week', 'daily cap'].includes(res.reason)) await saveState(brief, { phase: 'nurture', note: 'first text not sent: ' + res.reason });
+      if (!res.ok && !['already texted today', '2 this week', 'daily cap'].includes(res.reason) && !/^notes: not/.test(res.reason || '')) await saveState(brief, { phase: 'nurture', note: 'first text not sent: ' + res.reason });
     } catch (e) { console.error('Alex buyers: new brief ' + brief.id, e.message); }
   }
 }
@@ -745,7 +766,7 @@ async function nudgeTick() {
       if (res.ok) {
         st.nudged = true; st.phase = 'nurture'; st.lastOutAt = new Date().toISOString(); remember(st, 'out', res.text);
         await saveState(brief, st, { [B.lastSent]: new Date().toISOString(), [B.unanswered]: (brief.fields[B.unanswered] || 0) + 1 });
-      } else if (!['already texted today', '2 this week', 'daily cap'].includes(res.reason)) { st.phase = 'nurture'; await saveState(brief, st); }
+      } else if (!['already texted today', '2 this week', 'daily cap'].includes(res.reason) && !/^notes: not/.test(res.reason || '')) { st.phase = 'nurture'; await saveState(brief, st); }
     } catch (e) { console.error('Alex buyers: nudge ' + brief.id, e.message); }
   }
 }
@@ -888,7 +909,7 @@ Return: {"intent": one of ${JSON.stringify(INTENTS)},
  "bought": {"address":"","settlement":"YYYY-MM-DD or empty","through":"Stone Ballarat|Another agent|Private sale|Unknown"},
  "agent_note": "one line for the agent summarising what they want, or empty",
  "other_agent": "if they say they have been dealing with a Stone agent: that agent's name as they wrote it; \"none\" if they say no / nobody / just Stu; otherwise empty"}
-Only fill update keys the buyer actually stated in THIS message (leave others empty/null). Allowed values:
+Only fill update keys the buyer actually stated in THIS message, or that AGENT NOTES state and "Brief so far" doesn't have yet (leave others empty/null). Allowed values:
  suburbs ${JSON.stringify(OPT.suburbs)}; types ${JSON.stringify(OPT.types)}; must ${JSON.stringify(OPT.must)};
  reason ${JSON.stringify(OPT.reason)}; finance ${JSON.stringify(OPT.finance)}; saleDep ${JSON.stringify(OPT.saleDep)}; timeframe ${JSON.stringify(OPT.timeframe)}.
  Areas: a list of named suburbs → suburbs. "Near / around / close to X" or "within N km of X" → near = X (a suburb name, or Ballarat) and radius_km = N (null if no distance given); you can set both near and suburbs.
@@ -914,6 +935,7 @@ Intent guide: liked_property = liked the inspected home / wants another look →
 Reply rules (the reply is sent as-is by SMS from Alex, on behalf of the agent):
  - Warm, local, plain Australian English, like a real person. 1-2 short sentences. No emojis. Don't start with filler (Great, Absolutely, Perfect).
  - Do NOT ask any qualifying question (areas, beds, timing, finance, selling, budget) - the system adds the next one.
+ - AGENT NOTES are background from the team ("What Alex Should Know"). Follow any instructions in them (who to deal with, what to avoid, how to address them), use them to understand the buyer, but never quote them or mention that you have notes.
  - Never give a value or price opinion. Only quote a price by copying a listing's Price exactly from KNOWN LISTINGS. Never invent facts, open times or dates.
  - Never share vendor details, reasons for selling, offers or other buyers' interest. Never promise what the agent will do beyond "I'll get {agent} to ..." / "I'll pass that on".
  - For intents handled by fixed wording (wants_inspection, wants_offer, contract_request, not_interested_unclear, not_looking_now, check_in_later_yes, check_in_later_no, bought, stop, complaint, who_is_this, must_sell, value_question, neighbour, unknown_question) the reply can be empty.
@@ -925,6 +947,7 @@ async function readReply({ brief, contact, agent, st, text, listings }) {
   const hist = (st.history || []).slice(-8).map(h => `${h.d === 'in' ? 'Buyer' : 'Alex'}: ${h.t}`).join('\n');
   const user = `Agent: ${agentFirst(agent)}. Buyer: ${contact.fields[C.name]}.
 Brief so far: ${briefSummary(f)}.
+AGENT NOTES: ${alexNotes(brief, contact) || '(none)'}
 PENDING: ${st.pending || 'none'}. Last qualifying question asked: ${st.lastQ || 'none'}.
 KNOWN LISTINGS:
 ${facts || '(none)'}

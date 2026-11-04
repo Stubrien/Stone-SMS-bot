@@ -500,6 +500,8 @@ function firstTextFor(kind, { first, agentName, short, area, contact, when, ageM
         return `Hey ${first || 'there'}, it's Alex from Stone Ballarat. Over the past year you've been in touch with ${who} about buying a property.` + tail + ` If you're still looking, are you happy to be involved?` + end;
       return `Hey ${first || 'there'}, it's Alex from Stone Ballarat. A while back you were in touch with ${who} about buying a property.` + tail + ` If you're still in the market, are you happy to be involved? Reply Y or Yes if you are, or let me know if you've already bought or your plans have changed. Reply STOP to opt out.`;
     }
+    case 'intro': // Add New Buyer page – the agent has already spoken to them (Stu's wording, 5 Nov)
+      return `Hey ${first || 'there'}, this is Alex from Stone Ballarat. ${agentName || 'The team'} has asked me to keep you in the loop on listings that might suit what you're after. I'll text you when I see something, whether it's one of ours or not. You might already be across it, which is fine, and if it's way off the mark let me know so I can update your criteria. If at any time these get too much, or you find what you're looking for, just say so and we'll leave you alone. Thanks, Alex` + (dncFlag(contact) ? ' ' + OPT_OUT_CLEAR : '');
     default: // agent-added / phone enquiry
       return `${hi} ${agentName} mentioned you're looking to buy around ${area || 'Ballarat'}. I'll keep an eye out and send you anything that fits. Can I ask a couple of quick questions so I only send you the right ones?` + oo;
   }
@@ -511,6 +513,7 @@ function nudgeTextFor(kind, { first, short }) {
 }
 function kindFromSource(src) {
   const s = String(src || '').toLowerCase();
+  if (/add buyer page/.test(s)) return 'intro'; // agent added them on the Add New Buyer page (Stu, 5 Nov)
   if (/coming soon|pre-market|register/.test(s)) return 'coming_soon';
   if (/agentbox import|import/.test(s)) return 'import';
   if (/phone|call|walk-in|referral|agent/.test(s)) return 'agent';
@@ -545,7 +548,7 @@ async function sendFirstText({ brief, contact, agent, kind, short, listing, reas
   if (!res.ok) return res;
   const c = clock();
   const outOfHours = c.hour < 8 || c.hour >= 19 || c.weekday === 'Sun';
-  st.phase = 'awaiting_reply';
+  st.phase = kind === 'intro' ? 'nurture' : 'awaiting_reply'; // intro asks nothing, so no follow-up nudge
   st.firstKind = kind;
   st.firstSentAt = new Date().toISOString();
   st.nudged = false;
@@ -1600,9 +1603,11 @@ async function nurtureOne(brief, c) {
 }
 const quietPaused = [];
 // Low-priority events Stu sees once a day in the 5pm summary instead of a text each time (Stu, 30 Oct)
-const dayNotes = { optOuts: [], swaps: [], failed: [] };
+const dayNotes = { optOuts: [], swaps: [], failed: [], sellerEnq: [] };
 // Seller and property-guide opt-outs are added here too, so all opt-outs arrive in one daily summary (Stu, 30 Oct)
 function noteOptOut(label) { if (label) dayNotes.optOuts.push(String(label).slice(0, 80)); }
+// Unqualified social seller enquiries that didn't need an agent (alex-leads.js) – listed in the 5pm summary (Stu, 3 Nov)
+function noteSellerEnquiry(label) { if (label) dayNotes.sellerEnq.push(String(label).slice(0, 140)); }
 
 // ---------------------------------------------------------------- events (section 7)
 
@@ -1736,6 +1741,7 @@ async function summaryTick() {
     (dayNotes.optOuts.length ? ` Opted out: ${dayNotes.optOuts.splice(0).join(', ')}.` : '') +
     (dayNotes.swaps.length ? ` Moved to another agent: ${dayNotes.swaps.splice(0).join(', ')}.` : '') +
     (dayNotes.failed.length ? ` Couldn't text (mobile flagged): ${dayNotes.failed.splice(0).join(', ')}.` : '') +
+    (dayNotes.sellerEnq.length ? `\nSocial value enquiries (no agent needed): ${dayNotes.sellerEnq.splice(0).join('; ')}.` : '') +
     (quietPaused.length ? ` Paused (Long-term, no replies): ${quietPaused.splice(0).join(', ')}.` : '') +
     ` Review: ${recordLink(REVIEW_PAGE, '').replace(/\/$/, '')}`;
   await alertStu(text);
@@ -1822,7 +1828,7 @@ function start() {
 }
 
 module.exports = {
-  start, enabled, handleBuyerSMS, handleAgentCommand, addBuyerFromAgent, noteOptOut,
+  start, enabled, handleBuyerSMS, handleAgentCommand, addBuyerFromAgent, noteOptOut, noteSellerEnquiry,
   // exposed for testing
   _t: { checkinTick, newBriefTick, nudgeTick, importTick, nurtureTick, eventTick, escalateTick, summaryTick, nextQuestion, cleanUpdates, priceSafe, firstTextFor, computeTier, listLine, inScheduledWindow, inspectionFollowUpOK, melbToISO, clock }
 };

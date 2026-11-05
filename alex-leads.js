@@ -1586,6 +1586,23 @@ function UNQ_GOALS(agentFirst, salesNear) {
     'BOOKING RULES: ';
 }
 
+// Add a detail to a "; "-separated field without repeating what's already there (Stu, 5 Nov: details were
+// being re-appended on every reply). A new detail that already appears is skipped; one that extends an existing
+// detail (e.g. "2-bed granny flat" → "2-bed granny flat with 1 bathroom") replaces it.
+function mergeDetail(existing, add) {
+  const words = x => new Set(String(x || '').toLowerCase().replace(/[^a-z0-9 ]/g, ' ').split(/\s+/).filter(Boolean));
+  const covers = (big, small) => { const B = words(big), S = words(small); return S.size > 0 && [...S].every(w => B.has(w)); };
+  const parts = [];
+  const addPart = piece => {
+    if (!piece || parts.some(p => covers(p, piece))) return;               // already said (same or fuller detail)
+    for (let i = parts.length - 1; i >= 0; i--) if (covers(piece, parts[i])) parts.splice(i, 1); // fuller version replaces it
+    parts.push(piece);
+  };
+  for (const x of String(existing || '').split(/;\s*/)) addPart(x.trim());
+  for (const x of String(add || '').split(/;\s*/)) addPart(x.trim());
+  return parts.join('; ');
+}
+
 async function handleNewLeadReply(lead, from, text, ctx) {
   const f = lead.fields;
   const state = getState(lead);
@@ -1614,6 +1631,7 @@ async function handleNewLeadReply(lead, from, text, ctx) {
       ? `3) if they are thinking of moving, offer an appraisal at one of ${agentFirst}'s free times: ${slots.map(x => `${x.label} (${x.local})`).join(' or ')}. If they accept one of these, outcome "book_at" with book_at set to it; if neither suits, ask what days/times generally suit and use outcome "appraisal" (the agent will confirm); `
       : `3) if they are thinking of moving, offer an appraisal and ask what days and times generally suit over the next week or so. Once they've said, outcome "appraisal": your reply thanks them and says you'll check with ${agentFirst} and confirm a time ${isBH(c) && c.hour < 17 ? 'shortly' : 'in the morning'} (never promise a time yourself); fill options with up to 3 specific times (YYYY-MM-DDTHH:MM, Mon–Sat 9:00–17:00, on the hour or half hour) that match what they said and avoid ${agentFirst}'s booked times: ${bookingsText(bookings)}; `) +
     '4) if they only want an update or an appraisal does not suit, agree a day and time for the agent to call. ' +
+    'PRICE REQUEST: if they ask for a price, estimate, ballpark or "what it might be worth" but do not want a visit (or put the visit off, e.g. "I will let you know"), do not push the appraisal again and do NOT put them in nurture: say ' + agentFirst + ' can put together a desktop estimate from recent sales nearby and send it through to them (ask whether text or email suits only if you do not know), then outcome "price_update". You still never give a figure yourself. ' +
     (state.unq
       ? 'FIRM LIMITS: never give a price opinion, valuation, range or ballpark for THEIR property, and never discuss commission (an accurate figure needs a visit) - quoting the actual sold prices listed above is fine. Mild surprise or annoyance is NOT a handover - handle it as in goal 1. Abuse, complaints, legal, tenancy or buying questions → outcome "handover"; any request to stop or be left alone → outcome "opt_out". '
       : 'FIRM LIMITS: never give a price, valuation, range or commission (an accurate figure needs a visit); anything outside this script (legal, tenancy, complaints, upset, buying questions) → outcome "handover"; any request to stop or be left alone → outcome "opt_out". ') +
@@ -1622,8 +1640,8 @@ async function handleNewLeadReply(lead, from, text, ctx) {
     'Return JSON only: {"reply": "Alex\'s next text (empty only for opt_out)", ' +
     '"details": {"beds": null, "baths": null, "living": null, "study": null, "block": null, "outdoor": "", "parking": "", "shedding": "", "yearBuilt": "", "renos": "", "yearsOwned": null, "other": ""}, ' +
     '"motivation": "Making a move|Just an update|Unsure|", "timing": "their words or empty", "address": "street address or suburb they told you, or empty", "owner": "yes|no|", "prompted_by": "what got them thinking about a price update, or empty", "disqualify_reason": "Bogus or duplicate|Not interested|Not engaged|", ' +
-    '"outcome": "continue|appraisal|book_at|call_time|nurture|disqualify|handover|opt_out", "book_at": "YYYY-MM-DDTHH:MM local appraisal time they accepted, or empty", "preferred_times": "days/times they offered for an appraisal, or empty", "options": ["YYYY-MM-DDTHH:MM", "…up to 3, only for outcome appraisal"], ' +
-    '"call_at": "YYYY-MM-DDTHH:MM local time agreed for the agent to call, or empty", "nurture_reason": "if they are clearly not moving for 3+ months: one of ' + NURTURE_REASONS.slice(0, 5).join(' | ') + '", ' +
+    '"outcome": "continue|appraisal|book_at|call_time|price_update|nurture|disqualify|handover|opt_out", "book_at": "YYYY-MM-DDTHH:MM local appraisal time they accepted, or empty", "preferred_times": "days/times they offered for an appraisal, or empty", "options": ["YYYY-MM-DDTHH:MM", "…up to 3, only for outcome appraisal"], ' +
+    '"call_at": "YYYY-MM-DDTHH:MM local time agreed for the agent to call, or empty", "price_send_by": "text|email| – how they want the desktop estimate, if they said", "nurture_reason": "if they are clearly not moving for 3+ months and have NOT asked for a price: one of ' + NURTURE_REASONS.slice(0, 5).join(' | ') + '", ' +
     '"handover_reason": "", "summary": "one line for the agent: what we learned and what happens next"}';
   const out = await claudeJSON(VOICE + ' You also extract facts accurately and conservatively.', user, 900);
 
@@ -1633,7 +1651,10 @@ async function handleNewLeadReply(lead, from, text, ctx) {
   const num = v => (v === null || v === undefined || v === '' || isNaN(Number(v))) ? null : Number(v);
   for (const k of ['beds', 'baths', 'living', 'block', 'yearsOwned']) { const v = num(d[k]); if (v !== null && !f[PROP[k]]) upd[PROP[k]] = v; }
   if (d.study === true && !f[PROP.study]) upd[PROP.study] = true;
-  for (const k of ['outdoor', 'parking', 'shedding', 'yearBuilt', 'renos', 'other']) if (d[k] && String(d[k]).trim()) upd[PROP[k]] = f[PROP[k]] ? (f[PROP[k]] + '; ' + d[k]) : d[k];
+  for (const k of ['outdoor', 'parking', 'shedding', 'yearBuilt', 'renos', 'other']) if (d[k] && String(d[k]).trim()) {
+    const merged = mergeDetail(f[PROP[k]], String(d[k]).trim());
+    if (merged !== (f[PROP[k]] || '')) upd[PROP[k]] = merged;
+  }
   if (['Making a move', 'Just an update', 'Unsure'].includes(out.motivation)) upd[PROP.motivation] = out.motivation;
   if (out.timing) upd[PROP.timing] = out.timing;
   if (state.unq && out.address && !f[L.address]) upd[L.address] = String(out.address).slice(0, 120);
@@ -1642,7 +1663,7 @@ async function handleNewLeadReply(lead, from, text, ctx) {
     const extra = [];
     if (/^(yes|no)$/i.test(out.owner || '') && !state.ownerNoted) { extra.push('Owner: ' + out.owner.toLowerCase()); state.ownerNoted = true; }
     if (out.prompted_by && !state.promptNoted) { extra.push('What prompted the price check: ' + out.prompted_by); state.promptNoted = true; }
-    if (extra.length) { const base = upd[PROP.other] || f[PROP.other] || ''; upd[PROP.other] = (base ? base + '; ' : '') + extra.join('; '); }
+    if (extra.length) { const base = upd[PROP.other] || f[PROP.other] || ''; upd[PROP.other] = mergeDetail(base, extra.join('; ')); }
     if (extra.length || Object.values(d).some(v => v !== null && v !== '' && v !== undefined && v !== false)) state.engaged = true;
   }
 
@@ -1686,6 +1707,10 @@ async function handleNewLeadReply(lead, from, text, ctx) {
     Object.assign(upd, { [L.stage]: 'Qualifying', [L.nextAction]: `Call ${first} – ${when}`, [L.nextActionDate]: iso ? new Date(iso).toLocaleDateString('en-CA', { timeZone: TZ }) : dueNext, [L_ALEX_STATUS]: 'Done' });
     if (iso) upd[L_CALL_AT] = iso;
     outcome = `call booked ${when}`;
+  } else if (out.outcome === 'price_update') {
+    const via = /email/i.test(out.price_send_by || '') ? ' by email' : /text|sms/i.test(out.price_send_by || '') ? ' by text' : '';
+    Object.assign(upd, { [L.stage]: 'Price Update / Desktop Required', [L.nextAction]: `Send ${first} a desktop price estimate${f[L.address] ? ' for ' + f[L.address] : ''}${via}`, [L.nextActionDate]: dueNext, [L_ALEX_STATUS]: 'Done' });
+    outcome = `wants a price estimate but not a visit yet – moved to Price Update / Desktop Required; please send a desktop estimate${via}`;
   } else if (out.outcome === 'nurture' && NURTURE_REASONS.includes(out.nurture_reason)) {
     Object.assign(upd, { [L.stage]: 'Nurture', [L.nurtureReason]: out.nurture_reason, [L_ALEX_STATUS]: 'Done' });
     outcome = `not moving yet – on the nurture track "${out.nurture_reason}"`;

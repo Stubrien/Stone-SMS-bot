@@ -12,6 +12,10 @@
 // - Listed (Won): texts Fiona and the agent; chases the agent if Fiona says the authority hasn't arrived
 // - Lost cards: 3-month check-in for "selling privately", Track 6 after 6 months for "not selling"
 // - GoHighLevel social-media leads texted in as "NEW LEAD / Name: … / Mobile: …" create or update the card
+// - "UNQUALIFIED LEAD" (same layout) = someone who tapped a value post expecting an instant estimate: card goes in
+//   the Unqualified Leads stage, allocated to Stu; Alex texts straight away 24/7, explains what drives price, asks to run
+//   through a few questions (features, owner?, what prompted it) and ends with: qualified now (agent), qualified for later
+//   (Nurture) or disqualified (Lost). No engagement after one follow-up = disqualified. Agent only texted when qualified.
 //   (env GHL_LEAD_NUMBERS = the number(s) GoHighLevel sends from)
 // - Qualifying calls (Call At): morning-of text to the contact, a brief to the agent 15 min before, "how did it go?"
 //   an hour after; "no answer" → Alex texts the contact for a better time and books it from their reply
@@ -1365,6 +1369,7 @@ const PROP = {
 // Everything else that is new (Summer intake, phone/walk-in, agent form) goes into NO_CONTACT for the agent to follow up,
 // which is also where Alex moves a social lead he couldn't reach.
 const NEW_SOCIAL = 'New (Socials) - Alex to Engage';
+const UNQ_STAGE = 'Unqualified Leads';   // unqualified social value enquiries (Stu, 3 Nov 2026)
 const NO_CONTACT = 'New – Agent Follow Up';
 const isNewStage = s => s === NEW_SOCIAL || s === 'New';
 const NEW_LEAD_MAX_AGE_DAYS = 3;   // older cards sitting in New are not blasted when this goes live
@@ -1444,7 +1449,7 @@ async function newLeadTick() {
   const c = melbClock();
   const agents = await alexActiveAgentIds();
   if (!agents.size) return;
-  const leads = (await listAll(T.leads, { filterByFormula: `AND(OR({${L.stage}}='${NEW_SOCIAL}',{${L.stage}}='${NO_CONTACT}',{${L.stage}}='Qualifying'),NOT({${L_PARKED}}),NOT({${L.doNotContact}}),NOT({${L.pauseAlex}}))` }))
+  const leads = (await listAll(T.leads, { filterByFormula: `AND(OR({${L.stage}}='${NEW_SOCIAL}',{${L.stage}}='${UNQ_STAGE}',{${L.stage}}='${NO_CONTACT}',{${L.stage}}='Qualifying'),NOT({${L_PARKED}}),NOT({${L.doNotContact}}),NOT({${L.pauseAlex}}))` }))
     .filter(l => (l.fields[L.agent] || []).some(id => agents.has(id)));
   for (const lead of leads) {
     try { await newLeadStep(lead, c); } catch (e) { console.error('Alex leads: new lead step failed for ' + lead.id, e.message); }
@@ -1480,6 +1485,16 @@ async function newLeadStep(lead, c) {
     return;
   }
   if (state.flow !== 'newlead') return;
+  if (state.unq) {
+    // Allocated after it came in (e.g. Stu picked the agent): start once the card is 10+ minutes old, within 2 days
+    if (state.phase === 'starting') {
+      const age = minutesSince(lead.createdTime);
+      if (age >= 10 && age <= 2 * 1440 && (f[L.agent] || []).length) console.log('Alex leads: late unqualified start ' + lead.id + ' – ' + await startUnqualifiedFlow(lead.id));
+      return;
+    }
+    await unqStep(lead, state, c, agent);
+    return;
+  }
 
   if (state.phase === 'alerted') {
     if (!isNewStage(stage)) { state.phase = 'done'; await setState(lead.id, state); return; } // the agent moved the card themselves
@@ -1554,6 +1569,23 @@ async function newLeadConversationHistory(lead) {
     .slice(-16).map(m => `${sel(m.fields[M.direction]) === 'From vendor' ? 'CONTACT' : 'ALEX'}: ${m.fields[M.finalText] || m.fields[M.draft] || ''}`).join('\n');
 }
 
+function UNQ_GOALS(agentFirst, salesNear) {
+  return 'CONTEXT: this person tapped one of our social media posts about property values, probably expecting an instant online estimate on their screen. ' +
+    'They did not necessarily expect to hear from a real estate office and may be surprised, confused or a bit annoyed. They are NOT a qualified lead yet. ' +
+    'Your first text told them it is hard for a computer to price a home from just an address (size of home and land, condition and updates, recent nearby sales drive value) and asked if they would answer a few quick questions. ' +
+    'You are texting them with no one approving each text. Be light, curious and helpful, never pushy, ONE question per text. ' +
+    'THE END GAME: qualify them as a lead for now or for later, or disqualify them and close the enquiry. ' +
+    'Steps: 1) if they seem surprised, confused or annoyed, acknowledge it simply (their details came through when they tapped our property value post), sorry for the surprise, no obligation - ask if they would still like to run through a few questions, or leave it there (left alone → outcome "opt_out"); ' +
+    '2) if they are open to it, ask the questions one at a time, in a natural order: is it their own home (are they the owner)? then beds, bathrooms, car spaces, land size, living spaces, renovations or updates - and what has got them thinking about a price update; ' +
+    '3) as they answer, give a little genuine feedback on what drives price (e.g. a second living area or a renovated kitchen matters to buyers) and, where it helps, compare with REAL recent sales from the list below - never invent a sale, and never estimate their property, a range or a "ballpark" (an accurate figure needs someone to see it); ' +
+    `4) qualified NOW (thinking of selling in the next few months, or wants a proper figure): offer a free, no-obligation appraisal with ${agentFirst} or a short call - BOOKING RULES below; ` +
+    '5) qualified for LATER (owner, maybe selling down the track, or curious and happy to hear from us): offer to text them local sales every now and then; outcome "nurture" with the nurture_reason that fits their timing ("Not quite ready (~3 months)", "Too early (~6 months)" or "Curious (12 months+)"); ' +
+    '6) DISQUALIFY and close politely → outcome "disqualify". disqualify_reason "Bogus or duplicate" ONLY when they say it is the wrong number, they are not the person named on the CARD (name does not match), or they never made the enquiry; "Not interested" when they say they are not interested / do not want updates (including non-owners with no interest); "Not engaged" when they keep brushing the questions off without saying either. Your reply thanks them and closes kindly. ' +
+    'Set motivation "Making a move" only if they say they are thinking of selling or moving. Set "owner" to yes or no once you know. ' +
+    (salesNear.text ? `RECENT SALES NEAR ${salesNear.suburb.toUpperCase()} (from our Market Sales data):\n${salesNear.text}\n` : 'RECENT SALES: none found yet for their area - you can ask their street or suburb, but keep the focus on the questions; never invent sales. ') +
+    'BOOKING RULES: ';
+}
+
 async function handleNewLeadReply(lead, from, text, ctx) {
   const f = lead.fields;
   const state = getState(lead);
@@ -1570,24 +1602,27 @@ async function handleNewLeadReply(lead, from, text, ctx) {
   }
   let bookings = [];
   if (!slots.length && agent) { try { bookings = await agentBookings(agent.id); } catch (e) { console.error('Alex leads: bookings failed', e.message); } }
+  const salesNear = state.unq ? await salesNearText(f[L.address] || text, 8) : { suburb: '', text: '' };
   const user =
     `NOW: ${c.weekday} ${c.date} ${String(c.hour).padStart(2, '0')}:${String(c.minute).padStart(2, '0')} Melbourne. AGENT: ${agentName}.\n` +
     `CARD: ${JSON.stringify({ name: f[L.name] || '', address: f[L.address] || '', source: sel(f[L.source]), sourceDetail: f[L.sourceDetail] || '' })}\n` +
     `PROPERTY DETAILS SO FAR: ${JSON.stringify(known)}\n\nCONVERSATION SO FAR:\n${convo}\nCONTACT (just now): ${text}\n\n` +
-    'You are running the first conversation with a new enquiry, on behalf of the agent, with no one approving each text. Goals, in order: ' +
+    (state.unq ? UNQ_GOALS(agentFirst, salesNear) : 'You are running the first conversation with a new enquiry, on behalf of the agent, with no one approving each text. Goals, in order: ' +
     '1) chat naturally and pick up property details (beds, bathrooms, living spaces, study, block size, outdoor area, parking, shedding, age, renovations, years owned) – ask ONE follow-up at a time, only for the gaps that matter most (beds, baths, block size, motivation, timing), never a questionnaire; ' +
-    '2) qualify: "Are you thinking of making a move, or just keen to get an update on value?" and note any timing; ' +
+    '2) qualify: "Are you thinking of making a move, or just keen to get an update on value?" and note any timing; ') +
     (slots.length
       ? `3) if they are thinking of moving, offer an appraisal at one of ${agentFirst}'s free times: ${slots.map(x => `${x.label} (${x.local})`).join(' or ')}. If they accept one of these, outcome "book_at" with book_at set to it; if neither suits, ask what days/times generally suit and use outcome "appraisal" (the agent will confirm); `
       : `3) if they are thinking of moving, offer an appraisal and ask what days and times generally suit over the next week or so. Once they've said, outcome "appraisal": your reply thanks them and says you'll check with ${agentFirst} and confirm a time ${isBH(c) && c.hour < 17 ? 'shortly' : 'in the morning'} (never promise a time yourself); fill options with up to 3 specific times (YYYY-MM-DDTHH:MM, Mon–Sat 9:00–17:00, on the hour or half hour) that match what they said and avoid ${agentFirst}'s booked times: ${bookingsText(bookings)}; `) +
     '4) if they only want an update or an appraisal does not suit, agree a day and time for the agent to call. ' +
-    'FIRM LIMITS: never give a price, valuation, range or commission (an accurate figure needs a visit); anything outside this script (legal, tenancy, complaints, upset, buying questions) → outcome "handover"; any request to stop or be left alone → outcome "opt_out". ' +
+    (state.unq
+      ? 'FIRM LIMITS: never give a price opinion, valuation, range or ballpark for THEIR property, and never discuss commission (an accurate figure needs a visit) - quoting the actual sold prices listed above is fine. Mild surprise or annoyance is NOT a handover - handle it as in goal 1. Abuse, complaints, legal, tenancy or buying questions → outcome "handover"; any request to stop or be left alone → outcome "opt_out". '
+      : 'FIRM LIMITS: never give a price, valuation, range or commission (an accurate figure needs a visit); anything outside this script (legal, tenancy, complaints, upset, buying questions) → outcome "handover"; any request to stop or be left alone → outcome "opt_out". ') +
     'Keep replies to 1–3 short sentences, warm plain Australian English, no exclamation marks, never mention you are an AI unless asked. Do not greet again or re-introduce yourself. ' +
-    (twentyFourHourNote(c) ? 'It is late at night: mention once, lightly, that we are a 24-hour service so no need to wait till morning. ' : '') +
+    (twentyFourHourNote(c) && !state.unq ? 'It is late at night: mention once, lightly, that we are a 24-hour service so no need to wait till morning. ' : '') +
     'Return JSON only: {"reply": "Alex\'s next text (empty only for opt_out)", ' +
     '"details": {"beds": null, "baths": null, "living": null, "study": null, "block": null, "outdoor": "", "parking": "", "shedding": "", "yearBuilt": "", "renos": "", "yearsOwned": null, "other": ""}, ' +
-    '"motivation": "Making a move|Just an update|Unsure|", "timing": "their words or empty", ' +
-    '"outcome": "continue|appraisal|book_at|call_time|nurture|handover|opt_out", "book_at": "YYYY-MM-DDTHH:MM local appraisal time they accepted, or empty", "preferred_times": "days/times they offered for an appraisal, or empty", "options": ["YYYY-MM-DDTHH:MM", "…up to 3, only for outcome appraisal"], ' +
+    '"motivation": "Making a move|Just an update|Unsure|", "timing": "their words or empty", "address": "street address or suburb they told you, or empty", "owner": "yes|no|", "prompted_by": "what got them thinking about a price update, or empty", "disqualify_reason": "Bogus or duplicate|Not interested|Not engaged|", ' +
+    '"outcome": "continue|appraisal|book_at|call_time|nurture|disqualify|handover|opt_out", "book_at": "YYYY-MM-DDTHH:MM local appraisal time they accepted, or empty", "preferred_times": "days/times they offered for an appraisal, or empty", "options": ["YYYY-MM-DDTHH:MM", "…up to 3, only for outcome appraisal"], ' +
     '"call_at": "YYYY-MM-DDTHH:MM local time agreed for the agent to call, or empty", "nurture_reason": "if they are clearly not moving for 3+ months: one of ' + NURTURE_REASONS.slice(0, 5).join(' | ') + '", ' +
     '"handover_reason": "", "summary": "one line for the agent: what we learned and what happens next"}';
   const out = await claudeJSON(VOICE + ' You also extract facts accurately and conservatively.', user, 900);
@@ -1601,12 +1636,22 @@ async function handleNewLeadReply(lead, from, text, ctx) {
   for (const k of ['outdoor', 'parking', 'shedding', 'yearBuilt', 'renos', 'other']) if (d[k] && String(d[k]).trim()) upd[PROP[k]] = f[PROP[k]] ? (f[PROP[k]] + '; ' + d[k]) : d[k];
   if (['Making a move', 'Just an update', 'Unsure'].includes(out.motivation)) upd[PROP.motivation] = out.motivation;
   if (out.timing) upd[PROP.timing] = out.timing;
+  if (state.unq && out.address && !f[L.address]) upd[L.address] = String(out.address).slice(0, 120);
+  if (state.unq && out.motivation === 'Making a move') state.keen = true;
+  if (state.unq) {
+    const extra = [];
+    if (/^(yes|no)$/i.test(out.owner || '') && !state.ownerNoted) { extra.push('Owner: ' + out.owner.toLowerCase()); state.ownerNoted = true; }
+    if (out.prompted_by && !state.promptNoted) { extra.push('What prompted the price check: ' + out.prompted_by); state.promptNoted = true; }
+    if (extra.length) { const base = upd[PROP.other] || f[PROP.other] || ''; upd[PROP.other] = (base ? base + '; ' : '') + extra.join('; '); }
+    if (extra.length || Object.values(d).some(v => v !== null && v !== '' && v !== undefined && v !== false)) state.engaged = true;
+  }
 
   if (out.outcome === 'opt_out') {
     await updateRecord(T.leads, lead.id, Object.assign(upd, { [L.doNotContact]: true, [L_ALEX_STATUS]: 'Done' }));
     const sid = await sendSMS(from, OPT_OUT_ACK); await logOut(lead, OPT_OUT_ACK, 'New lead', sid);
     state.phase = 'done'; state.replied = true; await setState(lead.id, state);
     await logActivity(lead.id, { summary: 'Contact asked to be left alone – Do Not Contact ticked by Alex', detail: text, type: 'General', kind: 'History' });
+    if (state.unq) noteOptOutForSummary(`${f[L.name]} (social enquiry)`);
     return;
   }
 
@@ -1621,6 +1666,12 @@ async function handleNewLeadReply(lead, from, text, ctx) {
   let outcome = '';
   let bookedIso = null;
   let apptOptions = [];
+  if (state.unq && out.outcome === 'disqualify') {
+    if (Object.keys(upd).length) await updateRecord(T.leads, lead.id, upd);
+    const reason = UNQ_DISQUALIFY_REASONS.includes(out.disqualify_reason) ? out.disqualify_reason : 'Not interested';
+    await toUnqClosed(await getRecord(T.leads, lead.id), state, reason, out.summary || 'disqualified in the chat with Alex');
+    return;
+  }
   if (out.outcome === 'book_at' && melbToISO(out.book_at)) {
     bookedIso = melbToISO(out.book_at);
     Object.assign(upd, { [L.stage]: 'Appraisal Booked', [L_APPT_AT]: bookedIso, [L_ALEX_STATUS]: 'Done' });
@@ -1654,6 +1705,8 @@ async function handleNewLeadReply(lead, from, text, ctx) {
       await offerTimesToAgent(await getRecord(T.leads, lead.id), apptOptions, 'appraisal', `${leadLabel(f)} wants an appraisal${out.preferred_times ? ' – they said ' + out.preferred_times : ''}. ${f[L.phone]}${out.summary ? '\n' + out.summary : ''}`);
       return;
     }
+    // Unqualified enquiry that is just curious: no agent text, it goes in the 5pm summary
+    if (state.unq && out.outcome === 'nurture') { state.summarySent = true; noteUnqForSummary(`${leadLabel(f)} – a lead for later (${out.nurture_reason || 'Nurture'}) → Nurture`); await setState(lead.id, state); return; }
     // In BH (or a handover) tell the agent now; otherwise it goes in the 8am summary
     if (isBH(c) || out.outcome === 'handover') { await textAgent(agent, (out.outcome === 'handover' ? '⚠ ' : '') + `${state.outcomeSummary} ${f[L.phone]}`); state.summarySent = true; }
   }
@@ -1699,6 +1752,32 @@ function rememberQuestions(agent, date, items) {
   checkinsByPhone.set(key, { date, items: keep.concat(items) });
 }
 let lastCheckinDate = null;
+// Open tasks on a card that are due after today (Tasks table). If the agent has already scheduled the next step,
+// Alex's "how did you go / what's next" check-in is redundant and is skipped (Stu, 5 Nov).
+const TASKS_T = 'tblly5yaH9pTZrUXC';
+const TK = { title: 'flds1zBNNSIuWMIAe', due: 'fldFgsIL7uMKKutro', status: 'flddkegXHPifQmUaV', opp: 'fldMF7mIWcDzaCANY' };
+async function futureTasksByCard(today) {
+  const map = new Map();
+  try {
+    const recs = await listAll(TASKS_T, { filterByFormula: `AND({${TK.status}}='Open',{${TK.due}}!='',IS_AFTER({${TK.due}},'${today}'))` });
+    for (const t of recs) {
+      const due = String(t.fields[TK.due] || '').slice(0, 10);
+      if (!due || due <= today) continue;
+      for (const id of (t.fields[TK.opp] || []).map(x => (typeof x === 'string' ? x : x.id))) {
+        const cur = map.get(id);
+        if (!cur || due < cur.due) map.set(id, { title: t.fields[TK.title] || 'task', due });
+      }
+    }
+  } catch (e) { console.error('Alex: future task lookup failed', e.message); }
+  return map;
+}
+function futureStep(f, today, futureTasks, leadId) {
+  const t = futureTasks.get(leadId);
+  if (t) return t;
+  if (f[L.nextAction] && f[L.nextActionDate] && String(f[L.nextActionDate]).slice(0, 10) > today) return { title: f[L.nextAction], due: String(f[L.nextActionDate]).slice(0, 10) };
+  for (const k of [L_APPT_AT, L_MTG_AT]) if (f[k] && minutesSince(f[k]) < 0) return { title: k === L_APPT_AT ? 'appraisal' : 'listing meeting', due: String(f[k]).slice(0, 10) };
+  return null;
+}
 
 async function checkinTick() {
   if (!sweepEnabled()) return;
@@ -1724,7 +1803,9 @@ async function checkinTick() {
   // Price update sent (task ticked off, card still in Price Update): follow it up in 3 business days
   const pu = (await listAll(T.leads, { filterByFormula: `AND({${L.stage}}='Price Update / Desktop Required',NOT({${L_PARKED}}),{${L.nextAction}}='')` }))
     .filter(l => (l.fields[L.agent] || []).some(id => agents.has(id)));
+  const futureTasks = await futureTasksByCard(c.date);
   for (const lead of pu) {
+    if (futureTasks.has(lead.id)) continue; // agent has already booked the next step
     // re-check just before writing: the agent may have moved the card on (e.g. to Nurture) in the last minute
     const now = await getRecord(T.leads, lead.id).catch(() => null);
     if (!now || sel(now.fields[L.stage]) !== 'Price Update / Desktop Required' || now.fields[L.nextAction]) continue;
@@ -1751,13 +1832,16 @@ async function checkinTick() {
   const cards = (await listAll(T.leads, { filterByFormula: `AND(NOT({${L_PARKED}}),{${L.stage}}!='Nurture',{${L.stage}}!='Listed (Won)',{${L.stage}}!='${NEW_SOCIAL}')` }))
     .filter(l => (l.fields[L.agent] || []).some(id => agents.has(id)));
   const byAgent = {};
+  const futureTasks2 = await futureTasksByCard(c.date);
   for (const lead of cards) {
     const f = lead.fields;
     const stage = sel(f[L.stage]);
     const first = firstName(f[L.name]) || f[L.name];
     const state = getState(lead);
+    const future = futureStep(f, c.date, futureTasks2, lead.id); // a later task / appointment already covers the follow-up
     let q = '';
     if (stage === NO_CONTACT) {
+      if (future) { /* agent has a follow-up booked – no "any luck?" question */ } else {
       const base = state.ncBase || f[L_STAGE_ENTERED] || c.date;
       const bd = bizDaysBetween(base, c.date);
       const asked = state.ncAsked || {};
@@ -1765,6 +1849,7 @@ async function checkinTick() {
       else if (bd >= 3 && bd < 5 && !asked[base + ':3']) { q = `Any luck reaching ${first}?`; asked[base + ':3'] = true; }
       else if (bd >= 1 && bd < 3 && !asked[base + ':1']) { q = `How did you go with ${first}?`; asked[base + ':1'] = true; }
       if (q) { state.ncAsked = asked; await setState(lead.id, state); }
+      }
     } else if (f[L.nextAction] && f[L.nextActionDate] && f[L.nextActionDate] <= c.date && stage !== 'Appraisal Booked') {
       const key = f[L.nextAction] + '|' + f[L.nextActionDate];
       if (state.taskAsked !== key || (state.taskAskedOn && bizDaysBetween(state.taskAskedOn, c.date) >= 2)) {
@@ -1777,13 +1862,13 @@ async function checkinTick() {
     // stage age prompts and cards with no next step
     const entered = f[L_STAGE_ENTERED] || '';
     const daysIn = entered ? Math.floor((Date.parse(c.date) - Date.parse(entered.slice(0, 10))) / 86400000) : 0;
-    if (!q && stage === 'Qualifying' && daysIn >= 14 && state.qual14 !== entered) {
+    if (!q && !future && stage === 'Qualifying' && daysIn >= 14 && state.qual14 !== entered) {
       q = `${first} has been in Qualifying for ${Math.floor(daysIn / 7)} weeks – what's next? a – appraisal booked (tell me when) · b – Nurture (tell me how far off) · c – something else`;
       state.qual14 = entered; await setState(lead.id, state);
-    } else if (!q && stage === 'Decision Pending' && daysIn >= 21 && state.dp21 !== entered) {
+    } else if (!q && !future && stage === 'Decision Pending' && daysIn >= 21 && state.dp21 !== entered) {
       q = `${first} has been deciding for ${Math.floor(daysIn / 7)} weeks – any news? a – going ahead (Approved / Accepted) · b – Nurture (Proposal or decision stalled) · c – something else`;
       state.dp21 = entered; await setState(lead.id, state);
-    } else if (!q && !f[L.nextAction] && !['Appraisal Booked', 'Listing Meeting Booked', NO_CONTACT, 'Lost / Not Progressing', 'Price Update / Desktop Required'].includes(stage)
+    } else if (!q && !future && !f[L.nextAction] && !['Appraisal Booked', 'Listing Meeting Booked', NO_CONTACT, 'Lost / Not Progressing', 'Price Update / Desktop Required'].includes(stage)
       && (!state.noTaskAskedOn || bizDaysBetween(state.noTaskAskedOn, c.date) >= 5)) {
       q = `What's the next step with ${first} (${stage})?`;
       state.noTaskAskedOn = c.date; await setState(lead.id, state);
@@ -1951,7 +2036,7 @@ function ghlSenderOK(from) {
 }
 function parseGhlLead(text) {
   const t = String(text || '').replace(/\r/g, '');
-  if (!/^\s*new\s+lead\b/i.test(t)) return null;
+  if (!/^\s*(new|unqualified)\s+lead\b/i.test(t)) return null;
   const labels = Object.keys(GHL_LABELS).sort((a, b) => b.length - a.length).map(l => l.replace(/ /g, '\\s+'));
   const re = new RegExp(`(?:^|\\n|\\s)(${labels.join('|')})\\s*:`, 'gi');
   const hits = []; let m;
@@ -2015,6 +2100,134 @@ async function startNewLeadFlow(leadId, returning) {
   return 'opener sent to the contact';
 }
 
+// ---- Unqualified social enquiries ("UNQUALIFIED LEAD" from GoHighLevel) – agreed with Stu 3 Nov 2026
+// People who tapped a "what's my home worth" style post expecting an instant figure on screen, often surprised that
+// their details came to us. Alex texts straight away (24/7), leads with real nearby sales instead of an ask, qualifies
+// gently, follows up once after 2 days (friendly hours), then moves the card quietly onto Nurture (Curious, 12 months+).
+// The agent only hears about it when the person wants an appraisal / call or needs a person; the rest is in the 5pm summary.
+const UNQ_FOLLOWUP_HOURS = 48;
+const UNQ_CLOSE_AFTER_HOURS = 72;     // after the follow-up: no engagement = disqualified
+const UNQ_NURTURE_REASON = 'Curious (12 months+)';
+// Lost reasons that close the card without starting another Alex track (the Airtable 'card changed' automation turns
+// "No contact" into Nurture Track 5 and "Not selling" into an annual check-in, so those are avoided here)
+// No engagement = 'Not engaged'; 'Bogus or duplicate' only when they say it's the wrong number / the name doesn't match (Stu, 3 Nov)
+const UNQ_NO_REPLY_REASON = 'Not engaged';
+const UNQ_DISQUALIFY_REASONS = ['Not interested', 'Not engaged', 'Bogus or duplicate'];
+// The team member who owns unqualified enquiries: the approver (Stu)
+async function unqOwner() {
+  const team = await teamRows();
+  return team.find(t => samePhone(t.fields[TM.mobile], approverMobile())) ||
+    team.find(t => String(t.fields[TM.name] || '').toLowerCase().startsWith(String(process.env.APPROVER_NAME || 'Stu').toLowerCase())) || null;
+}
+function noteUnqForSummary(label) { try { require('./alex-buyers').noteSellerEnquiry(label); } catch (e) { console.log('Alex unqualified enquiry (not in summary): ' + label); } }
+function friendlyHours(c) { c = c || melbClock(); return c.weekday === 'Sun' ? (c.hour >= 10 && c.hour < 18) : (c.hour >= 9 && c.hour < 19); }
+async function markSaleQuoted(saleId, leadId) {
+  try {
+    const sale = await getRecord(MS_TABLE, saleId);
+    const quoted = (sale.fields[MS.quotedTo] || []).map(x => x.id || x).concat(leadId);
+    await updateRecord(MS_TABLE, saleId, { [MS.quotedTo]: Array.from(new Set(quoted)) });
+  } catch (e) { console.error('Alex leads: Quoted To link failed', e.message); }
+}
+// Recent sales near an address (or a bit of text naming a suburb) – plain lines for the conversation prompt
+async function salesNearText(addressOrText, max) {
+  const sales = await recentSales();
+  const known = Array.from(new Set(sales.map(s => s.fields[MS.suburb]).filter(Boolean).concat(Object.keys(NEIGHBOURS))));
+  const { suburb } = suburbOf(' ' + String(addressOrText || ''), known);
+  if (!suburb) return { suburb: '', text: '' };
+  const near = new Set(NEIGHBOURS[suburb] || []);
+  const rows = sales.filter(s => s.fields[MS.price] && (s.fields[MS.suburb] === suburb || near.has(s.fields[MS.suburb])))
+    .sort((a, b) => (a.fields[MS.suburb] === suburb ? 0 : 1) - (b.fields[MS.suburb] === suburb ? 0 : 1) || (a.fields[MS.date] < b.fields[MS.date] ? 1 : -1))
+    .slice(0, max || 8);
+  return { suburb, text: rows.map(s => { const f = s.fields; return `- ${f[MS.address]}: ${[f[MS.beds] ? f[MS.beds] + ' bed' : '', /^unit/i.test(f[MS.type] || '') ? 'unit' : 'house', f[MS.land] ? f[MS.land] + 'm2' : ''].filter(Boolean).join(' ')}, sold ${fmtPrice(f[MS.price])} in ${monthName(f[MS.date])}`; }).join('\n') };
+}
+async function sendUnqOpener(lead) {
+  const f = lead.fields;
+  const first = firstName(f[L.name]);
+  const usable = first && !/\d/.test(first);
+  const text = plainSMS(`${usable ? 'Hi ' + first : 'Hi there'}, it's Alex from Stone Real Estate Ballarat - you tapped on one of our property value posts, so I thought I'd reach out. ` +
+    `It's hard for a computer to price a home from just an address: what really drives value is the size of the home and land, its condition and any updates, and what's sold nearby lately. ` +
+    `Would you be open to answering a few quick questions about your place? ` + OPT_OUT_LINE);
+  const sid = await sendSMS(f[L.phone], text);
+  await logOut(lead, text, 'New lead', sid);
+  if (!f[L_FIRST_CONTACT]) await updateRecord(T.leads, lead.id, { [L_FIRST_CONTACT]: new Date().toISOString() });
+}
+async function sendUnqFollowUp(lead) {
+  const f = lead.fields;
+  const first = firstName(f[L.name]);
+  const addr = f[L.address] && f[L.address] !== f[L.name] ? f[L.address] : '';
+  let sale = null;
+  if (addr) { try { sale = await pickSale(lead.id, addr, new Set()); } catch (e) { console.error('Alex leads: unq sale pick failed', e.message); } }
+  const text = plainSMS(sale
+    ? `Hi ${first || 'there'}, Alex from Stone again - no pressure at all. For a bit of context, ${sale.plain.replace(/^Thought you might find this handy - /, '').replace(/ Just keeping you in the loop.*$/, '')} If you'd like a better sense of where your place sits, I'm happy to ask a few quick questions. Otherwise I'll leave it there.`
+    : `Hi ${first || 'there'}, Alex from Stone again - no pressure at all. If you'd still like a better sense of what your place is worth, I'm happy to ask a few quick questions and share what's sold nearby. Otherwise I'll leave it there.`);
+  const sid = await sendSMS(f[L.phone], text);
+  await logOut(lead, text, 'New lead', sid);
+  if (sale) await markSaleQuoted(sale.saleId, lead.id);
+}
+async function toUnqClosed(lead, state, reason, why) {
+  state.phase = 'done'; state.summarySent = true;
+  await setState(lead.id, state, { [L.stage]: 'Lost / Not Progressing', [L_LOST_REASON]: reason, [L_ALEX_STATUS]: 'Done' });
+  await logActivity(lead.id, { summary: `Unqualified enquiry closed – ${reason}`, detail: why || '', type: 'General', kind: 'History' });
+  noteUnqForSummary(`${leadLabel(lead.fields)} – ${why} → closed (${reason})`);
+}
+async function toUnqNurture(lead, state, why) {
+  state.phase = 'done'; state.summarySent = true;
+  await setState(lead.id, state, { [L.stage]: 'Nurture', [L.nurtureReason]: UNQ_NURTURE_REASON, [L_ALEX_STATUS]: 'Done' });
+  await logActivity(lead.id, { summary: `Unqualified enquiry moved to Nurture (${UNQ_NURTURE_REASON})`, detail: why || '', type: 'General', kind: 'History' });
+  noteUnqForSummary(`${leadLabel(lead.fields)} – ${why} → Nurture`);
+}
+// Start the unqualified flow on a card in New (Socials): opener straight away, any hour, no agent alert
+async function startUnqualifiedFlow(leadId) {
+  const lead = await getRecord(T.leads, leadId);
+  const f = lead.fields;
+  const agents = await alexActiveAgentIds();
+  if (!(f[L.agent] || []).some(id => agents.has(id))) return 'agent not on Alex – normal allocation email only';
+  if (f[L.doNotContact] || !isTextableMobile(f[L.phone])) {
+    await setState(lead.id, { flow: 'newlead', unq: true, phase: 'skip', why: f[L.doNotContact] ? 'Do Not Contact' : 'no mobile' });
+    noteUnqForSummary(`${leadLabel(f)} – couldn't text (${f[L.doNotContact] ? 'Do Not Contact' : 'no mobile'})`);
+    return 'no text (Do Not Contact or no mobile)';
+  }
+  await sendUnqOpener(lead);
+  await setState(lead.id, { flow: 'newlead', unq: true, phase: 'engaging', openerAt: new Date().toISOString() }, { [L_ALEX_STATUS]: 'Engaging' });
+  await logActivity(lead.id, { summary: 'Alex texted the unqualified enquiry (what drives price + a few questions?)', type: 'General', kind: 'History' });
+  return 'opener sent to the contact';
+}
+// Timers for an unqualified enquiry (called from newLeadStep every 2 minutes)
+async function unqStep(lead, state, c, agent) {
+  const f = lead.fields;
+  const nowIso = new Date().toISOString();
+  if (state.phase === 'engaging' && !state.replied) {
+    if (!state.followUpAt && minutesSince(state.openerAt) >= UNQ_FOLLOWUP_HOURS * 60 && friendlyHours(c)) {
+      await sendUnqFollowUp(lead);
+      state.followUpAt = nowIso;
+      await setState(lead.id, state);
+    } else if (state.followUpAt && minutesSince(state.followUpAt) >= UNQ_CLOSE_AFTER_HOURS * 60) {
+      await toUnqClosed(lead, state, UNQ_NO_REPLY_REASON, 'no reply to Alex after 2 texts');
+    }
+    return;
+  }
+  if (state.phase === 'conversing' && state.lastReplyAt && minutesSince(state.lastReplyAt) >= 48 * 60) {
+    if (state.keen && isBH(c)) {
+      // Showed real interest, then went quiet before booking: the agent takes it from here
+      const first = firstName(f[L.name]) || f[L.name];
+      state.phase = 'done';
+      await setState(lead.id, state, { [L.stage]: 'Qualifying', [L.nextAction]: `Call ${first} – keen on an appraisal / chat with Alex, then went quiet`, [L.nextActionDate]: c.date, [L_ALEX_STATUS]: 'Waiting for agent' });
+      await textAgent(agent, `${leadLabel(f)} came in from a social value post and sounded keen when chatting with me, but went quiet before we booked anything. I've moved the card to Qualifying with a call task for today - the conversation is on the card. ${f[L.phone]}`);
+    } else if (!state.keen && state.engaged) {
+      await toUnqNurture(lead, state, 'answered some questions, then went quiet – a lead for later');
+    } else if (!state.keen) {
+      await toUnqClosed(lead, state, 'Not engaged', 'replied but did not engage with the questions');
+    }
+    return;
+  }
+  // A qualified outcome reached outside business hours: tell the agent from 8am
+  if (state.outcomeSummary && !state.summarySent && isBH(c)) {
+    await textAgent(agent, `Social enquiry: ${state.outcomeSummary}`);
+    state.summarySent = true;
+    await setState(lead.id, state);
+  }
+}
+
 // Queue a message for the card's agent: now in business hours, otherwise from 8am (noticeTick)
 async function noticeAgent(lead, text) {
   if (isBH(melbClock())) { await textAgent(await agentOfLead(lead), text); return 'agent texted'; }
@@ -2036,30 +2249,32 @@ async function noticeTick() {
 }
 
 async function handleGhlLead(from, body) {
-  if (!/^\s*new\s+lead\b/i.test(String(body || '')) || !ghlSenderOK(from)) return false;
+  if (!/^\s*(new|unqualified)\s+lead\b/i.test(String(body || '')) || !ghlSenderOK(from)) return false;
+  const unq = /^\s*unqualified\s+lead\b/i.test(String(body || ''));
   const g = parseGhlLead(body);
   if (!g || (!g.mobile && !g.address && !g.name)) { await sendSMS(approverMobile(), `A GoHighLevel lead text came in but I couldn't read it:\n"${String(body).slice(0, 300)}"`); return true; }
   const today = melbClock().date;
-  const ghlAgent = await matchAgent(g.agent);
+  // Unqualified enquiries are all Stu's while the system is tested (Stu, 3 Nov 2026)
+  const ghlAgent = unq ? (await unqOwner()) || await matchAgent(g.agent) : await matchAgent(g.agent);
   const detail = [g.campaign && `Campaign: ${g.campaign}`, g.agent && `GHL allocated: ${g.agent}`, g.notes && `Notes: ${g.notes}`, g.email && `Email: ${g.email}`].filter(Boolean).join('\n');
   const existing = await findExistingCard(g);
 
   if (!existing) {
     const fields = {
       [L.name]: g.name || g.address || g.mobile, [L.phone]: g.mobile ? normalisePhone(g.mobile) : undefined, [L.email]: g.email || undefined,
-      [L.address]: g.address || undefined, [L.source]: 'Social Media', [L.sourceDetail]: g.campaign || 'GoHighLevel social media lead',
-      [L.enteredVia]: 'GoHighLevel', [L.stage]: NEW_SOCIAL, [L_RECEIVED]: today, [PROP.other]: g.notes || undefined,
-      [L_STATE]: '{"flow":"newlead","phase":"starting"}' // stops the 2-minute tick double-handling it
+      [L.address]: g.address || undefined, [L.source]: 'Social Media', [L.sourceDetail]: unq ? 'Unqualified social enquiry' + (g.campaign ? ' – ' + g.campaign : '') : (g.campaign || 'GoHighLevel social media lead'),
+      [L.enteredVia]: 'GoHighLevel', [L.stage]: unq ? UNQ_STAGE : NEW_SOCIAL, [L_RECEIVED]: today, [PROP.other]: g.notes || undefined,
+      [L_STATE]: unq ? '{"flow":"newlead","phase":"starting","unq":true}' : '{"flow":"newlead","phase":"starting"}' // stops the 2-minute tick double-handling it
     };
     if (ghlAgent) fields[L.agent] = [ghlAgent.id];
     const rec = await createRecord(T.leads, fields);
-    await logActivity(rec.id, { summary: 'New social media lead from GoHighLevel', detail, type: 'General', kind: 'History' });
+    await logActivity(rec.id, { summary: unq ? 'Unqualified social enquiry from GoHighLevel (tapped a value post)' : 'New social media lead from GoHighLevel', detail, type: 'General', kind: 'History' });
     if (!ghlAgent) {
       await sendSMS(approverMobile(), `New social media lead: ${g.name || ''} ${g.address || ''} ${g.mobile || ''}. GoHighLevel's agent "${g.agent || 'none'}" doesn't match anyone in Team – please allocate it in the Admin Inbox.`);
       return true;
     }
-    const res = await startNewLeadFlow(rec.id, '');
-    console.log('Alex leads: GHL lead created ' + rec.id + ' – ' + res);
+    const res = unq ? await startUnqualifiedFlow(rec.id) : await startNewLeadFlow(rec.id, '');
+    console.log('Alex leads: GHL lead created ' + rec.id + (unq ? ' (unqualified)' : '') + ' – ' + res);
     return true;
   }
 
@@ -2067,13 +2282,13 @@ async function handleGhlLead(from, body) {
   const f = existing.fields;
   const stage = sel(f[L.stage]);
   const cardAgent = await agentOfLead(existing);
-  const differentAgent = ghlAgent && !(f[L.agent] || []).includes(ghlAgent.id);
+  const differentAgent = !unq && ghlAgent && !(f[L.agent] || []).includes(ghlAgent.id);
   const upd = {};
   if (g.mobile && !isTextableMobile(f[L.phone])) upd[L.phone] = normalisePhone(g.mobile);
   if (g.email && !f[L.email]) upd[L.email] = g.email;
   if (g.address && !f[L.address]) upd[L.address] = g.address;
   await logActivity(existing.id, {
-    summary: `Responded to a social media advertisement${g.campaign ? ' (' + g.campaign + ')' : ''}`,
+    summary: `Responded to a social media advertisement${unq ? ' (unqualified – tapped a value post)' : ''}${g.campaign ? ' (' + g.campaign + ')' : ''}`,
     detail: detail + (differentAgent ? `\nGoHighLevel allocated ${ghlAgent.fields[TM.name]} – kept ${cardAgent ? cardAgent.fields[TM.name] : 'the card\'s agent'} as the agent.` : ''),
     type: 'General', kind: 'Note'
   });
@@ -2091,8 +2306,9 @@ async function handleGhlLead(from, body) {
   }
   if (['Nurture', 'Lost / Not Progressing', 'Lost', 'Not to Progress'].includes(stage)) {
     // A fresh enquiry from a nurture / lost contact: back to New (Socials) and into the new-lead flow
-    upd[L.stage] = NEW_SOCIAL;
-    await updateRecord(T.leads, existing.id, Object.assign(upd, { [L_STATE]: '{"flow":"newlead","phase":"starting"}' }));
+    upd[L.stage] = unq ? UNQ_STAGE : NEW_SOCIAL;
+    await updateRecord(T.leads, existing.id, Object.assign(upd, { [L_STATE]: unq ? '{"flow":"newlead","phase":"starting","unq":true}' : '{"flow":"newlead","phase":"starting"}' }));
+    if (unq) { const r = await startUnqualifiedFlow(existing.id); console.log('Alex leads: returning unqualified enquiry ' + existing.id + ' – ' + r); return true; }
     const res = await startNewLeadFlow(existing.id, `They were in ${stage}${sel(f[L.nurtureReason]) ? ' (' + sel(f[L.nurtureReason]) + ')' : ''}${agentLine}. The card is back in New (Socials).`);
     if (/opener/.test(res)) await noticeAgent(existing, `${label} (was in ${stage}) responded to a social media ad overnight${agentLine}. I've moved them back to New (Socials) and texted them – I'll let you know how it goes.`);
     return true;

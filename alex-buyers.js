@@ -887,6 +887,52 @@ function briefSummary(f) {
   if (f[B.other]) parts.push('other: ' + f[B.other]);
   return parts.join('; ') || '(nothing known yet)';
 }
+// End-of-chat summary once qualifying is done (Stu, 6 Nov): "Thanks for that Dan, just so I'm sure I've got everything..."
+function wrapUp(first, f) {
+  const and = a => a.length > 1 ? a.slice(0, -1).join(', ') + ' or ' + a[a.length - 1] : (a[0] || '');
+  const bits = [];
+  const subs = sels(f[B.suburbs]);
+  if (f[B.near]) bits.push('around ' + f[B.near]);
+  else if (subs.includes('Anywhere in Ballarat')) bits.push('anywhere in Ballarat');
+  else if (subs.length) bits.push('in ' + and(subs.slice(0, 4)) + (subs.length > 4 ? ' and nearby' : ''));
+  const types = sels(f[B.types]).map(t => t.toLowerCase());
+  const what = (f[B.beds] ? f[B.beds] + '+ bed ' : '') + (types.length ? and(types) : (f[B.beds] ? 'home' : ''));
+  if (what) bits.push(what);
+  const extras = sels(f[B.must]).map(m => m.toLowerCase());
+  if (f[B.car]) extras.push(f[B.car] + '+ car spaces');
+  if (f[B.land]) extras.push(f[B.land] + 'm²+ block');
+  if (extras.length) bits.push(extras.join(', '));
+  const m = n => n >= 1e6 ? '$' + (n / 1e6).toFixed(2).replace(/\.?0+$/, '') + 'm' : k(n);
+  if (f[B.pmin] && f[B.pmax]) bits.push(m(f[B.pmin]) + '–' + m(f[B.pmax]));
+  else if (f[B.pmax]) bits.push('up to ' + m(f[B.pmax]));
+  else if (f[B.pmin]) bits.push('from ' + m(f[B.pmin]));
+  const tf = { '0–3 months': 'buying in the next few months', '3–6 months': 'buying in the next 6 months or so', '6–12 months': 'buying within the next year', '12+ months': 'probably more than a year away' }[sel(f[B.timeframe])];
+  if (tf) bits.push(tf);
+  const dep = { 'Must sell first': 'selling first', 'Might sell': 'may sell first', 'Sold / under contract': 'already sold' }[sel(f[B.saleDep])];
+  if (dep) bits.push(dep);
+  const fin = { 'Pre-approved': 'pre-approved', 'Cash buyer': 'cash buyer', 'Talking to lender': 'finance in the works' }[sel(f[B.finance])];
+  if (fin) bits.push(fin);
+  if (f[B.other] && String(f[B.other]).length <= 90) { const o = String(f[B.other]).trim().replace(/[.\s]+$/, ''); bits.push(/^[A-Z][a-z]/.test(o) ? o[0].toLowerCase() + o.slice(1) : o); }
+  const head = `Thanks for that ${first || ''}`.trim() + ", just so I'm sure I've got everything: ";
+  const tail = ". If I've missed anything just let me know, otherwise I'll send through anything that fits. Alex";
+  if (!bits.length) return `Thanks for that ${first || ''}`.trim() + ". I'll send through anything that fits. Alex";
+  let list = bits.join(', ');
+  while (bits.length > 1 && (head + list + tail).length > 470) { bits.pop(); list = bits.join(', '); }
+  return head + list + tail;
+}
+// Use the buyer's first name once per chat, not in every message (Stu, 6 Nov)
+function trimName(text, first, st) {
+  if (!first || !text) return text;
+  const re = new RegExp('\\b' + first.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b', 'i');
+  const since = Date.now() - 3 * 3600000;
+  const used = (st.history || []).some(h => h.d === 'out' && new Date(h.at || 0).getTime() > since && re.test(h.t));
+  if (!used) return text;
+  return text.replace(new RegExp('\\s+' + first.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '(?=\\s*[,.!?–-])', 'gi'), '').replace(/\s+([,.!?])/g, '$1');
+}
+// Phone tapbacks ("Liked “…”", "Loved “…”", "Reacted 👍 to …") aren't replies – no answer needed
+const REACTION = /^\s*(liked|loved|disliked|laughed at|emphasi[sz]ed|questioned|reacted\s+\S{1,4}\s+to)\s+["“'‘]/i;
+const IDLE_MINUTES = 30;
+
 function shortSummary(f) {
   const bits = [];
   if (f[B.beds]) bits.push(f[B.beds] + '-bed');
@@ -942,7 +988,10 @@ Reply rules (the reply is sent as-is by SMS from Alex, on behalf of the agent):
  - Never give a value or price opinion. Only quote a price by copying a listing's Price exactly from KNOWN LISTINGS. Never invent facts, open times or dates.
  - Never share vendor details, reasons for selling, offers or other buyers' interest. Never promise what the agent will do beyond "I'll get {agent} to ..." / "I'll pass that on".
  - For intents handled by fixed wording (wants_inspection, wants_offer, contract_request, not_interested_unclear, not_looking_now, check_in_later_yes, check_in_later_no, bought, stop, complaint, who_is_this, must_sell, value_question, neighbour, unknown_question) the reply can be empty.
- - For property_fact answer only from the facts given. For answer/still_looking/thanks a short acknowledgement that reflects what they said.`;
+ - For property_fact answer only from the facts given.
+ - For answer/still_looking/thanks: at most a few words ("Thanks.", "Got it.", "Good to know.") or leave it empty. NEVER repeat back or list what they just told you – the system sends one summary at the end of the chat.
+ - Don't say you'll pass it on, note it down, keep the agent across it or loop anyone in, and don't say "I'll keep an eye out" – only mention the agent when they ask for them or something needs the agent.
+ - Use their first name at most once in the whole chat: if Alex has already used it in "Conversation so far", don't use it again.`;
 
 async function readReply({ brief, contact, agent, st, text, listings }) {
   const f = brief.fields;
@@ -1165,18 +1214,28 @@ async function handleBuyerSMS(from, body) {
   const agentName = agentFirst(agent);
 
   await logMsg({ brief, contact, direction: 'From buyer', purpose: 'Reply to buyer', status: 'Received', text, number: from });
+  if (REACTION.test(text)) { // a tapback on Alex's text: log it, no reply
+    await saveState(brief, st, { [B.lastReply]: new Date().toISOString(), [B.unanswered]: 0 });
+    return true;
+  }
   remember(st, 'in', text);
   st.lastInAt = new Date().toISOString();
+  st.awaitingAnswer = false;
   const upd = { [B.lastReply]: new Date().toISOString(), [B.unanswered]: 0 };
   if (st.alexLocked) { upd[B.lock] = false; st.alexLocked = false; }
   if (sel(brief.fields[B.campaign]) === 'Import outreach' && ['Queued', 'First sent', 'Nudged'].includes(sel(brief.fields[B.cStage]))) upd[B.cStage] = 'Replied';
   if (st.phase === 'awaiting_reply' || st.phase === 'held' || !st.phase) st.phase = 'qualifying';
   st.fallbacks = 0;
 
+  let keepName = false;
   const reply = async (msg, purpose, extra) => {
     if (!msg) return null;
+    if (!keepName) msg = trimName(msg, first, st);
     const res = await sendToBuyer(Object.assign({ brief, contact, text: msg, purpose: purpose || 'Reply to buyer', kind: 'reply' }, extra || {}));
-    if (res.ok) { remember(st, 'out', res.text); st.lastOutAt = new Date().toISOString(); }
+    if (res.ok) {
+      remember(st, 'out', res.text); st.lastOutAt = new Date().toISOString();
+      st.awaitingAnswer = /\?/.test(res.text); // a question left hanging → sign-off after 30 min (idleTick)
+    }
     return res;
   };
   const finish = async (more) => { await saveState(brief, st, Object.assign(upd, more || {})); return true; };
@@ -1393,17 +1452,15 @@ async function handleBuyerSMS(from, body) {
     const q = nextQuestion(merged, st);
     if (q && /\?/.test(out || '')) {
       // Alex's reply already asks them something: don't stack a second question on top (Stu, 30 Oct)
-    } else if (q && (st.qRow || 0) < 3) {
+    } else if (q) {
+      // Keep going until the brief is captured, then one summary (Stu, 6 Nov – replaces the 3-in-a-row pause)
       out = (out ? out + ' ' : '') + q.text;
       st.asked = st.asked || {}; st.asked[q.key] = (st.asked[q.key] || 0) + 1; st.lastQ = q.key; st.qRow = (st.qRow || 0) + 1;
-    } else if (q) {
-      out = (out ? out + ' ' : '') + "I'll keep an eye out and send you anything that fits.";
-      st.qRow = 0; st.lastQ = null;
     } else {
       st.lastQ = null; st.qRow = 0;
       if (st.phase === 'qualifying') {
         st.phase = 'nurture';
-        if (!/keep an eye out/i.test(out)) out = (out ? out + ' ' : '') + "That's really helpful. I'll keep an eye out and send you anything that fits.";
+        out = wrapUp(first, merged.fields); keepName = true;
         if (sel(brief.fields[B.campaign]) === 'Import outreach' && sel(brief.fields[B.cStage]) !== 'Complete') { upd[B.cStage] = 'Complete'; upd[B.cOutcome] = 'Qualified'; }
       }
     }
@@ -1415,14 +1472,41 @@ async function handleBuyerSMS(from, body) {
   }
   if (swapNote) out = swapNote + (out ? ' ' + out.replace(/^(No worries|Great|Thanks)[^.!?]*[.!?]\s*/i, '') : '');
   if (out) {
-    const safe = priceSafe(out, allowedPrices);
+    // the wrap-up repeats the buyer's own budget back to them – that's allowed
+    const allowed = keepName ? allowedPrices.concat(out.match(/\$\s?\d[\d,]*(\.\d+)?\s?(k|m)?\b/gi) || []) : allowedPrices;
+    const safe = priceSafe(out, allowed);
     if (!safe) {
       out = `Good question, I'll check with ${agentName} and come back to you.`;
       await handoff({ brief, contact, agent, st, priority: 'high', task: `Answer ${contact.fields[C.name]}'s question`, alertText: `"${text.slice(0, 200)}"` });
     }
-    await reply(out, 'Reply to buyer', { allowedPrices });
+    await reply(out, 'Reply to buyer', { allowedPrices: allowed });
   }
   return finish();
+}
+
+// A question left unanswered for 30 minutes mid-chat → one friendly sign-off (Stu, 6 Nov)
+async function idleTick() {
+  const c = clock();
+  if (c.weekday === 'Sun' || isHoliday(c.date) || c.hour < 8 || c.hour >= 20) return;
+  const briefs = await listAll(T.briefs, { filterByFormula: `AND({${B.status}}='Active',FIND('"awaitingAnswer":true',{${B.state}}&''))` });
+  for (const brief of briefs) {
+    try {
+      const st = getState(brief);
+      if (!st.awaitingAnswer || !st.lastInAt) continue; // only once a conversation is under way
+      const mins = minutesSince(st.lastOutAt);
+      if (mins < IDLE_MINUTES) continue;
+      st.awaitingAnswer = false;
+      const stale = mins > 180 || (st.lastInAt || '') > (st.lastOutAt || '') || brief.fields[B.pause] || brief.fields[B.following];
+      const contact = stale ? null : await primaryContact(brief);
+      if (contact && !optedOut(contact)) {
+        const first = firstName(contact.fields[C.name]);
+        const text = `Hey ${first || 'there'}, looks like you've been interrupted or you're busy. I'll check in again soon, or just shoot me a reply when you're free. Alex from Stone Ballarat`;
+        const res = await sendToBuyer({ brief, contact, text, purpose: 'Follow-up nudge', kind: 'reply' });
+        if (res.ok) { remember(st, 'out', res.text); st.lastOutAt = new Date().toISOString(); st.signedOffAt = st.lastOutAt; }
+      }
+      await saveState(brief, st);
+    } catch (e) { console.error('Alex buyers: idle sign-off ' + brief.id, e.message); }
+  }
 }
 
 // Same thresholds as the Suggested Tier formula
@@ -1809,7 +1893,7 @@ function start() {
   let fastBusy = false, slowBusy = false;
   const fast = async () => {
     if (fastBusy) return; fastBusy = true;
-    for (const [name, fn] of [['check-ins', checkinTick], ['new briefs', newBriefTick], ['nudges', nudgeTick], ['escalation', escalateTick]]) {
+    for (const [name, fn] of [['check-ins', checkinTick], ['new briefs', newBriefTick], ['nudges', nudgeTick], ['idle sign-off', idleTick], ['escalation', escalateTick]]) {
       try { await fn(); } catch (e) { console.error('Alex buyers: ' + name + ' tick failed', e.message); }
     }
     fastBusy = false;
@@ -1830,5 +1914,5 @@ function start() {
 module.exports = {
   start, enabled, handleBuyerSMS, handleAgentCommand, addBuyerFromAgent, noteOptOut, noteSellerEnquiry,
   // exposed for testing
-  _t: { checkinTick, newBriefTick, nudgeTick, importTick, nurtureTick, eventTick, escalateTick, summaryTick, nextQuestion, cleanUpdates, priceSafe, firstTextFor, computeTier, listLine, inScheduledWindow, inspectionFollowUpOK, melbToISO, clock }
+  _t: { idleTick, wrapUp, trimName, checkinTick, newBriefTick, nudgeTick, importTick, nurtureTick, eventTick, escalateTick, summaryTick, nextQuestion, cleanUpdates, priceSafe, firstTextFor, computeTier, listLine, inScheduledWindow, inspectionFollowUpOK, melbToISO, clock }
 };

@@ -260,8 +260,9 @@ async function queueDraft({ lead, ctx, purpose, draft, reasoning, extraLines, co
   const why = shownReason ? `\nWhy: ${shownReason}` : '';
   const extra = extraLines && extraLines.length ? '\n' + extraLines.map(x => x.replace('<code>', code)).join('\n') : '';
   const text = `${head}${why}${extra}\n\nDraft: "${draft}"\n\nReply YES ${code} · CHANGE ${code} what to change · EDIT ${code} full wording · NO ${code}`;
-  await sendSMS(approverMobile(), text);
-  console.log('Alex leads: draft ' + code + ' sent for approval');
+  // Only the card's agent is asked to approve (Stu, 6 Nov) – Stu only gets it when the card has no agent with a mobile
+  await textAgentOf(lead, text);
+  console.log('Alex leads: draft ' + code + ' sent for approval to the card\'s agent');
   return code;
 }
 
@@ -1092,13 +1093,7 @@ async function sweep() {
       const ageDays = (Date.now() - new Date(w.fields[M.created] || w.createdTime).getTime()) / 86400000;
       if (ageDays > 3) await updateRecord(T.messages, w.id, { [M.status]: 'Expired' });
     }
-    if (lastDigestDate !== today) {
-      const stillWaiting = (await waitingDrafts()).filter(w => String(w.fields[M.created] || w.createdTime).slice(0, 10) < today);
-      if (stillWaiting.length) {
-        await sendSMS(approverMobile(), `Morning – ${stillWaiting.length} Alex draft(s) still waiting: ${stillWaiting.map(w => w.fields[M.code]).join(', ')}. Reply YES/EDIT/NO with the code, or LIST.`);
-      }
-      lastDigestDate = today;
-    }
+    // (The morning "drafts still waiting" text was dropped – the agent was asked when the draft was made, and the emails cover the rest. Stu, 6 Nov)
 
     // 3. Track 8 housekeeping (sold / agreement ended) and lost-card follow-ups, once a day
     await track8Housekeeping();

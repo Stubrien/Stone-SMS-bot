@@ -102,7 +102,8 @@ const IN = {
 };
 const TK = {
   task: 'flds1zBNNSIuWMIAe', due: 'fldFgsIL7uMKKutro', status: 'flddkegXHPifQmUaV', notes: 'fldmHfFADFPhyLW2U',
-  source: 'fldvhHAvuWm60NRo2', with: 'fldjjI2VaSG0bYh7Q', assigned: 'fldaINd0hRSQlVQCN', brief: 'fldkwomOX6NiqAZa0'
+  source: 'fldvhHAvuWm60NRo2', with: 'fldjjI2VaSG0bYh7Q', assigned: 'fldaINd0hRSQlVQCN', brief: 'fldkwomOX6NiqAZa0',
+  priority: 'fldFmfDdgbBYhqki8'
 };
 const OPP_STAGE = 'fldIHUJYiPGHuR0WZ';
 const CLOSED_OPP_STAGES = ['Lost', 'Lost / Not Progressing', 'Listed (Won)', 'Authority Signed', 'Nurture', 'Won'];
@@ -457,8 +458,10 @@ async function alertStu(text) {
   } catch (e) { console.error('Alex buyers: alert to Stu failed', e.message); }
 }
 
-async function createTask({ brief, contact, agent, task, due, notes }) {
-  const f = { [TK.task]: task, [TK.status]: 'Open', [TK.source]: 'Alex', [TK.due]: due || clock().date };
+// Priority (Stu, 6 Nov): tasks for Hot buyers and urgent / high hand-overs are High, everything else Medium
+async function createTask({ brief, contact, agent, task, due, notes, priority }) {
+  const hot = brief && sel(brief.fields[B.tier]) === 'Hot';
+  const f = { [TK.task]: task, [TK.status]: 'Open', [TK.source]: 'Alex', [TK.due]: due || clock().date, [TK.priority]: priority || (hot ? 'High' : 'Medium') };
   if (brief) f[TK.brief] = [brief.id];
   if (contact) f[TK.with] = [contact.id];
   if (agent) f[TK.assigned] = [agent.id];
@@ -1093,7 +1096,7 @@ async function setMatch(match, status, feedback) {
 const RESPONSE_MINUTES = { urgent: 60, complaint: 120 };
 async function handoff({ brief, contact, agent, st, priority, task, alertText, escalateAfter }) {
   const due = priority === 'normal' ? addDays(clock().date, 1) : clock().date;
-  const t = await createTask({ brief, contact, agent, task, due, notes: alertText });
+  const t = await createTask({ brief, contact, agent, task, due, notes: alertText, priority: priority === 'urgent' || priority === 'high' ? 'High' : undefined });
   if (priority === 'urgent' || priority === 'high') {
     await textAgent(agent, `Alex: ${alertText} Brief: ${recordLink(BRIEF_PAGE, brief.id)}`, brief, contact);
   }
@@ -1831,8 +1834,8 @@ async function summaryTick() {
     (dayNotes.sellerEnq.length ? `\nSocial value enquiries (no agent needed): ${dayNotes.sellerEnq.splice(0).join('; ')}.` : '') +
     (quietPaused.length ? ` Paused (Long-term, no replies): ${quietPaused.splice(0).join(', ')}.` : '') +
     ` Review: ${recordLink(REVIEW_PAGE, '').replace(/\/$/, '')}`;
-  await alertStu(text);
-  await createRecord(T.messages, { [M.code]: code, [M.audience]: 'Buyer', [M.direction]: 'To agent', [M.purpose]: 'Buyer alert to agent', [M.status]: 'Sent', [M.finalText]: text });
+  // No 5pm text any more – the end-of-day email covers the day (Stu, 6 Nov). The summary is still logged in Alex Messages.
+  await createRecord(T.messages, { [M.code]: code, [M.audience]: 'Buyer', [M.direction]: 'To agent', [M.purpose]: 'Buyer alert to agent', [M.status]: 'Received', [M.finalText]: text });
   summaryDone = c.date;
 }
 let summaryDone = null;

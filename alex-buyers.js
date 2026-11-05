@@ -1587,10 +1587,11 @@ function listLine(n, l) {
   const bits = [`${n}. ${l.short}${l.suburb && !l.short.toLowerCase().includes(l.suburb.toLowerCase()) ? ', ' + l.suburb : ''}`];
   if (bbc(l)) bits.push(bbc(l));
   if (l.status === 'Coming soon') bits.push('coming soon');
+  else if (l.status === 'Off market') bits.push('off market');
   else if (l.price) bits.push(l.price);
   let line = bits.join(' - ');
   if (l.stone) line += ' (one of ours)';
-  if (l.link && l.status !== 'Coming soon') line += ' ' + l.link;
+  if (l.link && !['Coming soon', 'Off market'].includes(l.status)) line += ' ' + l.link;
   return line;
 }
 
@@ -1654,7 +1655,7 @@ async function nurtureOne(brief, c) {
       const ls = await getMany(T.listings, matches.map(m => linkId(m.fields[MT.listing])));
       const pairs = matches.map(m => ({ m, l: ls.find(x => x.id === linkId(m.fields[MT.listing])) })).filter(p => p.l)
         .map(p => ({ m: p.m, l: listingFacts(p.l) }))
-        .filter(p => ['For sale', 'Coming soon'].includes(p.l.status))
+        .filter(p => ['For sale', 'Coming soon', 'Off market'].includes(p.l.status))
         .sort((a, b) => (b.l.stone - a.l.stone) || ((b.m.fields[MT.score] || 0) - (a.m.fields[MT.score] || 0)))
         .slice(0, 3);
       if (pairs.length) {
@@ -1712,7 +1713,7 @@ async function eventTick() {
       if (!['nurture', 'qualifying'].includes(st.phase) || !listReady(f)) continue;
       const tier = sel(f[B.tier]);
       const ls = (await getMany(T.listings, ms.map(m => linkId(m.fields[MT.listing])))).map(listingFacts);
-      const cand = ms.map(m => ({ m, l: ls.find(x => x.id === linkId(m.fields[MT.listing])) })).filter(p => p.l && ['For sale', 'Coming soon'].includes(p.l.status))
+      const cand = ms.map(m => ({ m, l: ls.find(x => x.id === linkId(m.fields[MT.listing])) })).filter(p => p.l && ['For sale', 'Coming soon', 'Off market'].includes(p.l.status))
         .filter(p => (tier === 'Hot' && ((p.m.fields[MT.score] || 0) >= 70 || p.l.stone)) || (p.l.stone && (tier === 'Warm' || (tier === 'Hot'))))
         .sort((a, b) => (b.l.stone - a.l.stone) || ((b.m.fields[MT.score] || 0) - (a.m.fields[MT.score] || 0)));
       if (!cand.length) continue;
@@ -1724,8 +1725,10 @@ async function eventTick() {
       const listAgent = agentFirst(agent);
       const text = l.status === 'Coming soon'
         ? `Hi ${first}, heads-up before it's advertised: ${listAgent} is about to list ${l.short}${bbc(l) ? ', ' + l.beds + ' bed' : ''} in ${l.suburb}. Want first look?`
+        : l.status === 'Off market'
+        ? `Hi ${first}, one that isn't being advertised: ${l.short}${bbc(l) ? ', ' + l.beds + ' bed' : ''}${l.suburb ? ' in ' + l.suburb : ''} is available off market through ${listAgent}. Want the details?`
         : `Hi ${first}, just listed and I thought of you: ${l.short}${l.suburb ? ', ' + l.suburb : ''}${bbc(l) ? ' - ' + bbc(l) : ''}${l.price ? ' - ' + l.price : ''}${l.link ? ' ' + l.link : ''}. Want me to get ${listAgent} to book you in?`;
-      const res = await sendToBuyer({ brief, contact, text, purpose: l.status === 'Coming soon' ? 'Coming soon alert' : 'Instant match', kind: 'initiated', allowedPrices: [l.price].filter(Boolean), match: m });
+      const res = await sendToBuyer({ brief, contact, text, purpose: ['Coming soon', 'Off market'].includes(l.status) ? 'Coming soon alert' : 'Instant match', kind: 'initiated', allowedPrices: [l.price].filter(Boolean), match: m });
       if (!res.ok) continue;
       await updateRecord(T.matches, m.id, { [MT.status]: 'Sent', [MT.sentAt]: new Date().toISOString() });
       st.lastOutAt = new Date().toISOString(); remember(st, 'out', res.text);
@@ -1756,7 +1759,7 @@ async function eventTick() {
           text = `Just letting you know ${l.short} is now under offer. I'll keep looking for something similar.`; purpose = 'Under offer / sold notice';
         } else if (l.status !== w.status && l.status === 'Sold' && keen) {
           text = `${l.short} has sold. I'll keep an eye out for similar ones and send them through.`; purpose = 'Under offer / sold notice';
-        } else if (l.status === 'For sale' && w.status === 'Coming soon' && l.price && ['Sent', 'Interested'].includes(mStatus)) {
+        } else if (l.status === 'For sale' && ['Coming soon', 'Off market'].includes(w.status) && l.price && ['Sent', 'Interested'].includes(mStatus)) {
           text = `${l.short} is now on the market at ${l.price}.${l.link ? ' ' + l.link : ''} Want me to line up a look?`; purpose = 'Coming soon alert';
         } else if (l.status === 'For sale' && w.price && l.price && l.price !== w.price && ['Sent', 'Interested'].includes(mStatus)) {
           const pmax = brief.fields[B.pmax];

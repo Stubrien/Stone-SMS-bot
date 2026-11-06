@@ -391,10 +391,22 @@ module.exports = function(app) {
       console.error('Alex buyers command error: ' + e.message);
     }
 
+    // Someone who is both a buyer and a seller (e.g. a buyer who must sell first gets a seller card): the reply belongs to
+    // whichever conversation Alex texted them in most recently, within the last 3 days (Matt, 6 Nov)
+    let buyerFirst = false;
+    try {
+      const buyerAt = await alexBuyers.buyerChatAt(From);
+      const sellerAt = alexLeads.enabled() && alexLeads.vendorChatAt ? await alexLeads.vendorChatAt(From) : 0;
+      buyerFirst = buyerAt > sellerAt && Date.now() - buyerAt < 3 * 864e5;
+    } catch (e) { console.error('Alex routing check: ' + e.message); }
+
     if (alexLeads.enabled()) {
       try {
         // Texts from Stu or an agent on the Team table: preview commands, approvals and card updates
         if (await alexLeads.handleTeamSMS(From, Body)) {
+          return res.type('text/xml').send('<Response></Response>');
+        }
+        if (buyerFirst && !alexLeads.isApprover(From) && await alexBuyers.handleBuyerSMS(From, Body)) {
           return res.type('text/xml').send('<Response></Response>');
         }
         if (!alexLeads.isApprover(From) && await alexLeads.handleVendorSMS(From, Body)) {

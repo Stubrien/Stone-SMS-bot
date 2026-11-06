@@ -1130,6 +1130,17 @@ async function findLeadByPhone(from) {
   return found.sort((a, b) => rank(sel(a.fields[L.stage])) - rank(sel(b.fields[L.stage])))[0];
 }
 
+// When Alex last texted this number about their seller card (ms, 0 if never) – see alex.js routing
+async function vendorChatAt(from) {
+  if (!enabled()) return 0;
+  try {
+    const lead = await findLeadByPhone(from);
+    if (!lead) return 0;
+    const msgs = await listAll(T.messages, { filterByFormula: `AND({${M.direction}}='To vendor',{${M.status}}='Sent',FIND('${lead.id}',ARRAYJOIN({${M.lead}})))` });
+    return msgs.reduce((m, r) => Math.max(m, Date.parse(r.fields[M.sentAt] || r.fields[M.created] || r.createdTime || '') || 0), 0);
+  } catch (e) { return 0; }
+}
+
 async function isPilotLead(lead) {
   if (!lead) return false;
   const agents = await alexActiveAgentIds();
@@ -3582,4 +3593,4 @@ function start() {
   setTimeout(fast, 45000);
 }
 
-module.exports = { start, sweep, isApprover, handleApproverSMS, handleTeamSMS, handleVendorSMS, createEnquiryLead, normalisePhone, enabled };
+module.exports = { vendorChatAt, start, sweep, isApprover, handleApproverSMS, handleTeamSMS, handleVendorSMS, createEnquiryLead, normalisePhone, enabled };

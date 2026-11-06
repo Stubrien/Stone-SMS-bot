@@ -969,7 +969,7 @@ Only fill update keys the buyer actually stated in THIS message, or that AGENT N
  Timeframe "ASAP"/"next couple of months" → "0–3 months"; "this year"/"6 months" → "3–6 months"; "next year" → "6–12 months" or "12+ months" as fits.
  "Pre-approved"/"approval done" → "Pre-approved"; "cash" → "Cash buyer"; "talking to the bank/broker" → "Talking to lender".
  Must sell first only if they need to sell before buying; "already sold"/"unconditional" → "Sold / under contract"; renting/first home → "Nothing to sell".
- declined_price = true if they'd rather not share a budget.
+ declined_price = true if they'd rather not share a budget. If the last qualifying question asked is "price" and they say "send everything (through)", "no limit", "anything", "don't mind" or similar, that IS their answer: intent answer, declined_price true.
 Intent guide: liked_property = liked the inspected home / wants another look → use wants_inspection when they ask to see it (again);
  wants_offer = wants to make an offer or talk price/negotiation; price_question = asks the asking price / price range / guide;
  contract_request = asks for the contract, Section 32 or vendor statement; property_fact = asks something answerable from KNOWN LISTINGS facts;
@@ -1205,6 +1205,13 @@ async function addBuyerFromAgent({ agent, input }) {
 }
 
 // Returns true when handled (a buyer Alex is looking after); false to let the other handlers run
+// When Alex last texted this number as a buyer (ms, 0 if never) – alex.js uses it to send a reply to the
+// conversation Alex was actually having (Matt, 6 Nov: a buyer who also has a seller card)
+async function buyerChatAt(from) {
+  if (!enabled()) return 0;
+  try { const found = await findBuyerByPhone(from); return found ? (Date.parse(getState(found.brief).lastOutAt || '') || 0) : 0; } catch (e) { return 0; }
+}
+
 async function handleBuyerSMS(from, body) {
   if (!enabled()) return false;
   const found = await findBuyerByPhone(from);
@@ -1284,6 +1291,11 @@ async function handleBuyerSMS(from, body) {
   const prop = matchFor(matches, listings, r.property) || (st.property && st.property.listingId ? { listing: listings.find(l => l.id === st.property.listingId), match: matches.find(m => linkId(m.fields[MT.listing]) === st.property.listingId) } : null);
   const propShort = (prop && prop.listing && prop.listing.short) || (st.property || {}).short || 'the property';
   const allowedPrices = listings.map(l => l.price).filter(Boolean);
+  // "Send everything through" / "no limit" in reply to the budget question is an answer, not something for the agent (Sophie, 6 Nov)
+  const NO_BUDGET = /\bsend (me )?(everything|anything|it all|all)\b|\bno (limit|budget|max|maximum|ceiling|price limit)\b|\bdon'?t (mind|care)\b|\bany ?(price|thing)\b|\bwhatever\b|\bopen to (anything|all)\b/i;
+  if (st.lastQ === 'price' && NO_BUDGET.test(text) && ['other', 'thanks', 'still_looking', 'answer'].includes(r.intent)) {
+    r.intent = 'answer'; r.declined_price = true; st.declinedPrice = true;
+  }
   const intent = r.intent;
   const prevPending = st.pending;
   st.pending = null;
@@ -1444,9 +1456,14 @@ async function handleBuyerSMS(from, body) {
       break;
 
     default: // other
-      out = `Thanks ${first}, I'll pass that on to ${agentName}.`;
       upd[B.notes] = ((brief.fields[B.notes] || '') + `\n${clock().date} buyer said: ${text.slice(0, 300)}`).trim();
-      await handoff({ brief, contact, agent, st, priority: 'normal', task: `Check ${contact.fields[C.name]}'s reply to Alex`, alertText: `"${text.slice(0, 200)}"` });
+      if ((st.phase || 'qualifying') === 'qualifying') {
+        // Mid-chat while Alex is still capturing the brief: note it and carry on – no task for the agent (Stu, 6 Nov)
+        addQuestion = true;
+      } else {
+        out = `Thanks ${first}, noted.`;
+        await handoff({ brief, contact, agent, st, priority: 'normal', task: `Check ${contact.fields[C.name]}'s reply to Alex`, alertText: `"${text.slice(0, 200)}"` });
+      }
   }
 
   // Next qualifying question (one at a time, max 3 in a row, price last)
@@ -1499,7 +1516,9 @@ async function idleTick() {
       const mins = minutesSince(st.lastOutAt);
       if (mins < IDLE_MINUTES) continue;
       st.awaitingAnswer = false;
-      const stale = mins > 180 || (st.lastInAt || '') > (st.lastOutAt || '') || brief.fields[B.pause] || brief.fields[B.following];
+      // At most one "interrupted" sign-off a day (Matt got two on 6 Nov)
+      const signedRecently = st.signedOffAt && minutesSince(st.signedOffAt) < 24 * 60;
+      const stale = mins > 180 || signedRecently || (st.lastInAt || '') > (st.lastOutAt || '') || brief.fields[B.pause] || brief.fields[B.following];
       const contact = stale ? null : await primaryContact(brief);
       if (contact && !optedOut(contact)) {
         const first = firstName(contact.fields[C.name]);
@@ -1918,6 +1937,7 @@ function start() {
 }
 
 module.exports = {
+  buyerChatAt,
   start, enabled, handleBuyerSMS, handleAgentCommand, addBuyerFromAgent, noteOptOut, noteSellerEnquiry,
   // exposed for testing
   _t: { idleTick, wrapUp, trimName, checkinTick, newBriefTick, nudgeTick, importTick, nurtureTick, eventTick, escalateTick, summaryTick, nextQuestion, cleanUpdates, priceSafe, firstTextFor, computeTier, listLine, inScheduledWindow, inspectionFollowUpOK, melbToISO, clock }

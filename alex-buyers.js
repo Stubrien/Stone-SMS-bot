@@ -31,6 +31,7 @@
 
 const Anthropic = require('@anthropic-ai/sdk');
 const twilio = require('twilio');
+const away = require('./alex-away'); // team leave (Stu, 10 Nov)
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 let twilioClient = null;
@@ -261,7 +262,7 @@ function agentFirst(agent) { return agent ? (agent.fields[TM.first] || firstName
 // Pilot gate. A brief Alex moved to another agent (buyer said they'd been dealing with them) keeps going
 // even if that agent isn't on the pilot yet (st.keepAlex).
 function agentLive(agent, brief) { return !!agent && (!!agent.fields[TM.buyersActive] || !!(brief && getState(brief).keepAlex)); }
-function agentPaused(agent) { return !!agent && !!agent.fields[TM.pauseBuyers]; }
+function agentPaused(agent) { return !!agent && (!!agent.fields[TM.pauseBuyers] || away.awayOnRecord(agent)); } // on leave = paused
 function approverMobile() { return normalisePhone(process.env.APPROVER_MOBILE); }
 function isApprover(from) { return !!approverMobile() && samePhone(from, approverMobile()); }
 
@@ -442,7 +443,9 @@ async function sendToBuyer({ brief, contact, match, text, purpose, kind, allowed
 }
 
 async function textAgent(agent, text, brief, contact) {
-  if (!agent || !agent.fields[TM.mobile]) return false;
+  if (!agent) return false;
+  if (await away.routeAgentText(agent, text, rawSMS)) { await logMsg({ brief, contact, direction: 'To agent', purpose: 'Buyer alert to agent', status: 'Sent', text: '(to cover – agent away) ' + text, number: '' }).catch(() => { }); return true; }
+  if (!agent.fields[TM.mobile]) return false;
   try {
     const sid = await rawSMS(agent.fields[TM.mobile], text);
     await logMsg({ brief, contact, direction: 'To agent', purpose: 'Buyer alert to agent', status: 'Sent', text, number: agent.fields[TM.mobile], sid });
@@ -1000,7 +1003,8 @@ async function readReply({ brief, contact, agent, st, text, listings }) {
   const f = brief.fields;
   const facts = listings.map(l => `- ${l.address}${l.stone ? ' (Stone Ballarat listing)' : ''}: ${l.type || ''} ${bbc(l) ? bbc(l) + ' bed/bath/car' : ''}${l.land ? ', ' + l.land + 'm²' : ''}; Price: ${l.price || 'not advertised'}; status ${l.status}${l.link ? '; link ' + l.link : ''}${l.features ? '; features: ' + l.features : ''}`).join('\n');
   const hist = (st.history || []).slice(-8).map(h => `${h.d === 'in' ? 'Buyer' : 'Alex'}: ${h.t}`).join('\n');
-  const user = `Agent: ${agentFirst(agent)}. Buyer: ${contact.fields[C.name]}.
+  const awayNote = agent ? await away.awayLine(agent.id).catch(() => '') : '';
+  const user = `Agent: ${agentFirst(agent)}. Buyer: ${contact.fields[C.name]}.${awayNote ? '\n' + awayNote : ''}
 Brief so far: ${briefSummary(f)}.
 AGENT NOTES: ${alexNotes(brief, contact) || '(none)'}
 PENDING: ${st.pending || 'none'}. Last qualifying question asked: ${st.lastQ || 'none'}.
@@ -1094,11 +1098,24 @@ async function setMatch(match, status, feedback) {
 
 // Agent handoff (section 8): task in My Tasks + text alert for urgent / high
 const RESPONSE_MINUTES = { urgent: 60, complaint: 120 };
-async function handoff({ brief, contact, agent, st, priority, task, alertText, escalateAfter }) {
-  const due = priority === 'normal' ? addDays(clock().date, 1) : clock().date;
-  const t = await createTask({ brief, contact, agent, task, due, notes: alertText, priority: priority === 'urgent' || priority === 'high' ? 'High' : undefined });
-  if (priority === 'urgent' || priority === 'high') {
-    await textAgent(agent, `Alex: ${alertText} Brief: ${recordLink(BRIEF_PAGE, brief.id)}`, brief, contact);
+// Task notes carry the context (Stu, 9 Nov): who, how to reach them, what they're after and the last few messages
+function taskContext({ brief, contact, st, alertText, fields }) {
+  const cf = (contact && contact.fields) || {};
+  const out = [alertText, ''];
+  out.push('Contact: ' + [cf[C.name], cf[C.mobile], cf[C.email]].filter(Boolean).join(' · '));
+  if (brief) out.push('Looking for: ' + briefSummary(fields || brief.fields));
+  const hist = ((st && st.history) || []).slice(-6).map(h => `${h.d === 'in' ? 'Them' : 'Alex'}: ${String(h.t).slice(0, 300)}`);
+  if (hist.length) out.push('', 'Recent chat with Alex:', ...hist);
+  if (brief) out.push('', 'Brief: ' + recordLink(BRIEF_PAGE, brief.id));
+  return out.join('\n').slice(0, 5000);
+}
+// notify = text the agent straight away even on a normal-priority hand-over (new seller leads – Stu, 9 Nov)
+async function handoff({ brief, contact, agent, st, priority, task, alertText, escalateAfter, notify, label, fields }) {
+  const due = priority === 'normal' && !notify ? addDays(clock().date, 1) : clock().date;
+  const t = await createTask({ brief, contact, agent, task, due, notes: taskContext({ brief, contact, st, alertText, fields }), priority: priority === 'urgent' || priority === 'high' || notify ? 'High' : undefined });
+  if (priority === 'urgent' || priority === 'high' || notify) {
+    const em = contact && contact.fields[C.email] ? ` Email: ${contact.fields[C.email]}.` : '';
+    await textAgent(agent, `Alex${label ? ' – ' + label : ''}: ${alertText}${notify || label ? em : ''} Brief: ${recordLink(BRIEF_PAGE, brief.id)}`, brief, contact);
   }
   if (escalateAfter && t) {
     (st.urgent = st.urgent || []).push({ taskId: t.id, at: new Date().toISOString(), after: escalateAfter, what: alertText, chased: false });
@@ -1400,9 +1417,15 @@ async function handleBuyerSMS(from, body) {
     case 'must_sell':
     case 'value_question':
       if (intent === 'must_sell') upd[B.saleDep] = 'Must sell first'; // the brief automation creates the selling opportunity
+      // ...and the agent hears about it straight away (Stu, 9 Nov). The seller card's own task carries the follow-up.
+      if (intent === 'must_sell' && sel(brief.fields[B.saleDep]) !== 'Must sell first' && !st.sellerAlerted) {
+        st.sellerAlerted = true;
+        const em = contact.fields[C.email] ? ` Email: ${contact.fields[C.email]}.` : '';
+        await textAgent(agent, `Alex – NEW SELLER LEAD: ${contact.fields[C.name]} (${contact.fields[C.mobile]}) needs to sell before they buy.${em} Said: "${text.slice(0, 160)}". I've offered an in-person chat about value and a seller card is being set up for you. Brief: ${recordLink(BRIEF_PAGE, brief.id)}`, brief, contact);
+      }
       out = `Would it help to know what yours might be worth in today's market? ${agentName} can pop round for a quick chat, no obligation.`;
       st.pending = 'appraisal';
-      if (intent === 'value_question') await handoff({ brief, contact, agent, st, priority: 'normal', task: `Appraisal chat – ${contact.fields[C.name]} asked what their home is worth`, alertText: `${contact.fields[C.name]} (${contact.fields[C.mobile]}) asked about the value of their home. Alex offered an in-person chat (never a figure by text).` });
+      if (intent === 'value_question') await handoff({ brief, contact, agent, st, priority: 'normal', notify: true, label: 'NEW SELLER LEAD', task: `Appraisal chat – ${contact.fields[C.name]} asked what their home is worth`, alertText: `${contact.fields[C.name]} (${contact.fields[C.mobile]}) asked about the value of their home. Alex offered an in-person chat (never a figure by text).` });
       break;
 
     case 'neighbour':
@@ -1413,7 +1436,7 @@ async function handleBuyerSMS(from, body) {
 
     case 'neighbour_yes':
       out = `Lovely, I'll get ${agentName} to give you a call to find a time.`;
-      await handoff({ brief, contact, agent, st, priority: 'normal', task: `Appraisal chat with ${contact.fields[C.name]} (neighbour near ${propShort})`, alertText: `${contact.fields[C.name]} (${contact.fields[C.mobile]}) said yes to a chat about the value of their home.` });
+      await handoff({ brief, contact, agent, st, priority: 'normal', notify: true, label: 'NEW SELLER LEAD', task: `Appraisal chat with ${contact.fields[C.name]} (neighbour near ${propShort})`, alertText: `${contact.fields[C.name]} (${contact.fields[C.mobile]}) said yes to a chat about the value of their home.` });
       break;
 
     case 'who_is_this':
@@ -1447,7 +1470,7 @@ async function handleBuyerSMS(from, body) {
         await handoff({ brief, contact, agent, st, priority: 'high', task: `Send contract / Section 32 for ${st.pendingDoc || 'the property'} to ${contact.fields[C.name]} (${contact.fields[C.email]})`, alertText: `${contact.fields[C.name]} asked for the contract / Section 32 on ${st.pendingDoc || 'the property'}. Email: ${contact.fields[C.email]}.` });
       } else if (prevPending === 'appraisal' && /\b(yes|yeah|yep|sure|ok|okay|please)\b/i.test(text)) {
         out = `Lovely, I'll get ${agentName} to give you a call to find a time.`;
-        await handoff({ brief, contact, agent, st, priority: 'normal', task: `Appraisal chat with ${contact.fields[C.name]} (buyer who needs to sell)`, alertText: `${contact.fields[C.name]} (${contact.fields[C.mobile]}) said yes to an in-person chat about what their home is worth.` });
+        await handoff({ brief, contact, agent, st, priority: 'normal', notify: true, label: 'NEW SELLER LEAD', task: `Appraisal chat with ${contact.fields[C.name]} (buyer who needs to sell)`, alertText: `${contact.fields[C.name]} (${contact.fields[C.mobile]}) said yes to an in-person chat about what their home is worth.` });
       } else if (prevPending === 'second_look' && /\b(yes|yeah|yep|sure|please)\b/i.test(text)) {
         out = `Great, I'll get ${agentName} to call you to set it up.`;
         await handoff({ brief, contact, agent, st, priority: 'high', task: `Book another look at ${propShort} for ${contact.fields[C.name]}`, alertText: `${contact.fields[C.name]} (${contact.fields[C.mobile]}) wants another look at ${propShort}.` });
@@ -1488,7 +1511,7 @@ async function handleBuyerSMS(from, body) {
   // The opportunity improved: text + task for the agent the first time a buyer becomes Hot (Stu, 30 Oct)
   if (!st.hotAlerted && sel(brief.fields[B.tier]) !== 'Hot' && sel(brief.fields[B.status]) === 'Active' && computeTier(merged.fields) === 'Hot') {
     st.hotAlerted = true;
-    await handoff({ brief, contact, agent, st, priority: 'high', task: `Hot buyer: ${contact.fields[C.name]} – ${shortSummary(merged.fields)}`, alertText: `${contact.fields[C.name]} (${contact.fields[C.mobile]}) is now a Hot buyer: ${briefSummary(merged.fields)}.` });
+    await handoff({ brief, contact, agent, st, priority: 'high', label: 'HOT BUYER', fields: merged.fields, task: `Hot buyer: ${contact.fields[C.name]} – ${shortSummary(merged.fields)}`, alertText: `${contact.fields[C.name]} (${contact.fields[C.mobile]}) is now a Hot buyer: ${briefSummary(merged.fields)}.` });
   }
   if (swapNote) out = swapNote + (out ? ' ' + out.replace(/^(No worries|Great|Thanks)[^.!?]*[.!?]\s*/i, '') : '');
   if (out) {

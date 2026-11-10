@@ -2,7 +2,8 @@ const Anthropic = require('@anthropic-ai/sdk');
 const twilio = require('twilio');
 const alexLeads = require('./alex-leads');
 const alexBuyers = require('./alex-buyers');
-const alexRequests = require('./alex-requests'); // jobs the team gives Alex on the Ask Alex page (Stu, 10 Nov)
+const alexRequests = require('./alex-requests');
+const alexAway = require('./alex-away'); // team leave: "I'm away 20th to 27th" (Stu, 10 Nov) // jobs the team gives Alex on the Ask Alex page (Stu, 10 Nov)
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
@@ -376,6 +377,7 @@ module.exports = function(app) {
   alexLeads.start();
   alexBuyers.start();
   alexRequests.start();
+  alexAway.start();
 
   app.post('/campaign', async function(req, res) {
     const From = req.body.From;
@@ -390,6 +392,15 @@ module.exports = function(app) {
       }
     } catch (e) {
       console.error('Alex requests handler error: ' + e.message);
+    }
+
+    // A team member telling Alex about leave ("on holidays 20th to 27th", "I'm back", "cancel my leave")
+    try {
+      if (await alexAway.handleTeamSMS(From, Body)) {
+        return res.type('text/xml').send('<Response></Response>');
+      }
+    } catch (e) {
+      console.error('Alex away handler error: ' + e.message);
     }
 
     // Airtable Sales Leads pilot: approver commands (YES A7 / EDIT A7 ... / NO A7 / KEEP A7 / LIST)

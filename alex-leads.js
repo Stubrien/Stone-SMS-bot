@@ -44,6 +44,7 @@
 
 const Anthropic = require('@anthropic-ai/sdk');
 const twilio = require('twilio');
+const away = require('./alex-away'); // team leave (Stu, 10 Nov)
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
@@ -184,7 +185,7 @@ async function leadContext(lead) {
       background: f[L.background] || '', nurtureReason: sel(f[L.nurtureReason]), followUpInterval: sel(f[L.interval]),
       followUpDate: f[L.followUp] || '', appraisalType: sel(f[L.apptType]), source: sel(f[L.source])
     },
-    agent: agent ? { name: agent.fields[TM.name], firstName: agent.fields[TM.firstName] || firstName(agent.fields[TM.name]), mobile: agent.fields[TM.mobile] } : null,
+    agent: agent ? { id: agent.id, name: agent.fields[TM.name], firstName: agent.fields[TM.firstName] || firstName(agent.fields[TM.name]), mobile: agent.fields[TM.mobile], away: await away.awayLine(agent.id).catch(() => '') } : null,
     history
   };
 }
@@ -822,9 +823,12 @@ async function eligibleLeads() {
   const waiting = await activeDrafts();
   const waitingLeadIds = new Set(waiting.map(w => (w.fields[M.lead] || [])[0]));
   const binnedLeadIds = await recentlyBinnedLeadIds();
+  const awayIds = new Set();
+  for (const id of agents) if (await away.awayInfo(id)) awayIds.add(id);
   return leads.filter(l => {
     const f = l.fields;
     if (!(f[L.agent] || []).some(id => agents.has(id))) return false;
+    if ((f[L.agent] || []).some(id => awayIds.has(id))) return false; // agent on leave – nurture waits
     if (!isTextableMobile(f[L.phone])) return false; // e.g. an email or landline typed into Phone
     if (waitingLeadIds.has(l.id)) return false;
     if (binnedLeadIds.has(l.id)) return false; // a draft was just binned - wait for the next round
@@ -1034,6 +1038,7 @@ function ownSale(address, sales) {
 }
 async function textAgentOf(lead, text) {
   const agent = await teamById((lead.fields[L.agent] || [])[0]);
+  if (await away.routeAgentText(agent, text, sendSMS)) return;
   const to = agent && isTextableMobile(agent.fields[TM.mobile]) ? normalisePhone(agent.fields[TM.mobile]) : approverMobile();
   try { await sendSMS(to, text); } catch (e) { console.error('Alex leads: agent text failed', e.message); }
 }
@@ -1184,7 +1189,7 @@ async function handleVendorSMS(from, body) {
   const ctx = await leadContext(await getRecord(T.leads, lead.id));
   const today = melbNow().date;
   const user =
-    `TODAY: ${today}\nAGENT: ${ctx.agent ? ctx.agent.name : 'the agent'}\nLEAD CARD: ${JSON.stringify(ctx.card)}\n\nNOTES & HISTORY (oldest first):\n${historyText(ctx.history)}\n\n` +
+    `TODAY: ${today}\nAGENT: ${ctx.agent ? ctx.agent.name : 'the agent'}\n${ctx.agent && ctx.agent.away ? ctx.agent.away + '\n' : ''}LEAD CARD: ${JSON.stringify(ctx.card)}\n\nNOTES & HISTORY (oldest first):\n${historyText(ctx.history)}\n\n` +
     `THE VENDOR JUST TEXTED: "${text}"\n\n` +
     (/rental provider|landlord/i.test(sel(f[L.nurtureReason])) ? 'NOTE: this person is a rental provider - the card property is their investment property, managed by Stone Ballarat\'s property management team. If they raise rent, tenants, the lease, repairs, maintenance or anything else property management handles, do not try to answer it: reply that you\'ll pass it straight to our property management team, and set urgent_for_agent true with the details in reasoning.\n\n' : '') +
     'Work out what this means for the agent and draft Alex\'s reply. Return JSON only:\n' +
@@ -1341,7 +1346,7 @@ async function handoffToAgent({ lead, ctx, out, text, from }) {
     `The card is now in ${upd[L.stage] || stage} with "Call ${first || name}" due today in your My Day.`,
     ackSent ? `Alex has told them you'll call and has stopped nurture texts.` : `Alex could NOT send them a reply – please call them.`
   ].filter(Boolean);
-  try { await sendSMS(to, lines.join('\n')); } catch (e) { console.error('Alex leads: agent alert failed', e.message); }
+  try { if (!(ctx.agent && ctx.agent.id && await away.routeAgentText(ctx.agent.id, lines.join('\n'), sendSMS))) await sendSMS(to, lines.join('\n')); } catch (e) { console.error('Alex leads: agent alert failed', e.message); }
 
   await logActivity(lead.id, {
     summary: `Handed to ${ctx.agent ? ctx.agent.name : 'the agent'} – vendor ${reason}`,
@@ -1387,6 +1392,8 @@ function melbClock() {
   return { date: `${p('year')}-${p('month')}-${p('day')}`, hour: parseInt(p('hour'), 10) % 24, minute: parseInt(p('minute'), 10), weekday: p('weekday') };
 }
 function isBH(c) { c = c || melbClock(); return c.weekday !== 'Sun' && c.hour >= 8 && c.hour < 19; }
+// Agent alerts about new seller leads go straight away, any day 7am–9pm (Stu, 9 Nov); overnight they wait for 7am
+function isAlertHrs(c) { c = c || melbClock(); return c.hour >= 7 && c.hour < 21; }
 function isBizDay(iso) { const wd = new Date(iso + 'T00:00:00Z').getUTCDay(); return wd !== 0 && wd !== 6; }
 function bizDaysBetween(fromIso, toIso) { let n = 0, d = fromIso; while (d < toIso) { d = addDays(d, 1); if (isBizDay(d)) n++; } return n; }
 function nextBizDay(iso) { let d = addDays(iso, 1); while (!isBizDay(d)) d = addDays(d, 1); return d; }
@@ -1399,6 +1406,7 @@ async function setState(leadId, state, extra) {
 
 async function agentOfLead(lead) { return teamById((lead.fields[L.agent] || [])[0]); }
 async function textAgent(agent, text) {
+  if (await away.routeAgentText(agent, text, sendSMS)) return;
   const to = agent && isTextableMobile(agent.fields[TM.mobile]) ? normalisePhone(agent.fields[TM.mobile]) : approverMobile();
   try { await sendSMS(to, text); } catch (e) { console.error('Alex leads: agent text failed', e.message); }
 }
@@ -1479,13 +1487,14 @@ async function newLeadStep(lead, c) {
       await setState(lead.id, { flow: 'newlead', phase: 'skip', why: !isTextableMobile(f[L.phone]) ? 'no mobile' : old ? 'older card' : 'agent already in contact' });
       return;
     }
-    if (isBH(c)) {
+    if (isBH(c) && !(await away.awayInfo(agent))) {
       const text = `New lead: ${label}${f[L.sourceDetail] || f[L.source] ? ' – ' + (f[L.sourceDetail] || sel(f[L.source])) : ''}. ${f[L.phone]}.\nReply CALL if you'll ring them yourself, or ALEX for me to engage.`;
       await textAgent(agent, text);
       await setState(lead.id, { flow: 'newlead', phase: 'alerted', alertedAt: nowIso, alertHour: c.hour, lastReminderAt: nowIso, reminders: 0 }, { [L_ALEX_STATUS]: 'Waiting for agent' });
       await logActivity(lead.id, { summary: `New lead sent to ${agent ? agent.fields[TM.name] : 'the agent'} (CALL or ALEX)`, type: 'General', kind: 'History' });
     } else {
       await sendOpener(lead, agent);
+      if (isAlertHrs(c)) await textAgent(agent, `NEW SELLER LEAD${isBH(c) ? '' : ' (after hours)'}: ${label}${f[L.sourceDetail] || f[L.source] ? ' – ' + (f[L.sourceDetail] || sel(f[L.source])) : ''}. ${f[L.phone]}${f[L.email] ? ' · ' + f[L.email] : ''}. I've texted them to start the conversation and will let you know how it goes – no need to reply.`);
       await setState(lead.id, { flow: 'newlead', phase: 'engaging', openerAt: nowIso, overnight: true }, { [L_ALEX_STATUS]: 'Engaging' });
     }
     return;
@@ -1561,7 +1570,7 @@ async function newLeadStep(lead, c) {
   }
 
   // Overnight lead that reached an outcome: tell the agent from 8am (moves to the morning email in part 3)
-  if (state.overnight && state.outcomeSummary && !state.summarySent && isBH(c)) {
+  if (state.overnight && state.outcomeSummary && !state.summarySent && isAlertHrs(c)) {
     await textAgent(agent, `New lead overnight: ${state.outcomeSummary}`);
     state.summarySent = true;
     await setState(lead.id, state);
@@ -1739,7 +1748,7 @@ async function handleNewLeadReply(lead, from, text, ctx) {
     // Unqualified enquiry that is just curious: no agent text, it goes in the 5pm summary
     if (state.unq && out.outcome === 'nurture') { state.summarySent = true; noteUnqForSummary(`${leadLabel(f)} – a lead for later (${out.nurture_reason || 'Nurture'}) → Nurture`); await setState(lead.id, state); return; }
     // In BH (or a handover) tell the agent now; otherwise it goes in the 8am summary
-    if (isBH(c) || out.outcome === 'handover') { await textAgent(agent, (out.outcome === 'handover' ? '⚠ ' : '') + `${state.outcomeSummary} ${f[L.phone]}`); state.summarySent = true; }
+    if (isAlertHrs(c) || out.outcome === 'handover') { await textAgent(agent, (out.outcome === 'handover' ? '⚠ ' : 'NEW SELLER LEAD – ') + `${state.outcomeSummary} ${f[L.phone]}${f[L.email] ? ' · ' + f[L.email] : ''}${f[L.sourceDetail] || f[L.source] ? ' · source: ' + (f[L.sourceDetail] || sel(f[L.source])) : ''}`); state.summarySent = true; }
   }
   await setState(lead.id, state);
 }
@@ -2119,7 +2128,7 @@ async function startNewLeadFlow(leadId, returning) {
   const agent = await agentOfLead(lead);
   const nowIso = new Date().toISOString();
   const label = leadLabel(f);
-  if (isBH(c)) {
+  if (isBH(c) && !(await away.awayInfo(agent))) {
     const text = `${returning ? 'Returning contact – they just responded to a social media ad' : 'New lead'}: ${label}${f[L.sourceDetail] ? ' – ' + f[L.sourceDetail] : ''}. ${f[L.phone]}.` +
       (returning ? `\n${returning}` : '') + `\nReply CALL if you'll ring them yourself, or ALEX for me to engage.`;
     await textAgent(agent, text);
@@ -2127,6 +2136,7 @@ async function startNewLeadFlow(leadId, returning) {
     return 'agent alerted (CALL / ALEX)';
   }
   await sendOpener(lead, agent);
+  if (isAlertHrs(c)) await textAgent(agent, `${returning ? 'Returning contact' : 'NEW SELLER LEAD'}${isBH(c) ? '' : ' (after hours)'}: ${label}${f[L.sourceDetail] ? ' – ' + f[L.sourceDetail] : ''}. ${f[L.phone]}${f[L.email] ? ' · ' + f[L.email] : ''}. I've texted them to start the conversation and will let you know how it goes – no need to reply.`);
   await setState(lead.id, { flow: 'newlead', phase: 'engaging', openerAt: nowIso, overnight: true, returning: !!returning }, { [L_ALEX_STATUS]: 'Engaging' });
   return 'opener sent to the contact';
 }
@@ -2252,7 +2262,7 @@ async function unqStep(lead, state, c, agent) {
     return;
   }
   // A qualified outcome reached outside business hours: tell the agent from 8am
-  if (state.outcomeSummary && !state.summarySent && isBH(c)) {
+  if (state.outcomeSummary && !state.summarySent && isAlertHrs(c)) {
     await textAgent(agent, `Social enquiry: ${state.outcomeSummary}`);
     state.summarySent = true;
     await setState(lead.id, state);

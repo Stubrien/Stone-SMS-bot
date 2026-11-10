@@ -9,6 +9,7 @@
 
 const Anthropic = require('@anthropic-ai/sdk');
 const twilio = require('twilio');
+const away = require('./alex-away'); // team leave (Stu, 10 Nov)
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
@@ -176,6 +177,7 @@ async function textTeam(job, member, text) {
   const to = isTextableMobile(member.fields[TM.mobile]) ? member.fields[TM.mobile] : approverMobile();
   if (!to) return false;
   text = plainSMS(text);
+  if (teamHours() && await away.awayInfo(member)) { note(job, 'Alex → cover for ' + tFirst(member), text); await away.routeAgentText(member, text, sendSMS); return true; }
   if (teamHours()) { try { await sendSMS(to, text); } catch (e) { console.error('Alex requests: team text failed', e.message); } }
   else (job.st.teamOutbox = job.st.teamOutbox || []).push({ to, text });
   note(job, 'Alex → ' + tFirst(member), text);
@@ -253,6 +255,9 @@ async function requestFacts(job) {
   if (job.type === 'Chase a document') L.push(`Document needed: ${docText(job)}`, `How to send it: ${await sendToText(job)}`);
   if (job.type === 'Ask a question') L.push(`Question to ask: ${job.f[R.question] || ''}`);
   if (job.f[R.replyBy]) L.push(`Needed by: ${job.f[R.replyBy]}`);
+  const aw = job.agent ? await away.awayInfo(job.agent) : null;
+  if (aw) L.push(`${job.aFirst} is on leave until ${aw.until} (back ${aw.back}) - any meeting must be on or after ${aw.back}.`);
+  else if (job.agent && job.agent.fields['fldS5Xjx0ZZ4vknFO'] && job.agent.fields['fldS5Xjx0ZZ4vknFO'] > melbClock().date) L.push(`${job.aFirst} is on leave ${job.agent.fields['fldS5Xjx0ZZ4vknFO']} to ${job.agent.fields['fldVaVBBXJQvKLvBm']} - no meetings on those days.`);
   return L.join('\n');
 }
 
@@ -303,13 +308,15 @@ const overlaps = (s, e, b) => new Date(s) < new Date(b.end) && new Date(e) > new
 async function cleanOptions(job, locals) {
   const busy = await busyFor(job.agent, (job.f[R.within] || 7) + 7);
   const mins = job.f[R.minutes] || 30;
-  const lastDay = addDays(melbClock().date, Math.max(2, (job.f[R.within] || 7) + 3));
+  const aw = await away.awayInfo(job.agent);
+  const lastDay = addDays(aw ? aw.back : melbClock().date, Math.max(2, (job.f[R.within] || 7) + 3));
   const out = [], seen = new Set();
   for (const loc of locals || []) {
     const iso = melbToISO(loc);
     if (!iso || seen.has(iso) || Date.parse(iso) < Date.now() + 2 * 3600000) continue;
     const day = loc.slice(0, 10), hhmm = loc.slice(11);
     if (day > lastDay || new Date(day + 'T00:00:00Z').getUTCDay() === 0 || hhmm < '08:00' || hhmm > '18:00') continue;
+    if (job.agent && away.awayOnRecord(await teamById(job.agent.id), day)) continue; // agent on leave that day
     const end = new Date(Date.parse(iso) + mins * 60000).toISOString();
     if (busy.some(b => overlaps(new Date(Date.parse(iso) - 15 * 60000).toISOString(), end, b))) continue;
     seen.add(iso); out.push(iso);

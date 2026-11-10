@@ -2,6 +2,7 @@ const Anthropic = require('@anthropic-ai/sdk');
 const twilio = require('twilio');
 const alexLeads = require('./alex-leads');
 const alexBuyers = require('./alex-buyers');
+const alexRequests = require('./alex-requests'); // jobs the team gives Alex on the Ask Alex page (Stu, 10 Nov)
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
@@ -374,11 +375,22 @@ module.exports = function(app) {
 
   alexLeads.start();
   alexBuyers.start();
+  alexRequests.start();
 
   app.post('/campaign', async function(req, res) {
     const From = req.body.From;
     const Body = req.body.Body;
     console.log('Alex incoming from ' + From + ': ' + Body);
+
+    // Alex Requests (Ask Alex page): team replies with a code ("R12 2", "R12 YES", "R12 GOT IT") and replies
+    // from a contact Alex is working a request with come first (Stu, 10 Nov)
+    try {
+      if (await alexRequests.handleTeamSMS(From, Body) || await alexRequests.handleContactSMS(From, Body)) {
+        return res.type('text/xml').send('<Response></Response>');
+      }
+    } catch (e) {
+      console.error('Alex requests handler error: ' + e.message);
+    }
 
     // Airtable Sales Leads pilot: approver commands (YES A7 / EDIT A7 ... / NO A7 / KEEP A7 / LIST)
     // and replies from vendors on pilot agents' leads are handled by alex-leads.js

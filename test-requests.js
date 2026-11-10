@@ -291,5 +291,63 @@ async function test(name, fn) { claudeQueue = []; try { await fn(); passed++; co
     assert.strictEqual(to(W).length, n);
   });
 
+  // ===== Phase 2: private inspections
+  await test('inspection: buyer → tenant OKs 2 of 3 → agent picks → all confirmed', async () => {
+    NOW = new RealDate('2026-11-23T23:00:00Z').getTime(); // Tue 24 Nov 10am
+    const LIS = 'tbl7rq0yT4S55joAJ';
+    const lst = add(LIS, { fldSRLtRIu0xYW1O3: '12 Smith Street, Alfredton' });
+    const OCC = '+61411999888';
+    const r11 = newReq({ [F.type]: 'Private inspection', [F.contact]: [bob], fldhu6NoBV9zhjEK3: [lst], fldisB2ltD6cqLFdJ: 'Tenant', fld9dJQvH40N7pTYv: 'Tina Tenant', fldWB6Prb06hTWiGG: '0411 999 888', fldkVcmMRUAyatLEN: 24, fldUv70qB2SqBNP5X: true, [F.first]: 'Send straight away' }, '0411 222 444');
+    table(CON).get(bob).fields.fldd9p4vMwi8R6Bx8 = false; delete table(CON).get(bob).fields.fldd9p4vMwi8R6Bx8;
+    claudeQueue.push({ text: '' });
+    await AR.tick();
+    assert(/take you through 12 Smith Street, Alfredton privately/.test(lastTo(B)), lastTo(B));
+    const d1 = new RealDate(NOW + 2 * 864e5).toISOString().slice(0, 10), d2 = new RealDate(NOW + 3 * 864e5).toISOString().slice(0, 10);
+    claudeQueue.push({ intent: 'availability', reply: 'x', options: [d1 + 'T15:00', d2 + 'T10:00', d2 + 'T14:00'] });
+    await AR.handleContactSMS(B, 'Thursday or Friday works');
+    assert(/check those with the tenants and Leanne/.test(lastTo(B)), lastTo(B));
+    assert(/A buyer would like a private inspection of 12 Smith Street/.test(lastTo(OCC)), lastTo(OCC));
+    assert.strictEqual(to(LEANNE).filter(m => /R11/.test(m.body)).length, 0); // agent not asked yet
+    claudeQueue.push({ intent: 'ok', ok_numbers: [2, 3] });
+    assert(await AR.handleContactSMS(OCC, '2 or 3 is fine'));
+    assert.strictEqual(rq(r11)[F.status], 'Waiting on agent');
+    assert(/private inspection of 12 Smith Street.*can do: 1 - Thu 26 Nov, 10:00am \/ 2 - Thu 26 Nov, 2:00pm/.test(lastTo(LEANNE)), lastTo(LEANNE));
+    await AR.handleTeamSMS(LEANNE, 'R11 1');
+    assert.strictEqual(rq(r11)[F.status], 'Confirmed');
+    assert(/Leanne will see you .* at 12 Smith Street, Alfredton, for a private inspection|Leanne will see you .*12 Smith Street/.test(lastTo(B)), lastTo(B));
+    assert(/Confirmed - Leanne will bring a buyer through 12 Smith Street.*notice of the inspection/.test(lastTo(OCC)), lastTo(OCC));
+    // feedback an hour after
+    NOW = Date.parse(rq(r11)[F.confirmed]) + 70 * 60000;
+    await AR.tick();
+    assert(/What did you think/.test(lastTo(B)), lastTo(B));
+    claudeQueue.push({ intent: 'feedback', summary: 'liked it, kitchen small', interest: 'medium', reply: 'Thanks Bob, appreciate it.' });
+    await AR.handleContactSMS(B, 'Liked it but the kitchen is small');
+    assert.strictEqual(rq(r11)[F.status], 'Done');
+    assert(/feedback on 12 Smith Street, Alfredton \(interest: medium\)/.test(lastTo(LEANNE)), lastTo(LEANNE));
+  });
+  await test('inspection: tenant says none suit → buyer asked again; tenant notice respected', async () => {
+    NOW = new RealDate('2026-11-30T23:00:00Z').getTime(); // Tue 1 Dec 10am
+    const lst = add('tbl7rq0yT4S55joAJ', { fldSRLtRIu0xYW1O3: '8 Grevillea Crescent, Delacombe' });
+    const OCC = '+61411999777';
+    const r12 = newReq({ [F.type]: 'Private inspection', [F.contact]: [bob], fldhu6NoBV9zhjEK3: [lst], fldisB2ltD6cqLFdJ: 'Vendor', fld9dJQvH40N7pTYv: 'Vic Vendor', fldWB6Prb06hTWiGG: '0411 999 777', fldkVcmMRUAyatLEN: 24, [F.first]: 'Send straight away' }, '0411 222 444');
+    claudeQueue.push({ text: '' });
+    await AR.tick();
+    const today = new RealDate(NOW).toISOString().slice(0, 10), d1 = new RealDate(NOW + 2 * 864e5).toISOString().slice(0, 10);
+    claudeQueue.push({ intent: 'availability', options: [today + 'T15:00', d1 + 'T14:00'] }); // today is inside 24h notice
+    await AR.handleContactSMS(B, 'this arvo or Thursday');
+    assert(/Would any of these suit\? 1 - Wed 2 Dec/.test(lastTo(OCC)), lastTo(OCC));
+    assert(!/2 - /.test(lastTo(OCC)));
+    claudeQueue.push({ intent: 'none', other_times: 'Saturday morning' });
+    await AR.handleContactSMS(OCC, "No sorry, Saturday morning is better");
+    assert.strictEqual(rq(r12)[F.status], 'Contacting');
+    assert(/Saturday morning could work/.test(lastTo(B)), lastTo(B));
+  });
+  await test('inspection: no mobile for the tenant → straight back to the agent', async () => {
+    const lst = add('tbl7rq0yT4S55joAJ', { fldSRLtRIu0xYW1O3: '1 Nowhere St' });
+    const r13 = newReq({ [F.type]: 'Private inspection', [F.contact]: [bob], fldhu6NoBV9zhjEK3: [lst], fldisB2ltD6cqLFdJ: 'Tenant', [F.first]: 'Send straight away' }, '0411 222 444');
+    await AR.tick();
+    assert.strictEqual(rq(r13)[F.status], 'Needs agent');
+  });
+
   console.log(`\n${passed} passed`);
 })();

@@ -30,7 +30,8 @@ const R = {
   question: 'fldmDuzqN0147O8Aa', answerTo: 'fldglNoGmYSDgGhww',
   proposed: 'fldh2RHz9wIqNh4xs', confirmed: 'fldqvrWi08S02dT8S', outcome: 'fldf475oEQsDJnzIw', convo: 'fldzCdzfPKSk5ofkY', chases: 'fldrT5q5doEwCTaXb',
   lastContact: 'fldAlOgM22bzf3ArV', closedAt: 'fld4xzeSH2G8tQO12', task: 'fldLwiaC81ZN8jppI', state: 'fldKmJiVyb1pUddfQ', mobile: 'fldOG6muQygJJFcOz', created: 'fldeD7bBF0m7ch8d9',
-  pageCmd: 'fldVQ8ivTxzVF1YAV', draft: 'fldRbDkjdVaF5BqG2'
+  pageCmd: 'fldVQ8ivTxzVF1YAV', draft: 'fldRbDkjdVaF5BqG2',
+  occ: 'fldisB2ltD6cqLFdJ', occName: 'fld9dJQvH40N7pTYv', occMobile: 'fldWB6Prb06hTWiGG', notice: 'fldkVcmMRUAyatLEN', askFeedback: 'fldUv70qB2SqBNP5X'
 };
 const TM = { name: 'fldWZzjCL3xoU0l82', first: 'fldbxwqujqA0rygi9', mobile: 'fldUZ1RQT4BNOo41n', email: 'fldCwH4gZpNqZKmU1', active: 'fld8McuiVqyHAYduE' };
 const C = { name: 'fld5hDJRpN92YZnFx', mobile: 'fld0EA8biRz66il05', email: 'fldZW60VKGeM5Pc2u', know: 'fldeg2ubhT2KCRR75', dnc: 'fldd9p4vMwi8R6Bx8', optedOn: 'fldKV1dvdkTd08Mgv' };
@@ -38,6 +39,9 @@ const TK = { task: 'flds1zBNNSIuWMIAe', due: 'fldFgsIL7uMKKutro', status: 'flddk
 const A = { summary: 'fldBSXLvtiGrLDlBB', lead: 'fldR7UavJmh0OWsDI', kind: 'fldfKAWZQWXe00nz7', type: 'fldP8or1OJQgK4jrg', detail: 'fldhFWP8aFaaRV3nV', author: 'fld9GdJ7yWaVdBE9z', actType: 'fldFkehYx2Ow3iDm4', agent: 'fldUWwdtHeEPyoESq', contact: 'fldNzBEfyZ2uOi7k2', brief: 'fldtpS92u35fQHUKp' };
 const LST = { addr: 'fldSRLtRIu0xYW1O3' };
 
+// Private inspections (Phase 2, Stu 10 Nov): buyer + vendor / tenant + agent
+const isPI = job => job.type === 'Private inspection';
+const isMeet = job => job.type === 'Meet the agent' || job.type === 'Private inspection';
 const OPEN = ['Awaiting approval', 'New', 'Contacting', 'Waiting on agent', 'Confirmed'];
 
 // ---------------------------------------------------------------- small helpers
@@ -146,6 +150,12 @@ async function load(rec) {
   job.cFirst = firstName(job.cName) || 'there';
   job.mobile = job.contact ? job.contact.fields[C.mobile] : '';
   job.aFirst = tFirst(job.agent) || 'our agent';
+  job.occ = sel(f[R.occ]);
+  job.occMobile = f[R.occMobile] || '';
+  job.oFirst = firstName(f[R.occName]) || (job.occ === 'Tenant' ? 'there' : 'there');
+  job.needsOcc = isPI(job) && (job.occ === 'Vendor' || job.occ === 'Tenant');
+  if (isPI(job) && !job.st.listingAddr && f[R.listing] && f[R.listing][0]) { try { job.st.listingAddr = (await getRecord(T.listings, f[R.listing][0])).fields[LST.addr] || ''; } catch (e) { } }
+  job.addr = job.st.listingAddr || f[R.address] || 'the property';
   return job;
 }
 function setStatus(job, s) { job.status = s; job.upd[R.status] = s; if (['Done', 'Cancelled', 'Needs agent'].includes(s)) job.upd[R.closedAt] = new Date().toISOString(); }
@@ -194,6 +204,7 @@ function requester(job) { return job.by && isTextableMobile(job.by.fields[TM.mob
 
 // ---------------------------------------------------------------- wording
 function whereText(job, forContact) {
+  if (isPI(job)) return `at ${job.addr}`;
   const w = sel(job.f[R.where]);
   const addr = job.f[R.address] || job.st.listingAddr || '';
   if (w === 'Phone call') return forContact ? `${job.aFirst} will give you a call` : 'phone call';
@@ -203,6 +214,7 @@ function whereText(job, forContact) {
   return `at our office, ${OFFICE}`;
 }
 function purposeText(job) {
+  if (isPI(job)) return 'for a private inspection';
   const p = sel(job.f[R.purpose]);
   return ({
     'AML / ID check': 'to go through the AML / ID check', 'Sign Section 32 / contract': 'to go through and sign the Section 32 / contract',
@@ -236,7 +248,8 @@ async function draftOpening(job) {
 }
 async function fallbackOpening(job) {
   const hi = `Hi ${job.cFirst}, it's Alex from Stone Ballarat - I help ${job.aFirst} with bookings.`;
-  if (job.type === 'Meet the agent') {
+  if (isPI(job)) return `${hi} ${job.aFirst} would be happy to take you through ${job.addr} privately. What days and times suit you over the next week or so?`;
+  if (isMeet(job)) {
     const w = sel(job.f[R.where]);
     const how = w === 'Phone call' ? 'a quick call' : w === 'Video call' ? 'a quick video call' : `a time to meet ${whereText(job, true)}`;
     return `${hi} ${job.aFirst} would like to find ${how} ${purposeText(job)}. What days and times suit you over the next week or so?`;
@@ -247,10 +260,15 @@ async function fallbackOpening(job) {
 async function requestFacts(job) {
   const L = [`Type: ${job.type}`, `Agent: ${job.agent ? job.agent.fields[TM.name] : ''} (first name ${job.aFirst})`, `Contact: ${job.cName}`];
   if (job.f[R.briefText]) L.push(`What the team member wants (their words): ${job.f[R.briefText]}`);
-  if (job.type === 'Meet the agent') {
+  if (isMeet(job)) {
     L.push(`Purpose: ${sel(job.f[R.purpose]) || 'meeting'}`, `Where: ${whereText(job, true)}`, `Length: ${job.f[R.minutes] || 30} minutes`, `Book within: ${job.f[R.within] || 7} days`);
     if (job.f[R.prefer]) L.push(`Preferred times (agent): ${job.f[R.prefer]}`);
     if (job.f[R.bring]) L.push(`Ask them to bring: ${job.f[R.bring]}`);
+  }
+  if (isPI(job)) {
+    L.push(`Private inspection of ${job.addr} (listing) with ${job.aFirst}`, `Length: ${job.f[R.minutes] || 20} minutes`, `Book within: ${job.f[R.within] || 7} days`);
+    L.push(job.needsOcc ? `The ${job.occ.toLowerCase()} (${job.f[R.occName] || ''}) must OK the time${job.f[R.notice] ? ' and needs at least ' + job.f[R.notice] + ' hours notice' : ''} - Alex checks with them before confirming.` : 'The property is vacant.');
+    if (job.f[R.prefer]) L.push(`Preferred times (agent): ${job.f[R.prefer]}`);
   }
   if (job.type === 'Chase a document') L.push(`Document needed: ${docText(job)}`, `How to send it: ${await sendToText(job)}`);
   if (job.type === 'Ask a question') L.push(`Question to ask: ${job.f[R.question] || ''}`);
@@ -295,7 +313,7 @@ async function addToCalendar(job, iso) {
   try {
     const mins = job.f[R.minutes] || 30;
     await graph('POST', `/users/${encodeURIComponent(email)}/events`, {
-      subject: `${sel(job.f[R.purpose]) || 'Meeting'} – ${job.cName}`,
+      subject: `${isPI(job) ? 'Private inspection' : sel(job.f[R.purpose]) || 'Meeting'} – ${job.cName}`,
       start: { dateTime: utc(iso), timeZone: 'UTC' }, end: { dateTime: utc(new Date(iso).getTime() + mins * 60000), timeZone: 'UTC' },
       location: { displayName: whereText(job, false).replace(/^at /, '') },
       body: { contentType: 'text', content: [`${job.cName} · ${job.mobile || ''}`, job.f[R.briefText] || '', job.f[R.bring] ? 'Bringing: ' + job.f[R.bring] : '', `Booked by Alex (${job.code}).`].filter(Boolean).join('\n') }
@@ -313,7 +331,8 @@ async function cleanOptions(job, locals) {
   const out = [], seen = new Set();
   for (const loc of locals || []) {
     const iso = melbToISO(loc);
-    if (!iso || seen.has(iso) || Date.parse(iso) < Date.now() + 2 * 3600000) continue;
+    const lead = Math.max(2, isPI(job) ? (job.f[R.notice] || 0) + 1 : 0);
+    if (!iso || seen.has(iso) || Date.parse(iso) < Date.now() + lead * 3600000) continue;
     const day = loc.slice(0, 10), hhmm = loc.slice(11);
     if (day > lastDay || new Date(day + 'T00:00:00Z').getUTCDay() === 0 || hhmm < '08:00' || hhmm > '18:00') continue;
     if (job.agent && away.awayOnRecord(await teamById(job.agent.id), day)) continue; // agent on leave that day
@@ -332,6 +351,8 @@ async function start(job) {
   if (job.contact.fields[C.dnc]) { await handBack(job, `${job.cName} is marked Do Not Contact`, null); return; }
   if (!isTextableMobile(job.mobile)) { await handBack(job, `${job.cName} has no mobile Alex can text`, null); return; }
   if (job.type === 'Ask a question' && !String(job.f[R.question] || '').trim()) { await handBack(job, 'the question was left blank', null); return; }
+  if (isPI(job) && !(job.f[R.listing] || []).length) { await handBack(job, 'no listing picked for the inspection', null); return; }
+  if (job.needsOcc && !isTextableMobile(job.occMobile)) { await handBack(job, `no mobile for the ${job.occ.toLowerCase()} to check the time with`, null); return; }
   if (job.f[R.listing] && job.f[R.listing][0]) { try { job.st.listingAddr = (await getRecord(T.listings, job.f[R.listing][0])).fields[LST.addr] || ''; } catch (e) { } }
   const text = await draftOpening(job);
   job.st.opening = text; job.upd[R.draft] = text;
@@ -395,31 +416,106 @@ async function confirmMeeting(job, iso) {
   const bring = String(job.f[R.bring] || '').trim();
   const rescheduled = !!job.f[R.confirmed];
   await textContact(job, `All set ${job.cFirst} - ${sel(job.f[R.where]) === 'Phone call' ? `${job.aFirst} will give you a call ${melbWhen(iso)}` : `${job.aFirst} will see you ${melbWhen(iso)} ${whereText(job, true)}`}${sel(job.f[R.where]) === 'Our office' || !sel(job.f[R.where]) ? ',' : ''} ${purposeText(job)}.${bring ? ' Please bring ' + bring.replace(/\.$/, '') + '.' : ''} If anything changes, just reply here.`, 'confirm');
+  if (job.needsOcc) await textOcc(job, `Confirmed - ${job.aFirst} will bring a buyer through ${job.addr} on ${melbWhen(iso)} (about ${job.f[R.minutes] || 20} minutes).${job.occ === 'Tenant' ? ' Please treat this text as notice of the inspection.' : ''} Thanks for having it ready. If anything changes, just reply here.`);
+  job.st.stage = 'booked';
   job.upd[R.confirmed] = iso; job.f[R.confirmed] = iso;
   delete job.st.options; delete job.st.proposed; job.st.reminded = false; job.st.confirmedAt = new Date().toISOString();
   setStatus(job, 'Confirmed');
   const cal = await addToCalendar(job, iso);
-  await makeTask(job, `${sel(job.f[R.purpose]) || 'Meeting'} with ${job.cName} – ${melbWhen(iso)}`, melbClock(Date.parse(iso)).date,
+  await makeTask(job, `${isPI(job) ? 'Private inspection' : sel(job.f[R.purpose]) || 'Meeting'} with ${job.cName} – ${melbWhen(iso)}`, melbClock(Date.parse(iso)).date,
     [`Booked by Alex (${job.code})${rescheduled ? ' – rescheduled' : ''}: ${melbWhen(iso)}, ${whereText(job, false)}.`, job.f[R.briefText] || '', bring ? 'Bringing: ' + bring : '', `Contact: ${job.cName} · ${job.mobile}`].filter(Boolean).join('\n'), 'Medium');
   await textTeam(job, job.agent, `${job.code} confirmed with ${job.cName}: ${melbWhen(iso)}, ${whereText(job, false)}.${cal} It's in your My Tasks.`);
   if (job.by && job.agent && job.by.id !== job.agent.id) await textTeam(job, job.by, `${job.code} - ${job.cName} is booked with ${job.aFirst} ${melbWhen(iso)}.`);
   job.upd[R.outcome] = ((job.f[R.outcome] ? job.f[R.outcome] + '\n' : '') + `Confirmed ${melbWhen(iso)}`).trim();
 }
+// ---------------------------------------------------------------- private inspections: the vendor / tenant side
+async function textOcc(job, text) {
+  text = plainSMS(text);
+  if (!isTextableMobile(job.occMobile)) return;
+  if (contactHours()) { await sendSMS(job.occMobile, text); job.st.occOutAt = new Date().toISOString(); note(job, 'Alex → ' + (job.f[R.occName] || job.occ), text); }
+  else { (job.st.occOutbox = job.st.occOutbox || []).push(text); note(job, 'Alex → ' + (job.f[R.occName] || job.occ) + ' (queued for the morning)', text); }
+}
+async function askOccupant(job, isos) {
+  job.st.stage = 'occupant'; job.st.occOptions = isos; job.st.occAskedAt = new Date().toISOString(); job.st.occNudged = false;
+  setStatus(job, 'Contacting');
+  const who = job.occ === 'Tenant' ? 'tenant' : 'owner';
+  await textOcc(job, `Hi ${job.oFirst}, it's Alex from Stone Ballarat for ${job.aFirst}. A buyer would like a private inspection of ${job.addr}. Would any of these suit? ${optionsText(isos)}. Reply with the number(s) that work, or let me know if none do.`);
+  job.upd[R.proposed] = `Asked the ${who}: ` + isos.map((iso, i) => `${i + 1}. ${melbWhen(iso)}`).join(' / ');
+}
+async function onOccupantReply(job, text) {
+  note(job, (job.f[R.occName] || job.occ) + ' → Alex', text);
+  job.st.occInAt = new Date().toISOString();
+  if (job.st.stage !== 'occupant') {
+    // after it's booked (or before we've asked): anything from them goes to the agent; a change of plans hands it back
+    if (/cancel|can'?t|cannot|change|move|reschedul|not (be )?(home|available)|sick|no longer/i.test(text) && job.status === 'Confirmed') {
+      await handBack(job, `the ${job.occ.toLowerCase()} needs to change the inspection (${melbWhen(job.f[R.confirmed])})`, null, `They said: "${text.slice(0, 200)}"`);
+      await textOcc(job, `Thanks ${job.oFirst}, I'll let ${job.aFirst} know and they'll be in touch.`);
+    } else if (!/^(thanks|thank you|ta|cheers|ok|okay|great|perfect|no worries|all good|will do|👍)[.! ]*$/i.test(text)) await textTeam(job, job.agent, `${job.code} - the ${job.occ.toLowerCase()} at ${job.addr} replied: "${text.slice(0, 200)}"`);
+    return;
+  }
+  const opts = job.st.occOptions || [];
+  let r;
+  try {
+    r = await claudeJSON(SYSTEM + ' You read a vendor or tenant\'s reply about a proposed private inspection time. Reply with JSON only.',
+      `Alex offered these times for a private inspection of ${job.addr}:\n${opts.map((iso, i) => `${i + 1} - ${melbWhen(iso)}`).join('\n')}\nTheir reply: "${text}"\n` +
+      `Return {"intent": "ok" (one or more of the times suit) | "none" (none suit) | "question" (they asked something, or want ${job.aFirst} to call) | "stop" (they don't want inspections / want to be left alone) | "unhappy", "ok_numbers": [numbers that suit], "other_times": "any other times they suggested, in their words, else empty"}`, 300);
+  } catch (e) { await textTeam(job, job.agent, `${job.code} - the ${job.occ.toLowerCase()} replied "${text.slice(0, 160)}" and I couldn't read it. Reply ${job.code} CALL to take over.`); return; }
+  const intent = String(r.intent || '').toLowerCase();
+  if (intent === 'ok') {
+    const ok = (Array.isArray(r.ok_numbers) ? r.ok_numbers : []).map(Number).filter(x => opts[x - 1]).map(x => opts[x - 1]);
+    if (ok.length === 1 && ok[0] === job.st.agentPicked) { await textOcc(job, `Thanks ${job.oFirst}.`); await confirmMeeting(job, ok[0]); return; } // agent already chose it
+    if (ok.length) {
+      await textOcc(job, `Thanks ${job.oFirst}, I'll confirm the time with you once ${job.aFirst} has locked it in.`);
+      job.st.stage = 'agent';
+      await offerToAgent(job, ok, null);
+      return;
+    }
+  }
+  if (intent === 'none' || intent === 'ok') {
+    job.st.stage = 'buyer'; job.st.occRounds = (job.st.occRounds || 0) + 1;
+    if (job.st.occRounds > 2) { await handBack(job, `couldn't find a time that suits both the buyer and the ${job.occ.toLowerCase()}`, null, r.other_times ? `The ${job.occ.toLowerCase()} suggested: ${r.other_times}` : ''); return; }
+    await textOcc(job, `Thanks ${job.oFirst}, I'll see what else suits the buyer.`);
+    setStatus(job, 'Contacting');
+    await textContact(job, `Hi ${job.cFirst}, unfortunately those times don't work at ${job.addr}${r.other_times ? ' - ' + String(r.other_times).slice(0, 120) + ' could work though' : ''}. What other days and times suit you?`);
+    return;
+  }
+  await handBack(job, intent === 'stop' ? `the ${job.occ.toLowerCase()} doesn't want the inspection` : `the ${job.occ.toLowerCase()} has a question / wants a call`, null, `They said: "${text.slice(0, 200)}"`);
+  await textOcc(job, `Thanks ${job.oFirst}, I'll get ${job.aFirst} to give you a call.`);
+}
+// after the inspection: the buyer's feedback goes to the agent and their notes
+async function feedbackReply(job, text) {
+  let r = { intent: 'feedback', summary: text };
+  try {
+    r = await claudeJSON(SYSTEM + ' You read a buyer\'s feedback after a private inspection. Reply with JSON only.',
+      `Property: ${job.addr}. Buyer's reply: "${text}"\nReturn {"intent": "feedback" | "wants_offer" (wants to make an offer / talk price) | "second_look" | "question" (asks something only the agent can answer), "summary": "their feedback in a few words", "interest": "high" | "medium" | "low" | "unknown", "reply": "short thanks back to them (empty for wants_offer / second_look / question)"}`, 300);
+  } catch (e) { }
+  const intent = String(r.intent || 'feedback').toLowerCase();
+  try { await updateRecord(T.contacts, job.contact.id, { [C.know]: ((job.contact.fields[C.know] || '') + `\n${melbClock().date} private inspection ${job.addr}: ${String(r.summary || text).slice(0, 200)}`).trim() }); } catch (e) { }
+  if (['wants_offer', 'second_look', 'question'].includes(intent)) {
+    await handBack(job, intent === 'wants_offer' ? `${job.cFirst} wants to make an offer on ${job.addr}` : intent === 'second_look' ? `${job.cFirst} wants a second look at ${job.addr}` : `${job.cFirst} has a question after the inspection`, `Thanks ${job.cFirst}, I'll get ${job.aFirst} to give you a call.`, `They said: "${text.slice(0, 200)}"`);
+    return;
+  }
+  if (r.reply) await textContact(job, r.reply); else await textContact(job, `Thanks ${job.cFirst}, I'll pass that on to ${job.aFirst}.`);
+  await textTeam(job, job.agent, `${job.code} - ${job.cName}'s feedback on ${job.addr}${r.interest && r.interest !== 'unknown' ? ' (interest: ' + r.interest + ')' : ''}: "${text.slice(0, 250)}"`);
+  await finish(job, `Feedback: ${text.slice(0, 300)}`, `Alex request ${job.code} – private inspection ${job.addr} with ${job.cName}; feedback: ${String(r.summary || text).slice(0, 100)}`);
+}
+
 async function offerToAgent(job, isos, said) {
   job.st.options = isos; job.st.offeredAt = new Date().toISOString(); job.st.agentReminded = false;
   job.upd[R.proposed] = isos.map((iso, i) => `${i + 1}. ${melbWhen(iso)}`).join('\n');
   setStatus(job, 'Waiting on agent');
-  await textTeam(job, job.agent, `${job.code} - ${job.cName} can do: ${optionsText(isos)} (${sel(job.f[R.purpose]) || 'meeting'}, ${whereText(job, false)}).${said ? ' They said: "' + said.slice(0, 120) + '".' : ''}\nReply ${job.code} 1, 2 or 3, ${job.code} followed by another time, or ${job.code} CALL to take it over.`);
+  await textTeam(job, job.agent, `${job.code} - ${isPI(job) ? `private inspection of ${job.addr}: ${job.cName}${job.needsOcc ? ' and the ' + job.occ.toLowerCase() : ''} can do` : job.cName + ' can do'}: ${optionsText(isos)}${isPI(job) ? '' : ` (${sel(job.f[R.purpose]) || 'meeting'}, ${whereText(job, false)})`}.${said ? ' They said: "' + said.slice(0, 120) + '".' : ''}\nReply ${job.code} 1, 2 or 3, ${job.code} followed by another time, or ${job.code} CALL to take it over.`);
 }
 
 // ---------------------------------------------------------------- reading the contact's reply
 async function readReply(job, text) {
   const c = melbClock();
-  const busy = job.type === 'Meet the agent' ? await busyFor(job.agent, (job.f[R.within] || 7) + 7) : [];
+  const busy = isMeet(job) ? await busyFor(job.agent, (job.f[R.within] || 7) + 7) : [];
   const facts = await requestFacts(job);
   const convo = String(job.f[R.convo] || '').split('\n').slice(-14).join('\n');
   const intents = {
     'Meet the agent': 'availability (they gave days/times that suit) | accept (they agree to the time Alex proposed) | reject_time (the proposed time does not suit) | vague (they want to meet but no usable times yet) | reschedule (a confirmed time needs to change) | cancel_meeting (they cancel / no longer need it)',
+    'Private inspection': 'availability (they gave days/times that suit) | accept (they agree to the time Alex proposed) | reject_time (the proposed time does not suit) | vague (they want to inspect but no usable times yet) | reschedule (a confirmed time needs to change) | cancel_meeting (they no longer want to inspect)',
     'Chase a document': 'sent (they say they have sent / dropped it off) | will_send (they will send it, maybe by a date) | cant_provide (they cannot or will not provide it, or need help getting it)',
     'Ask a question': 'answered (they answered the question, fully or mostly) | partial (they answered part and need follow-up from the agent)'
   }[job.type];
@@ -442,6 +538,7 @@ async function onContactReply(job, text) {
   note(job, job.cFirst + ' → Alex', text);
   job.st.lastInAt = new Date().toISOString();
   job.st.nudges = 0;
+  if (isPI(job) && job.st.stage === 'feedback') return feedbackReply(job, text);
   let r;
   try { r = await readReply(job, text); } catch (e) {
     console.error('Alex requests: read failed', e.message);
@@ -463,7 +560,7 @@ async function onContactReply(job, text) {
     await handBack(job, why, r.reply || `Thanks ${job.cFirst}, I'll get ${job.aFirst} to give you a call.`, `They said: "${text.slice(0, 200)}"`);
     return;
   }
-  if (job.type === 'Meet the agent') return meetingReply(job, text, r, say);
+  if (isMeet(job)) return meetingReply(job, text, r, say);
   if (job.type === 'Chase a document') return chaseReply(job, text, r, say);
   return questionReply(job, text, r, say);
 }
@@ -475,9 +572,11 @@ async function meetingReply(job, text, r, say) {
     await textTeam(job, job.agent, `${job.code} - heads up, ${job.cName} needs to move ${melbWhen(job.f[R.confirmed])}. I'm finding a new time.`);
   }
   if (r.intent === 'cancel_meeting') { await handBack(job, `${job.cFirst} cancelled / doesn't need the meeting`, r.reply || `No worries ${job.cFirst}, I'll let ${job.aFirst} know.`, `They said: "${text.slice(0, 160)}"`); return; }
+  if (r.intent === 'accept' && job.st.proposed && job.needsOcc) { job.st.agentPicked = job.st.proposed.iso; await say(`Thanks ${job.cFirst}, I'll just check that with the ${job.occ === 'Tenant' ? 'tenants' : 'owners'} and confirm.`); await askOccupant(job, [job.st.proposed.iso]); return; }
   if (r.intent === 'accept' && job.st.proposed) { await confirmMeeting(job, job.st.proposed.iso); return; }
   if (['availability', 'reschedule', 'reject_time', 'vague'].includes(r.intent)) {
     const isos = await cleanOptions(job, r.options);
+    if (isos.length && job.needsOcc) { await say(`Thanks ${job.cFirst}, I'll check those with the ${job.occ === 'Tenant' ? 'tenants' : 'owners'} and ${job.aFirst} and confirm shortly.`); await askOccupant(job, isos); return; }
     if (isos.length) { await say(r.reply || `Thanks ${job.cFirst}, I'll check with ${job.aFirst} and confirm a time shortly.`); await offerToAgent(job, isos, text); return; }
     job.st.rounds = (job.st.rounds || 0) + 1;
     if (job.st.rounds > 3) { await handBack(job, `couldn't land on a time after a few goes`, `Thanks ${job.cFirst}, I'll get ${job.aFirst} to call you to find a time.`, `Last reply: "${text.slice(0, 160)}"`); return; }
@@ -562,7 +661,7 @@ async function onTeamCommand(job, member, rest, fromPage) {
     const m = t.match(/^ask\s+([\s\S]+)/i);
     if (m) { job.upd[R.question] = ((job.f[R.question] || '') + '\nFollow-up: ' + m[1]).trim(); setStatus(job, 'Contacting'); await textContact(job, `Thanks ${job.cFirst} - ${job.aFirst} also asked: ${m[1]}`); await reply(`Asked ${job.cFirst}.`); return; }
   }
-  if (job.type === 'Meet the agent') {
+  if (isMeet(job)) {
     const n = t.match(/^([123])\b/);
     if (n && job.st.options && job.st.options[+n[1] - 1]) {
       const iso = job.st.options[+n[1] - 1];
@@ -589,7 +688,7 @@ async function onTeamCommand(job, member, rest, fromPage) {
       await reply(`OK, I've asked ${job.cFirst} if ${melbWhen(iso)} works.`); return;
     }
   }
-  await reply(`Sorry, I didn't follow. For ${job.code}: ${job.type === 'Meet the agent' ? `${job.code} 1/2/3, ${job.code} <another time>, ${job.code} NONE, ` : job.type === 'Chase a document' ? `${job.code} GOT IT, ${job.code} NOT YET, ` : `${job.code} ASK <follow-up question>, `}${job.code} CALL or ${job.code} CANCEL.`);
+  await reply(`Sorry, I didn't follow. For ${job.code}: ${isMeet(job) ? `${job.code} 1/2/3, ${job.code} <another time>, ${job.code} NONE, ` : job.type === 'Chase a document' ? `${job.code} GOT IT, ${job.code} NOT YET, ` : `${job.code} ASK <follow-up question>, `}${job.code} CALL or ${job.code} CANCEL.`);
 }
 
 // ---------------------------------------------------------------- inbound routing (called from alex.js)
@@ -613,7 +712,7 @@ async function handleTeamSMS(from, body) {
 // Replies from a contact with a live request (or one closed in the last 2 days) belong here
 async function findForContact(from) {
   const recs = await listAll(T.req, { filterByFormula: `OR(${OPEN.map(s => `{${R.status}}='${s}'`).join(',')},AND(OR({${R.status}}='Done',{${R.status}}='Needs agent'),IS_AFTER({${R.closedAt}},'${new Date(Date.now() - 2 * 864e5).toISOString()}')))` });
-  const mine = recs.filter(r => (Array.isArray(r.fields[R.mobile]) ? r.fields[R.mobile] : [r.fields[R.mobile]]).some(m => samePhone(m, from)))
+  const mine = recs.filter(r => (Array.isArray(r.fields[R.mobile]) ? r.fields[R.mobile] : [r.fields[R.mobile]]).some(m => samePhone(m, from)) || samePhone(r.fields[R.occMobile], from))
     .filter(r => sel(r.fields[R.status]) !== 'Awaiting approval' && sel(r.fields[R.status]) !== 'New');
   const live = r => OPEN.includes(sel(r.fields[R.status])) ? 1 : 0; // a live request beats one that has just closed
   mine.sort((a, b) => (live(b) - live(a)) || String(b.fields[R.lastContact] || '').localeCompare(String(a.fields[R.lastContact] || '')) || ((b.fields[R.no] || 0) - (a.fields[R.no] || 0)));
@@ -628,7 +727,8 @@ async function handleContactSMS(from, body) {
   if (await teamByPhone(from) && minutesSince(rec.fields[R.lastContact]) > 24 * 60) return false;
   const job = await load(rec);
   try {
-    if (['Done', 'Needs agent'].includes(job.status)) {
+    if (isPI(job) && samePhone(job.occMobile, from) && !samePhone(job.mobile, from)) { if (!['Done', 'Needs agent', 'Cancelled'].includes(job.status)) await onOccupantReply(job, text); else { note(job, (job.f[R.occName] || job.occ) + ' → Alex', text); await textTeam(job, job.agent, `${job.code} - the ${job.occ.toLowerCase()} at ${job.addr} replied: "${text.slice(0, 250)}"`); } }
+    else if (['Done', 'Needs agent'].includes(job.status)) {
       note(job, job.cFirst + ' → Alex', text);
       if (!/^(thanks|thank you|ta|cheers|ok|okay|great|perfect|will do|👍)[.! ]*$/i.test(text)) await textTeam(job, job.agent, `${job.code} - ${job.cName} replied: "${text.slice(0, 250)}"`);
     } else await onContactReply(job, text);
@@ -657,6 +757,10 @@ async function step(job) {
     for (const m of job.st.outbox) { await sendSMS(job.mobile, m.text); job.st.lastOutAt = new Date().toISOString(); job.upd[R.lastContact] = job.st.lastOutAt; }
     job.st.outbox = []; job.dirty = true;
   }
+  if (job.st.occOutbox && job.st.occOutbox.length && contactHours(c) && isTextableMobile(job.occMobile)) {
+    for (const t of job.st.occOutbox) await sendSMS(job.occMobile, t);
+    job.st.occOutAt = new Date().toISOString(); job.st.occOutbox = []; job.dirty = true;
+  }
   if (job.st.teamOutbox && job.st.teamOutbox.length && teamHours(c)) {
     for (const m of job.st.teamOutbox) { try { await sendSMS(m.to, m.text); } catch (e) { } }
     job.st.teamOutbox = []; job.dirty = true;
@@ -677,6 +781,17 @@ async function step(job) {
   }
   // reply-by date passed
   if (job.f[R.replyBy] && job.f[R.replyBy] < c.date && ['Contacting', 'Waiting on agent'].includes(job.status)) { await handBack(job, `it's past the reply-by date (${job.f[R.replyBy]})`, null); return; }
+  if (isPI(job) && job.status === 'Contacting' && job.st.stage === 'occupant') {
+    const since = minutesSince(job.st.occAskedAt);
+    if ((job.st.occOptions || []).every(i => Date.parse(i) < Date.now() + 3600000)) { job.st.stage = 'buyer'; await textContact(job, `Hi ${job.cFirst}, sorry - I couldn't confirm those times in time. What other days and times suit you for ${job.addr}?`); return; }
+    if (!job.st.occNudged && since >= 4 * 60 && contactHours(c)) { job.st.occNudged = true; job.dirty = true; await textOcc(job, `Hi ${job.oFirst}, just following up for ${job.aFirst} - would any of these suit for a private inspection of ${job.addr}? ${optionsText(job.st.occOptions || [])}`); return; }
+    if (job.st.occNudged && since >= 24 * 60 && teamHours(c)) { await handBack(job, `the ${job.occ.toLowerCase()} hasn't replied about the inspection times`, null); return; }
+    return;
+  }
+  if (isPI(job) && job.status === 'Contacting' && job.st.stage === 'feedback') {
+    if (minutesSince(job.st.fbAskedAt) >= 24 * 60) await finish(job, 'No feedback from the buyer', `Alex request ${job.code} – private inspection ${job.addr} with ${job.cName} (no feedback)`);
+    return;
+  }
   if (job.status === 'Contacting') {
     const since = minutesSince(job.st.lastOutAt || job.f[R.lastContact]);
     const quietSinceReply = !job.st.lastInAt || (job.st.lastOutAt && job.st.lastInAt < job.st.lastOutAt);
@@ -698,7 +813,7 @@ async function step(job) {
     // meetings and questions: one nudge after a day, back to the agent after another day
     if ((job.st.nudges || 0) === 0 && since >= 24 * 60 && contactHours(c)) {
       job.st.nudges = 1;
-      await textContact(job, job.type === 'Meet the agent'
+      await textContact(job, isMeet(job)
         ? `Hi ${job.cFirst}, just following up for ${job.aFirst} - is there a day and time over the next week that suits ${purposeText(job)}?`
         : `Hi ${job.cFirst}, just following up for ${job.aFirst} on my earlier question when you have a moment: ${String(job.f[R.question] || '').trim().slice(0, 200)}`);
       return;
@@ -707,20 +822,20 @@ async function step(job) {
     return;
   }
   if (job.status === 'Waiting on agent') {
-    const ref = job.type === 'Meet the agent' ? job.st.offeredAt : job.st.claimedAt;
+    const ref = isMeet(job) ? job.st.offeredAt : job.st.claimedAt;
     if (!ref) return;
-    const who = job.type === 'Meet the agent' ? job.agent : (await teamById(job.st.receiverId)) || job.agent;
+    const who = isMeet(job) ? job.agent : (await teamById(job.st.receiverId)) || job.agent;
     if (!job.st.agentReminded && minutesSince(ref) >= 120 && teamHours(c)) {
       job.st.agentReminded = true; job.dirty = true;
-      await textTeam(job, who, job.type === 'Meet the agent'
+      await textTeam(job, who, isMeet(job)
         ? `Reminder - ${job.cName} is waiting on a time for ${job.code}: ${optionsText((job.st.options || []).filter(i => Date.parse(i) > Date.now()))}. Reply ${job.code} 1/2/3, another time, or ${job.code} CALL.`
         : `Reminder - did the ${docText(job)} from ${job.cName} arrive? Reply ${job.code} GOT IT or ${job.code} NOT YET.`);
       return;
     }
-    if (job.type === 'Meet the agent' && job.st.agentReminded && minutesSince(ref) >= 6 * 60 && teamHours(c)) {
+    if (isMeet(job) && job.st.agentReminded && minutesSince(ref) >= 6 * 60 && teamHours(c)) {
       await handBack(job, `${job.cName} has been waiting 6 hours for you to pick a time (${optionsText(job.st.options || [])})`, null); return;
     }
-    if (job.type === 'Meet the agent' && (job.st.options || []).length && job.st.options.every(i => Date.parse(i) < Date.now() + 60 * 60000)) {
+    if (isMeet(job) && (job.st.options || []).length && job.st.options.every(i => Date.parse(i) < Date.now() + 60 * 60000)) {
       setStatus(job, 'Contacting'); delete job.st.options;
       await textContact(job, `Hi ${job.cFirst}, sorry for the wait - those times have slipped by. What other days and times suit you to meet ${job.aFirst}?`);
     }
@@ -734,7 +849,19 @@ async function step(job) {
     if (!job.st.reminded && mDay === addDays(c.date, 1) && c.hour >= 10 && contactHours(c) && melbClock(Date.parse(job.st.confirmedAt || job.f[R.created] || Date.now())).date < c.date) {
       job.st.reminded = true;
       const bring = String(job.f[R.bring] || '').trim();
+      if (isPI(job)) {
+        await textContact(job, `Hi ${job.cFirst}, a reminder you're seeing ${job.addr} with ${job.aFirst} tomorrow, ${melbWhen(iso)}. If anything has changed, just reply here.`);
+        if (job.needsOcc) await textOcc(job, `Hi ${job.oFirst}, a reminder ${job.aFirst} is bringing a buyer through ${job.addr} tomorrow, ${melbWhen(iso)}. If anything has changed, just reply here.`);
+        return;
+      }
       await textContact(job, `Hi ${job.cFirst}, a reminder you're ${sel(job.f[R.where]) === 'Phone call' ? `chatting with ${job.aFirst} by phone` : `meeting ${job.aFirst} ${whereText(job, true)}`} tomorrow, ${melbWhen(iso)}.${bring ? ' Please bring ' + bring.replace(/\.$/, '') + '.' : ''} If anything has changed, just reply here.`);
+      return;
+    }
+    if (isPI(job) && Date.parse(iso) + 60 * 60000 < Date.now()) {
+      if (job.f[R.askFeedback] && contactHours(c)) {
+        job.st.stage = 'feedback'; job.st.fbAskedAt = new Date().toISOString(); setStatus(job, 'Contacting');
+        await textContact(job, `Hi ${job.cFirst}, thanks for coming through ${job.addr} with ${job.aFirst}. What did you think of it?`);
+      } else if (!job.f[R.askFeedback]) await finish(job, `Inspection held ${melbWhen(iso)}`, `Alex request ${job.code} – private inspection ${job.addr} with ${job.cName} (${melbWhen(iso)})`);
       return;
     }
     if (Date.parse(iso) + 2 * 3600000 < Date.now()) await finish(job, `Meeting held ${melbWhen(iso)}`, `Alex request ${job.code} – arranged ${sel(job.f[R.purpose]) || 'meeting'} with ${job.cName} for ${job.aFirst} (${melbWhen(iso)})`);

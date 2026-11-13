@@ -48,7 +48,13 @@ const REVIEW_PAGE = 'pagLJaDLEUpqackix';  // Alex Messaging → Buyer Text Messa
 const T = {
   briefs: 'tbl43WTbzYyauRMhd', contacts: 'tblWRqWCqXWP708dY', team: 'tbl1aNcrdwmamMyEF', messages: 'tbl78WnIpym0PEutf',
   matches: 'tblQ9Z4lvKpxjWkJL', listings: 'tblvJCPHTQBgdYGZu', checkins: 'tblANNW7LRvFFgMcD', inspections: 'tblTVym6dw3M8rt0Z',
-  tasks: 'tblly5yaH9pTZrUXC', opps: 'tblrFYa8aQsLJkW13'
+  tasks: 'tblly5yaH9pTZrUXC', opps: 'tblrFYa8aQsLJkW13', campaigns: 'tbl17x0s7HkrX1oZ0'
+};
+// Pre-market campaigns (Stu, 10 Nov): coming soon / off market pushed to every buyer whose brief matches, all tiers
+const CP = {
+  title: 'fldqMQIZ5vTEwf0mJ', code: 'fld49XPROvzq2xx3n', status: 'flde07SRX4wndlPA8', kind: 'fldr01AGNxotUQEgV', ml: 'fldKWtHZl36IE3SsP',
+  agent: 'fld5tevDvg4CjC6WR', by: 'fldcUJbphGRGJgR2u', priceWording: 'fld08amLhnJysm5cp', msg: 'fldW0WwMz53tTg0Gz', approvedAt: 'fldAIlFnsROLtooVx',
+  sent: 'fldbNUB7GqRRsMdMH', skipped: 'fldBB7bS6zy3JRXPa', notes: 'fldbjPNGXrQe4HzSq'
 };
 const B = {
   name: 'fldEmtwK9XFwcQ9M1', buyers: 'fldKRyZ83PSx8LJNq', agent: 'fldUGX7gB3zJJIJcF', status: 'fldXrAXCEFqm98MLV',
@@ -82,13 +88,14 @@ const M = {
 const MT = {
   name: 'fldcUWY60iBkz7oym', brief: 'fld8hEKHNklMaEnOB', listing: 'fldSdPAw8fz58y2cq', score: 'fldUhe1yZVGfjUtme',
   why: 'fldQKMQt9PZH0i2CD', status: 'fldOEWUQ7krAMoyK9', sentAt: 'fldZGwCTz9WLPWGKO', feedback: 'fldj3bqTTzMzqbkEj',
-  matchedAt: 'fldnREWWWDHeorGqU'
+  matchedAt: 'fldnREWWWDHeorGqU', campaign: 'fldNDjfKl49IZymTk'
 };
 const LS = {
   addr: 'fld4iTTnjDJagkY7f', suburb: 'fld46hCNJv589iV4P', type: 'fld7pSlzfCYyCv499', beds: 'fld76puAVSOxN51vb',
   baths: 'fldWcNQArMl4CQoGG', car: 'fldoPMmb2SQCFVzpy', land: 'fldjxl8HWgTx7GeWw', ptext: 'fldzmKv5AGOXxWnMt',
   plo: 'fldWTMq9fq8DW7K2G', phi: 'fldbhlybQ8LA2M6He', listDate: 'fldBgyKXtIzhIk4Vh', status: 'fldpZuWLstBgyZzSk',
-  stone: 'fld2JKZuS5KkqofaW', link: 'fldgOq5OW8mF5FNfA', feat: 'fldZtJVT3tGVUYyHr', property: 'fld0RT3rZaM6FRc8I'
+  stone: 'fld2JKZuS5KkqofaW', link: 'fldgOq5OW8mF5FNfA', feat: 'fldZtJVT3tGVUYyHr', property: 'fld0RT3rZaM6FRc8I',
+  campaigns: 'fldSiKRSajHdI6KWo', matches: 'fld6oELQ0t1zZd1TC', cstatus: 'fldhpPQWn4ecHiA6I'
 };
 const CI = {
   name: 'fldurgnMEIdSie5z3', mobile: 'fldTIal66LWdnINN3', suburb: 'fldToYwX9ednVlJah', email: 'fldSvv3KIWgDacByG',
@@ -312,7 +319,10 @@ function listingFacts(l) {
     id: l.id, address: f[LS.addr] || '', short: shortAddress(f[LS.addr]), suburb: f[LS.suburb] || '', type: sel(f[LS.type]),
     beds: f[LS.beds] ?? null, baths: f[LS.baths] ?? null, car: f[LS.car] ?? null, land: f[LS.land] ?? null,
     price: (f[LS.ptext] || '').trim(), lo: f[LS.plo] || null, hi: f[LS.phi] || null, status: sel(f[LS.status]),
-    stone: !!f[LS.stone], link: f[LS.link] || '', features: String(f[LS.feat] || '').slice(0, 400), property: linkId(f[LS.property])
+    stone: !!f[LS.stone], link: f[LS.link] || '', features: String(f[LS.feat] || '').slice(0, 400), property: linkId(f[LS.property]),
+    campaign: (f[LS.campaigns] || []).length > 0, // a pre-market campaign owns the sending while it's coming soon / off market
+    // ...and a new-listing campaign owns it while it's still Draft / Sending (Stu, 14 Nov)
+    campaignHold: (f[LS.campaigns] || []).length > 0 && (sel(f[LS.status]) !== 'For sale' || /Draft|Sending/.test(String(f[LS.cstatus] || '')))
   };
 }
 function bbc(x) { return [x.beds, x.baths, x.car].every(v => v === null || v === undefined) ? '' : `${x.beds ?? '-'}/${x.baths ?? '-'}/${x.car ?? '-'}`; }
@@ -419,16 +429,17 @@ async function sendToBuyer({ brief, contact, match, text, purpose, kind, allowed
     if (rules.notBefore !== undefined && hour < rules.notBefore) return fail('notes: not before ' + rules.notBefore + ':00');
     if (rules.notAfter !== undefined && hour >= rules.notAfter) return fail('notes: not after ' + rules.notAfter + ':00');
     const counts = await sentCounts(contact.id);
-    if (counts.totalToday >= DAILY_CAP) return fail('daily cap');
+    if (counts.totalToday >= DAILY_CAP && kind !== 'campaign') return fail('daily cap'); // an approved campaign is a deliberate send to its list (Stu, 14 Nov)
     if (counts.buyerToday >= 1) return fail('already texted today');
-    if (counts.buyerWeek >= 2) return fail('2 this week');
+    if (counts.buyerWeek >= 2 && kind !== 'campaign') return fail('2 this week');
   }
   if (!priceSafe(text, allowedPrices)) {
     await alertStu(`Alex (buyers): held a text to ${contact.fields[C.name]} – it had a price that didn't match the listing. Text: "${text}"`);
     return fail('price check');
   }
   if (!skipDuplicateCheck && kind !== 'reply' && await sameTextRecently(contact.id, text)) return fail('same text in last 30 days');
-  if (text.length > 480) text = text.slice(0, 477) + '...';
+  const maxLen = kind === 'campaign' ? 640 : 480; // campaign texts are approved word for word on the page
+  if (text.length > maxLen) text = text.slice(0, maxLen - 3) + '...';
   try {
     const sid = await rawSMS(number, text);
     await logMsg({ brief, contact, match, direction: 'To buyer', purpose, status: 'Sent', text, number, sid, reasoning });
@@ -1379,11 +1390,13 @@ async function handleBuyerSMS(from, body) {
     case 'wants_inspection':
       if (prop) await setMatch(prop.match, 'Inspecting', r.feedback || text);
       if (!['Hot', 'Warm'].includes(sel(brief.fields[B.tier]))) { upd[B.tier] = 'Warm'; }
+      const preMkt = !!(prop && prop.listing && ['Coming soon', 'Off market'].includes(prop.listing.status)); // pre-market campaign / alert: they haven't seen it yet
+      const newCamp = !!(prop && prop.listing && prop.listing.campaign && prop.listing.status === 'For sale'); // new listing campaign: private inspections
       await reply(intent === 'wants_inspection' || /look|see|inspect|view/i.test(text)
-        ? `Great to hear. I'll get ${agentName} to call you to set up another look. Any particular time that suits?`
+        ? (preMkt ? `Great, I'll get ${agentName} to call you to set up a private look before it's advertised. Any particular time that suits?` : newCamp ? `Great, I'll get ${agentName} to call you to book a private inspection. Any particular day or time that suits?` : `Great to hear. I'll get ${agentName} to call you to set up another look. Any particular time that suits?`)
         : (r.reply || `Good to hear you liked it. Would you like ${agentName} to line up another look?`));
       if (intent === 'wants_inspection' || /look|see|inspect|view/i.test(text)) {
-        await handoff({ brief, contact, agent, st, priority: 'high', task: `Book another look at ${propShort} for ${contact.fields[C.name]}`, alertText: `${contact.fields[C.name]} (${contact.fields[C.mobile]}) wants another look at ${propShort}.` });
+        await handoff({ brief, contact, agent, st, priority: 'high', label: preMkt ? 'PRE-MARKET INTEREST' : newCamp ? 'PRIVATE INSPECTION' : undefined, task: preMkt ? `Pre-market look at ${propShort} for ${contact.fields[C.name]} (${prop.listing.status.toLowerCase()})` : newCamp ? `Book a private inspection at ${propShort} for ${contact.fields[C.name]}` : `Book another look at ${propShort} for ${contact.fields[C.name]}`, alertText: preMkt ? `${contact.fields[C.name]} (${contact.fields[C.mobile]}) is keen on ${propShort} (${prop.listing.status.toLowerCase()}) and wants a look.` : newCamp ? `${contact.fields[C.name]} (${contact.fields[C.mobile]}) wants a private inspection at ${propShort}.` : `${contact.fields[C.name]} (${contact.fields[C.mobile]}) wants another look at ${propShort}.` });
       } else st.pending = 'second_look';
       return finish();
 
@@ -1701,6 +1714,7 @@ async function nurtureOne(brief, c) {
       const pairs = matches.map(m => ({ m, l: ls.find(x => x.id === linkId(m.fields[MT.listing])) })).filter(p => p.l)
         .map(p => ({ m: p.m, l: listingFacts(p.l) }))
         .filter(p => ['For sale', 'Coming soon', 'Off market'].includes(p.l.status))
+        .filter(p => !p.l.campaignHold)
         .sort((a, b) => (b.l.stone - a.l.stone) || ((b.m.fields[MT.score] || 0) - (a.m.fields[MT.score] || 0)))
         .slice(0, 3);
       if (pairs.length) {
@@ -1741,6 +1755,70 @@ function noteSellerEnquiry(label) { if (label) dayNotes.sellerEnq.push(String(la
 
 // ---------------------------------------------------------------- events (section 7)
 
+// ---------------------------------------------------------------- pre-market campaigns
+// Status Sending (approved on the page): text every New match on the campaign's market listing, Hot first, in batches.
+// Replies are handled like any other alert (Interested / Not for them / book a look). Done sending → Running + agent told.
+const CAMPAIGN_BATCH = 20;
+const TIER_ORDER = { Hot: 0, Warm: 1, Nurture: 2, 'Long-term': 3 };
+async function campaignTick() {
+  const c = clock();
+  if (!inScheduledWindow(c)) return;
+  const camps = await listAll(T.campaigns, { filterByFormula: `{${CP.status}}='Sending'` });
+  for (const cp of camps) {
+    try {
+      const mlRec = linkId(cp.fields[CP.ml]) ? await getRecord(T.listings, linkId(cp.fields[CP.ml])) : null;
+      if (!mlRec) continue;
+      const l = listingFacts(mlRec);
+      const newListing = sel(cp.fields[CP.kind]) === 'New listing'; // just listed: the campaign puts it on the market (For sale) as it starts sending
+      if (newListing && l.status !== 'For sale') { await updateRecord(T.listings, mlRec.id, { [LS.status]: 'For sale' }); l.status = 'For sale'; }
+      const agent = await teamById(linkId(cp.fields[CP.agent]));
+      const listAgent = agent ? agentFirst(agent) : 'our agent';
+      const tmpl = String(cp.fields[CP.msg] || '').trim();
+      if (!tmpl) continue;
+      const allowed = sel(cp.fields[CP.priceWording]) === 'Use the price guide' ? [l.price].filter(Boolean) : [];
+      const fresh = (await getMany(T.matches, ids(mlRec.fields[LS.matches]))).filter(m => sel(m.fields[MT.status]) === 'New');
+      const briefs = await getMany(T.briefs, fresh.map(m => linkId(m.fields[MT.brief])));
+      const pairs = fresh.map(m => ({ m, b: briefs.find(b => b.id === linkId(m.fields[MT.brief])) })).filter(p => p.b)
+        .sort((x, y) => (TIER_ORDER[sel(x.b.fields[B.tier])] ?? 4) - (TIER_ORDER[sel(y.b.fields[B.tier])] ?? 4));
+      let sent = cp.fields[CP.sent] || 0, skipped = cp.fields[CP.skipped] || 0, n = 0;
+      const notes = [];
+      for (const { m, b } of pairs) {
+        if (n >= CAMPAIGN_BATCH) break;
+        const contact = await primaryContact(b);
+        const bAgent = await briefAgent(b, contact);
+        const skip = async why => { skipped++; notes.push(`${contact ? contact.fields[C.name] : 'brief ' + b.id}: ${why}`); await updateRecord(T.matches, m.id, { [MT.status]: 'Skipped', [MT.feedback]: ((m.fields[MT.feedback] ? m.fields[MT.feedback] + '\n' : '') + `${clock().date}: campaign not sent – ${why}`).slice(0, 2000) }); };
+        if (sel(b.fields[B.status]) !== 'Active') { await skip('brief not active'); continue; }
+        if (!contact) { await skip('no contact'); continue; }
+        if (!agentLive(bAgent, b)) { await skip("buyer's agent isn't on Alex buyers"); continue; }
+        if (agentPaused(bAgent)) continue; // paused / on leave – try again later
+        const text = tmpl.replace(/\{first\}/g, firstName(contact.fields[C.name]) || 'there').replace(/\{agent\}/g, listAgent);
+        const res = await sendToBuyer({ brief: b, contact, text, purpose: newListing ? 'Instant match' : 'Coming soon alert', kind: 'campaign', allowedPrices: allowed, match: m, skipDuplicateCheck: true });
+        if (!res.ok) {
+          if (/today|daily cap|not before|not after/.test(res.reason)) continue; // try again next window
+          await skip(res.reason); continue;
+        }
+        n++; sent++;
+        await updateRecord(T.matches, m.id, { [MT.status]: 'Sent', [MT.sentAt]: new Date().toISOString(), [MT.campaign]: [cp.id] });
+        const st = getState(b);
+        st.lastOutAt = new Date().toISOString(); remember(st, 'out', res.text);
+        st.watch = st.watch || {}; st.watch[m.id] = { status: l.status, price: l.price };
+        st.pending = 'second_look';
+        await saveState(b, st, { [B.unanswered]: (b.fields[B.unanswered] || 0) + 1 });
+      }
+      const upd = { [CP.sent]: sent, [CP.skipped]: skipped };
+      if (notes.length) upd[CP.notes] = ((cp.fields[CP.notes] ? cp.fields[CP.notes] + '\n' : '') + notes.map(x => `${c.date} skipped ${x}`).join('\n')).slice(-20000);
+      const left = pairs.length - n - notes.length;
+      const stale = cp.fields[CP.approvedAt] && Date.now() - new Date(cp.fields[CP.approvedAt]).getTime() > 3 * 864e5;
+      if (left <= 0 || stale) {
+        upd[CP.status] = 'Running';
+        upd[CP.notes] = ((upd[CP.notes] || cp.fields[CP.notes] || '') + `\n${c.date}: finished sending – ${sent} texted, ${skipped} skipped${left > 0 ? ', ' + left + ' not reached (texted too recently)' : ''}.`).trim();
+        if (agent) await textAgent(agent, `Alex: ${cp.fields[CP.code] || 'Campaign'} - the ${newListing ? 'new listing' : l.status === 'Off market' ? 'off market' : 'coming soon'} text for ${l.short} has gone to ${sent} matching buyer${sent === 1 ? '' : 's'}${skipped ? ' (' + skipped + ' skipped)' : ''}. Anyone keen comes straight to you, and the results are on the Pre-market Campaign page.`);
+      }
+      await updateRecord(T.campaigns, cp.id, upd);
+    } catch (e) { console.error('Alex buyers: campaign ' + cp.id, e.message); }
+  }
+}
+
 async function eventTick() {
   const c = clock();
   if (!inScheduledWindow(c)) return;
@@ -1758,7 +1836,7 @@ async function eventTick() {
       if (!['nurture', 'qualifying'].includes(st.phase) || !listReady(f)) continue;
       const tier = sel(f[B.tier]);
       const ls = (await getMany(T.listings, ms.map(m => linkId(m.fields[MT.listing])))).map(listingFacts);
-      const cand = ms.map(m => ({ m, l: ls.find(x => x.id === linkId(m.fields[MT.listing])) })).filter(p => p.l && ['For sale', 'Coming soon', 'Off market'].includes(p.l.status))
+      const cand = ms.map(m => ({ m, l: ls.find(x => x.id === linkId(m.fields[MT.listing])) })).filter(p => p.l && ['For sale', 'Coming soon', 'Off market'].includes(p.l.status) && !p.l.campaignHold)
         .filter(p => (tier === 'Hot' && ((p.m.fields[MT.score] || 0) >= 70 || p.l.stone)) || (p.l.stone && (tier === 'Warm' || (tier === 'Hot'))))
         .sort((a, b) => (b.l.stone - a.l.stone) || ((b.m.fields[MT.score] || 0) - (a.m.fields[MT.score] || 0)));
       if (!cand.length) continue;
@@ -1941,7 +2019,7 @@ function start() {
   let fastBusy = false, slowBusy = false;
   const fast = async () => {
     if (fastBusy) return; fastBusy = true;
-    for (const [name, fn] of [['check-ins', checkinTick], ['new briefs', newBriefTick], ['nudges', nudgeTick], ['idle sign-off', idleTick], ['escalation', escalateTick]]) {
+    for (const [name, fn] of [['check-ins', checkinTick], ['new briefs', newBriefTick], ['nudges', nudgeTick], ['idle sign-off', idleTick], ['escalation', escalateTick], ['campaigns', campaignTick]]) {
       try { await fn(); } catch (e) { console.error('Alex buyers: ' + name + ' tick failed', e.message); }
     }
     fastBusy = false;
@@ -1963,5 +2041,5 @@ module.exports = {
   buyerChatAt,
   start, enabled, handleBuyerSMS, handleAgentCommand, addBuyerFromAgent, noteOptOut, noteSellerEnquiry,
   // exposed for testing
-  _t: { idleTick, wrapUp, trimName, checkinTick, newBriefTick, nudgeTick, importTick, nurtureTick, eventTick, escalateTick, summaryTick, nextQuestion, cleanUpdates, priceSafe, firstTextFor, computeTier, listLine, inScheduledWindow, inspectionFollowUpOK, melbToISO, clock }
+  _t: { campaignTick, idleTick, wrapUp, trimName, checkinTick, newBriefTick, nudgeTick, importTick, nurtureTick, eventTick, escalateTick, summaryTick, nextQuestion, cleanUpdates, priceSafe, firstTextFor, computeTier, listLine, inScheduledWindow, inspectionFollowUpOK, melbToISO, clock }
 };

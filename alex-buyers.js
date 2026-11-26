@@ -68,7 +68,7 @@ const B = {
   through: 'fldP9mhab6VSd6Siu', notes: 'fldlTAcdUHJHjkQBK', created: 'fld1qKffhUxl7GmNX', matches: 'fld8rUrS7lDIAF0yH',
   state: 'fldgzAfAQQG4ogPu1', campaign: 'fldU9bnkjKJ5shc58', cStage: 'fldpydUaJkdGDTU0u', cOutcome: 'fldINgRo4UhHJZfOZ',
   approve: 'fldYwKAzSafqHRlzP', batch: 'fldIrX6E3Qp9fNCHz', following: 'fldVan9kErtWqqXqF',
-  firstContact: 'fldQqrjTFxWBI7ew5', near: 'fldEHyLCKWqNKVnKa', radius: 'fld8QdDAgP7J5pILm'
+  firstContact: 'fldQqrjTFxWBI7ew5', near: 'fldEHyLCKWqNKVnKa', radius: 'fld8QdDAgP7J5pILm', areaSubs: 'fldv86K61v4e6vP12', areaApplied: 'fldK8cQIPZLsxxWFm'
 };
 const C = {
   name: 'fld5hDJRpN92YZnFx', mobile: 'fld0EA8biRz66il05', email: 'fldZW60VKGeM5Pc2u', agent: 'fldHsGhaiVWBnYX23',
@@ -888,6 +888,26 @@ function nextQuestion(brief, st) {
   return null;
 }
 function qualified(brief) { return QUESTIONS.every(q => q.done(brief.fields, getState(brief)) || q.key === 'agent' || (q.key === 'finance') || (q.key === 'price' && getState(brief).declinedPrice)); }
+// Last check before a listing is texted to a buyer (Stu, 26 Nov – Carson / Michelle): the listing must have its
+// basic details, and fit the buyer's stated property type, land size and areas. Stops half-filled listings
+// (e.g. a new Stone listing with no type, beds or land yet) being sent to everyone.
+const TYPE_FITS = { 'House': ['House'], 'Unit / Townhouse': ['Unit / Townhouse'], 'Land': ['Land'], 'Lifestyle / Acreage': ['Lifestyle / Acreage', 'Rural'], 'Rural': ['Rural', 'Lifestyle / Acreage'], 'Investment': ['House', 'Unit / Townhouse'] };
+function fitsBrief(l, f) {
+  if (!l) return false;
+  if (!l.type && !l.beds && !l.land) return false; // details not filled in yet
+  const types = sels(f[B.types]);
+  if (types.length) {
+    if (!l.type) return false;
+    if (!types.flatMap(t => TYPE_FITS[t] || [t]).includes(l.type)) return false;
+  }
+  const wantLand = Number(f[B.land]) || 0;
+  if (wantLand >= 4000 && (!l.land || l.land < wantLand * 0.8)) return false; // acreage buyers: no land size, no text
+  if (f[B.beds] && l.beds && l.beds < f[B.beds]) return false;
+  const subs = sels(f[B.suburbs]).includes('Anywhere in Ballarat') ? [] : sels(f[B.suburbs]); // "Anywhere" = no area limit
+  if (subs.length && l.suburb && !subs.some(x => x.toLowerCase() === String(l.suburb).toLowerCase())) return false;
+  if (f[B.pmax] && l.lo && l.lo > f[B.pmax] * 1.05) return false;
+  return true;
+}
 function listReady(f) { return (sels(f[B.suburbs]).length || sels(f[B.types]).length) && (f[B.beds] || f[B.pmax] || f[B.pmin]); }
 
 function briefSummary(f) {
@@ -969,6 +989,7 @@ const READ_SYSTEM = `You read SMS replies from property BUYERS to Alex, the assi
 Return: {"intent": one of ${JSON.stringify(INTENTS)},
  "reply": "Alex's reply text, see rules",
  "updates": {"suburbs":[],"types":[],"beds":null,"baths":null,"car":null,"land":null,"pmin":null,"pmax":null,"must":[],"breakers":"","other":"","reason":"","finance":"","saleDep":"","timeframe":"","email":"","near":"","radius_km":null},
+ "suburbs_only": false,
  "declined_price": false,
  "property": "address of the listing they are talking about, copied from KNOWN LISTINGS, or empty",
  "feedback": "short note of what they said about that property, or empty",
@@ -978,7 +999,8 @@ Return: {"intent": one of ${JSON.stringify(INTENTS)},
 Only fill update keys the buyer actually stated in THIS message, or that AGENT NOTES state and "Brief so far" doesn't have yet (leave others empty/null). Allowed values:
  suburbs ${JSON.stringify(OPT.suburbs)}; types ${JSON.stringify(OPT.types)}; must ${JSON.stringify(OPT.must)};
  reason ${JSON.stringify(OPT.reason)}; finance ${JSON.stringify(OPT.finance)}; saleDep ${JSON.stringify(OPT.saleDep)}; timeframe ${JSON.stringify(OPT.timeframe)}.
- Areas: a list of named suburbs → suburbs. "Near / around / close to X" or "within N km of X" → near = X (a suburb name, or Ballarat) and radius_km = N (null if no distance given); you can set both near and suburbs.
+ Areas: a list of named suburbs → suburbs. If they say they ONLY want certain areas ("only interested in X and Y", "just X", "not Alfredton, only Buninyong") → suburbs = just those areas and suburbs_only = true.
+ Land is in m²: 1 acre = 4,047 m², 1 hectare = 10,000 m² ("5 acres" → 20000, "2 ha" → 20000). "Near / around / close to X" or "within N km of X" → near = X (a suburb name, or Ballarat) and radius_km = N (null if no distance given); you can set both near and suburbs.
  Prices are whole dollars: "around 600" → pmin 570000, pmax 630000; "up to 700" → pmax 700000 only; "600 to 650k" → 600000 / 650000.
  Timeframe "ASAP"/"next couple of months" → "0–3 months"; "this year"/"6 months" → "3–6 months"; "next year" → "6–12 months" or "12+ months" as fits.
  "Pre-approved"/"approval done" → "Pre-approved"; "cash" → "Cash buyer"; "talking to the bank/broker" → "Talking to lender".
@@ -995,7 +1017,7 @@ Intent guide: liked_property = liked the inspected home / wants another look →
  not_looking_now = not looking at the moment / just browsing / on hold; check_in_later_yes/no = answering "want me to check in every few months?" (PENDING "later");
  bought = they have bought (anywhere) or are answering the bought questions (PENDING "bought"); must_sell = they need to sell first or ask what theirs is worth because they'll sell;
  value_question = asks what their own home is worth without needing to sell first; neighbour = says they live near the listing; neighbour_yes = says yes to an appraisal chat after the neighbour offer;
- stop = wants no more texts; complaint = annoyed, upset, complaint, or asks for legal/finance advice; who_is_this = asks who this is / is this a bot;
+ stop = wants no more texts; complaint = annoyed or upset with Stone / Alex, or asks for legal/finance advice. Feedback that a property sent didn't fit what they asked for (wrong area, type, size) is not_for_them with feedback and updates, even if they are a bit annoyed about it; who_is_this = asks who this is / is this a bot;
  wants_agent = says they'll deal with the agent directly or names an agent to talk to; still_looking = yes still looking (no new detail); answer = gives brief details;
  thanks = thanks / ok with nothing else.
 Reply rules (the reply is sent as-is by SMS from Alex, on behalf of the agent):
@@ -1039,7 +1061,10 @@ function cleanUpdates(u, f) {
   if (!u) return out;
   const pick = (list, v) => list.find(x => x.toLowerCase() === String(v || '').toLowerCase().trim());
   const subs = (u.suburbs || []).map(s => pick(OPT.suburbs, s)).filter(Boolean);
-  if (subs.length) out[B.suburbs] = [...new Set(sels(f[B.suburbs]).concat(subs))];
+  if (subs.length && u.suburbs_only) { // they narrowed their areas: replace, and drop the "near X" area so it isn't re-added
+    out[B.suburbs] = [...new Set(subs)];
+    if (f[B.near]) { out[B.near] = null; out[B.areaSubs] = null; out[B.areaApplied] = null; }
+  } else if (subs.length) out[B.suburbs] = [...new Set(sels(f[B.suburbs]).concat(subs))];
   const types = (u.types || []).map(s => pick(OPT.types, s)).filter(Boolean);
   if (types.length) out[B.types] = [...new Set(sels(f[B.types]).concat(types))];
   const must = (u.must || []).map(s => pick(OPT.must, s)).filter(Boolean);
@@ -1064,6 +1089,7 @@ function cleanUpdates(u, f) {
 // ---------------------------------------------------------------- buyer replies (section 5)
 
 const CONSENT_YES = /^\s*(y|ya|yes|yep|yeah|yup|sure|ok|okay|yes please|please|sounds good|happy to|go for it|absolutely|definitely|for sure)\s*[.!👍]*\s*$/iu;
+const NO_CALL = /\b(don'?t|do not|no) need (a |to be |for a |the )?(call|ring|phone)|\bno (need for a |)call\b|\b(don'?t|do not) (call|ring|phone) me\b|\bdon'?t need (stu|leanne|anyone|him|her|them) to (call|ring|phone)|\bno need to (call|ring|phone)\b/i;
 const STOP_WORDS = /^\s*(stop|stopall|unsubscribe|unsub|cancel|end|quit|opt ?out|remove me)\s*[.!]*\s*$/i;
 
 async function findBuyerByPhone(from) {
@@ -1121,7 +1147,7 @@ function taskContext({ brief, contact, st, alertText, fields }) {
   return out.join('\n').slice(0, 5000);
 }
 // notify = text the agent straight away even on a normal-priority hand-over (new seller leads – Stu, 9 Nov)
-async function handoff({ brief, contact, agent, st, priority, task, alertText, escalateAfter, notify, label, fields }) {
+async function handoff({ brief, contact, agent, st, priority, task, alertText, escalateAfter, notify, label, fields, quiet }) {
   const due = priority === 'normal' && !notify ? addDays(clock().date, 1) : clock().date;
   const t = await createTask({ brief, contact, agent, task, due, notes: taskContext({ brief, contact, st, alertText, fields }), priority: priority === 'urgent' || priority === 'high' || notify ? 'High' : undefined });
   if (priority === 'urgent' || priority === 'high' || notify) {
@@ -1129,7 +1155,7 @@ async function handoff({ brief, contact, agent, st, priority, task, alertText, e
     await textAgent(agent, `Alex${label ? ' – ' + label : ''}: ${alertText}${notify || label ? em : ''} Brief: ${recordLink(BRIEF_PAGE, brief.id)}`, brief, contact);
   }
   if (escalateAfter && t) {
-    (st.urgent = st.urgent || []).push({ taskId: t.id, at: new Date().toISOString(), after: escalateAfter, what: alertText, chased: false });
+    (st.urgent = st.urgent || []).push({ taskId: t.id, at: new Date().toISOString(), after: escalateAfter, what: alertText, chased: false, quiet: !!quiet });
   }
   return t;
 }
@@ -1281,6 +1307,18 @@ async function handleBuyerSMS(from, body) {
   // 1. STOP
   if (STOP_WORDS.test(text)) return optOut({ brief, contact, agent, st, upd, text, quietTwilio: true });
 
+  // 1b. "Don't need a call": stand down any call Alex promised, tell the agent, no chase texts (Stu, 26 Nov)
+  const openUrgent = (st.urgent || []).filter(u => !u.chased);
+  const lastOut = (st.history || []).filter(h => h.d === 'out').slice(-2, -1)[0] || (st.history || []).filter(h => h.d === 'out').slice(-1)[0];
+  const declinedOffer = lastOut && /\bcall\b/i.test(lastOut.t) && /^\s*(no|nah|nope)[\s,]*(thanks?|thank you|thankyou)?[\s.!]*$/i.test(text);
+  if (openUrgent.length && (NO_CALL.test(text) || declinedOffer)) {
+    openUrgent.forEach(u => { u.chased = true; });
+    st.chaseReplied = true;
+    await textAgent(agent, `Alex: ${contact.fields[C.name]} says they don't need a call: "${text.slice(0, 160)}". No more reminders on this one.`, brief, contact);
+    await reply(`No problem, no call needed. Thanks for letting me know.`);
+    return finish();
+  }
+
   // 2. Agent is following up: no automatic reply, just make sure the agent knows
   if (brief.fields[B.following]) {
     await handoff({ brief, contact, agent, st, priority: 'high', task: `${contact.fields[C.name]} replied to Alex – you're following up`, alertText: `${contact.fields[C.name]} (${contact.fields[C.mobile]}) replied: "${text.slice(0, 200)}" – you're marked as following up, so I haven't answered.` });
@@ -1300,6 +1338,7 @@ async function handleBuyerSMS(from, body) {
     await handoff({ brief, contact, agent, st, priority: 'normal', task: `Reply from ${contact.fields[C.name]} – Alex couldn't read it`, alertText: `"${text.slice(0, 200)}"` });
     return finish();
   }
+  if (r.suburbs_only && r.updates) r.updates.suburbs_only = true;
   const fieldsUpd = cleanUpdates(r.updates, brief.fields);
   let swapNote = '';
   if (r.other_agent || st.lastQ === 'agent') {
@@ -1344,9 +1383,14 @@ async function handleBuyerSMS(from, body) {
     case 'not_for_them':
       if (prop) await setMatch(prop.match, 'Not for them', r.feedback || text);
       if (r.feedback) { const prevB = upd[B.breakers] || brief.fields[B.breakers] || ''; upd[B.breakers] = (prevB + (prevB ? '; ' : '') + `Didn't suit: ${propShort} – ${r.feedback}`).slice(0, 2000); }
-      out = prevPending === 'clarify'
-        ? `No worries, thanks for letting me know. I'll keep sending ones that might suit better.`
-        : `No worries, thanks for letting me know. What didn't work about it? Helps me send better ones.`;
+      { // ask why only once, and only when they haven't already said (Stu, 26 Nov – Michelle)
+        const gaveReason = !!(r.feedback && String(r.feedback).trim().length > 3) && !/^\s*(no|nah|nope)?[\s,]*(thanks?|thank you|thankyou)?[\s.!]*$/i.test(text);
+        const newSubs = (fieldsUpd[B.suburbs] && r.suburbs_only) ? sels(fieldsUpd[B.suburbs]) : [];
+        if (newSubs.length) out = `Thanks, that helps. I'll only send you places in ${newSubs.length > 1 ? newSubs.slice(0, -1).join(', ') + ' or ' + newSubs.slice(-1) : newSubs[0]} from now on.`;
+        else if (prevPending === 'clarify') out = `No worries, thanks for letting me know. I'll keep sending ones that might suit better.`;
+        else if (prevPending === 'why_not' || gaveReason) out = `Thanks, that helps. I'll keep that in mind for the next ones.`;
+        else { out = `No worries, thanks for letting me know. What didn't work about it? Helps me send better ones.`; st.pending = 'why_not'; }
+      }
       addQuestion = prevPending === 'clarify';
       break;
 
@@ -1373,8 +1417,9 @@ async function handleBuyerSMS(from, body) {
 
     case 'complaint':
       upd[B.pause] = true;
-      await reply(`Sorry about that ${first}, I'll get ${agentName} to give you a call.`);
-      await handoff({ brief, contact, agent, st, priority: 'urgent', task: `Call ${contact.fields[C.name]} – unhappy / needs a call`, alertText: `${contact.fields[C.name]} (${contact.fields[C.mobile]}) is unhappy or asked for advice: "${text.slice(0, 200)}". I've paused Alex for them. Please call.`, escalateAfter: RESPONSE_MINUTES.complaint });
+      // No promised call (Stu, 26 Nov – Carson / Michelle didn't want one): apologise, pause, let the agent decide
+      await reply(`Sorry about that ${first}, and thanks for telling me. I've passed it on to ${agentName} and I'll hold off on texts for now.`);
+      await handoff({ brief, contact, agent, st, priority: 'urgent', task: `Follow up ${contact.fields[C.name]} – unhappy with Alex`, alertText: `${contact.fields[C.name]} (${contact.fields[C.mobile]}) is unhappy or asked for advice: "${text.slice(0, 300)}". I've paused Alex for them and told them I've passed it to you (no call promised).`, escalateAfter: RESPONSE_MINUTES.complaint, quiet: true });
       if (!agent || !samePhone(agent.fields[TM.mobile] || '', approverMobile() || '')) await alertStu(`Alex (buyers): complaint from ${contact.fields[C.name]} (${agentName}'s buyer): "${text.slice(0, 200)}". Alex paused for them; ${agentName} has an urgent task.`);
       await noteComplaint();
       return finish();
@@ -1715,6 +1760,7 @@ async function nurtureOne(brief, c) {
         .map(p => ({ m: p.m, l: listingFacts(p.l) }))
         .filter(p => ['For sale', 'Coming soon', 'Off market'].includes(p.l.status))
         .filter(p => !p.l.campaignHold)
+        .filter(p => fitsBrief(p.l, f))
         .sort((a, b) => (b.l.stone - a.l.stone) || ((b.m.fields[MT.score] || 0) - (a.m.fields[MT.score] || 0)))
         .slice(0, 3);
       if (pairs.length) {
@@ -1836,7 +1882,7 @@ async function eventTick() {
       if (!['nurture', 'qualifying'].includes(st.phase) || !listReady(f)) continue;
       const tier = sel(f[B.tier]);
       const ls = (await getMany(T.listings, ms.map(m => linkId(m.fields[MT.listing])))).map(listingFacts);
-      const cand = ms.map(m => ({ m, l: ls.find(x => x.id === linkId(m.fields[MT.listing])) })).filter(p => p.l && ['For sale', 'Coming soon', 'Off market'].includes(p.l.status) && !p.l.campaignHold)
+      const cand = ms.map(m => ({ m, l: ls.find(x => x.id === linkId(m.fields[MT.listing])) })).filter(p => p.l && ['For sale', 'Coming soon', 'Off market'].includes(p.l.status) && !p.l.campaignHold && fitsBrief(p.l, f))
         .filter(p => (tier === 'Hot' && ((p.m.fields[MT.score] || 0) >= 70 || p.l.stone)) || (p.l.stone && (tier === 'Warm' || (tier === 'Hot'))))
         .sort((a, b) => (b.l.stone - a.l.stone) || ((b.m.fields[MT.score] || 0) - (a.m.fields[MT.score] || 0)));
       if (!cand.length) continue;
@@ -1922,7 +1968,8 @@ async function escalateTick() {
         await alertStu(`Alex (buyers): ${agentFirst(agent)} hasn't actioned this yet (${Math.round(minutesSince(u.at))} min): ${u.what}`);
         if (contact) {
           const first = firstName(contact.fields[C.name]);
-          if (!st.chaseReplied) { await sendToBuyer({ brief, contact, text: `${agentFirst(agent)}'s been tied up ${first}, I've flagged it again and they'll call you shortly.`, purpose: 'Reply to buyer', kind: 'reply' }); st.chaseReplied = true; }
+          const heardSince = st.lastInAt && new Date(st.lastInAt) > new Date(u.at);
+          if (!st.chaseReplied && !u.quiet && !heardSince) { await sendToBuyer({ brief, contact, text: `${agentFirst(agent)}'s been tied up ${first}, I've flagged it again and they'll call you shortly.`, purpose: 'Reply to buyer', kind: 'reply' }); st.chaseReplied = true; }
         }
         u.chased = true; changed = true;
       }
